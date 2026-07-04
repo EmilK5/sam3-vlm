@@ -28,10 +28,10 @@ follow the "Suggested order of the first week" in the plan.
 - [x] 3.2 Cost meter (agent/budget.py) — check: 2-pass run prints a cost line (CostMeter.total); recount by hand from the logs once.
 
 ## Phase 4 — Heuristic controller
-- [~] 4.1 VoI heuristic policy + episode runner (agent/policy_heuristic.py, agent/runner.py) — check: run episodes on 3 images (sparse, dense, empty-of-fruit); read the JSON action traces — dense should trigger TileQuery/Subdivide, empty should stop within ~3 actions.
+- [x] 4.1 VoI heuristic policy + episode runner (agent/policy_heuristic.py, agent/runner.py) — check: run episodes on 3 images (sparse, dense, empty-of-fruit); read the JSON action traces — dense should trigger TileQuery/Subdivide, empty should stop within ~3 actions.
 
 ## Phase 5 — VLM orchestrator
-- [ ] 5.1 Scene inspection z_t (agent/inspect.py)
+- [~] 5.1 Scene inspection z_t (agent/inspect.py) — check: run inspect_scene on a dense-canopy image and a sparse one; compare the two JSONs against your own eyes.
 - [ ] 5.2 VLM policy with strict validation (agent/policy_vlm.py)
 
 ## Phase 6 — Evaluation
@@ -104,6 +104,14 @@ follow the "Suggested order of the first week" in the plan.
   image_np=img_np. NOT DONE (out of 1.5's file scope): run_image.py has no
   --verifier flag, so the plan's "run_image.py per verifier mode" manual check
   can't be run as written yet — needs a small step-0.2-file follow-up.
+- 2026-07-04 (5.1): inspect_scene mirrors QwenOracle (base64 image, strict JSON
+  parse + retry + neutral fallback with recommend="query"); injectable client for
+  offline tests; openai imported lazily. Strict _parse_z rejects missing keys / bad
+  enums / non-bool target_present, truncates notes to 200. should_inspect lacks the
+  policy's action scores, so condition 2 ("tiling/subdivide decision pending") is
+  proxied by last_z.recommend in {tile, subdivide}, and "discovery saturated" by
+  no new candidates in the last _SATURATION_WINDOW=3 passes (sum(D[-3:])==0) — no
+  cfg needed. Both documented as proxies in the docstring.
 - 2026-07-04 (4.1): Prompt required estimators "in belief.py" (not in 4.1's Files
   line) -> added count_estimates there (N_obs/N_supp/N_cons over non-leaf/non-spurious
   nodes, consistent with 6.2's predicted_nodes; thresholds tau_w=0.5/k_min=2/
