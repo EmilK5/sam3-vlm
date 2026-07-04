@@ -1,3 +1,7 @@
+import dataclasses
+
+import pytest
+
 from config import Config
 
 
@@ -18,3 +22,44 @@ def test_config_load_overrides(tmp_path):
     assert cfg.conf == 0.5
     assert cfg.verifier_mode == "vip"
     assert cfg.nms_mode == "dualgate"
+
+
+def test_cost_and_agent_fields_present():
+    cfg = Config()
+    # costs are normalized relative to one global SAM3 call
+    assert cfg.c_sam == 1.0
+    for field in ("c_tile", "c_verify", "c_inspect", "c_orch"):
+        assert 0.0 < getattr(cfg, field) < 1.0
+    # agent knobs
+    assert cfg.window_m == 3
+    assert cfg.budget_max_actions == 12
+    assert "lambda_D" in cfg.lambdas and "lambda_S" in cfg.lambdas
+
+
+def test_verifier_defaults_keep_ioc_as_the_safe_default():
+    # Hard constraint: the old IoC path must stay the default; vip is opt-in.
+    cfg = Config()
+    assert cfg.verifier_mode == "ioc"
+    assert cfg.answer_mode == "batched"
+    assert 0.0 < cfg.vip_epsilon < 0.5
+
+
+def test_oracle_config_reads_env(monkeypatch):
+    monkeypatch.setenv("QWEN_BASE_URL", "http://example:8000/v1")
+    monkeypatch.setenv("QWEN_MODEL", "qwen3-vl-test")
+    cfg = Config()
+    assert cfg.oracle_base_url == "http://example:8000/v1"
+    assert cfg.oracle_model_name == "qwen3-vl-test"
+
+
+def test_api_key_is_never_a_config_field():
+    # QWEN_API_KEY must never be stored on Config (never logged/printed).
+    field_names = {f.name for f in dataclasses.fields(Config)}
+    assert not any("api_key" in name.lower() or "apikey" in name.lower() for name in field_names)
+
+
+def test_load_rejects_unknown_key(tmp_path):
+    bad = tmp_path / "bad.json"
+    bad.write_text('{"not_a_field": 1}')
+    with pytest.raises(TypeError):
+        Config.load(str(bad))

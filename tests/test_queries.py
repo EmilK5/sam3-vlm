@@ -70,3 +70,47 @@ def test_missing_top_level_key_fails(tmp_path):
     del data["classes"]
     with pytest.raises(ValueError):
         load_query_set(_write(tmp_path, data))
+
+
+def test_extra_unexpected_class_in_templates_fails(tmp_path):
+    data = _load_raw()
+    data["queries"][0]["templates"]["bogus"] = 1  # class not in `classes`
+    with pytest.raises(ValueError):
+        load_query_set(_write(tmp_path, data))
+
+
+def test_empty_queries_list_fails(tmp_path):
+    data = _load_raw()
+    data["queries"] = []
+    with pytest.raises(ValueError):
+        load_query_set(_write(tmp_path, data))
+
+
+def test_non_dict_templates_fails(tmp_path):
+    data = _load_raw()
+    data["queries"][0]["templates"] = [1, -1, 0]  # list, not dict
+    with pytest.raises(ValueError):
+        load_query_set(_write(tmp_path, data))
+
+
+def test_class_names_missing_entry_fails(tmp_path):
+    data = _load_raw()
+    del data["class_names"]["spurious"]  # class present but no human-readable name
+    with pytest.raises(ValueError):
+        load_query_set(_write(tmp_path, data))
+
+
+@pytest.mark.parametrize("bad_epsilon", [0.0, 0.5, -0.1, 1.0])
+def test_epsilon_boundaries_fail(tmp_path, bad_epsilon):
+    data = _load_raw()
+    data["epsilon"] = bad_epsilon
+    with pytest.raises(ValueError):
+        load_query_set(_write(tmp_path, data))
+
+
+def test_all_queries_have_at_least_one_informative_class():
+    # Not required by the schema, but a sanity check on the checked-in file:
+    # an all-zero-template query would be dead weight (never selected by V-IP).
+    qs = load_query_set(GREEN_CITRUS)
+    for q in qs.queries:
+        assert set(q.templates.values()) != {0}, f"{q.id} is uninformative for every class"

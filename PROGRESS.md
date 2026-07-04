@@ -13,9 +13,9 @@ follow the "Suggested order of the first week" in the plan.
 - [ ] 0.3 Dataset loader (eval/datasets.py)
 
 ## Phase 1 — FM+V-IP verifier
-- [~] 1.1 Query sets + generation script (verifier/queries.py, queries/green_citrus.json) — check: read queries/green_citrus.json by hand — every query answerable from a 256px crop; templates (T/D/S) match your intuition; edit freely. `pytest -q` green.
+- [x] 1.1 Query sets + generation script (verifier/queries.py, queries/green_citrus.json) — check: read queries/green_citrus.json by hand — every query answerable from a 256px crop; templates (T/D/S) match your intuition; edit freely. `pytest -q` green.
 - [ ] 1.2 Oracles (MockOracle, QwenOracle, Sam3Oracle)
-- [ ] 1.3 Training-free V-IP core (verifier/vip.py, pure numpy)
+- [x] 1.3 Training-free V-IP core (verifier/vip.py, pure numpy) — check: `pytest -v tests/test_vip.py` — read the four test names; they are the spec.
 - [ ] 1.4 Verify API + demo (verifier/verify.py, scripts/demo_verify.py)  ← GO/NO-GO checkpoint
 - [ ] 1.5 Pipeline integration behind verifier="vip" flag
 
@@ -65,3 +65,20 @@ follow the "Suggested order of the first week" in the plan.
   deviation: did 1.1 before 0.3 per the plan's "Suggested order of the first week"
   and an explicit human choice. `scripts/gen_queries.py` imports `openai` lazily
   inside `main()` (not installed in this dev env); syntax-checked only, no test.
+- 2026-07-04 (1.3): Did 1.3 before 1.2 per the plan's suggested week-1 order and
+  an explicit human choice; `vip.py` is pure numpy with no dependency on the
+  oracles (1.2). Tests generate the clean noise-free answer vectors directly
+  from `query_set` templates (identical to what `MockOracle(noise=0)` will
+  return in 1.2), keeping 1.3 self-contained. Entropies computed in nats
+  (natural log) — internally consistent, does not affect argmax. `run_ip` also
+  stops early when the best remaining info gain is <= 1e-12 (no informative
+  query left), which guarantees an all-zero-template query is never selected.
+- 2026-07-04 (verify 0.1-1.3): At the human's request during verification,
+  hardened test coverage across all completed steps (test files only, no source
+  changes): test_smoke +5 (env wiring, no api_key field, costs/agent fields,
+  ioc default, unknown-key rejection), test_graph_to_dict +2 (JSON round-trip,
+  leaf verdict), test_queries +7 (extra/empty/non-dict templates, class_names
+  gap, epsilon boundaries, no dead queries), test_vip +6 (row sums, uniform
+  uninformative row, CMI >= 0, empty-S == prior, max_q cap, prior-driven
+  verdict), and new test_run_image.py (+3) exercising the argparse/path helpers
+  via sys.modules stubs for torch/inference/pipeline. Suite: 14 -> 39, all green.
