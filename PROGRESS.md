@@ -10,7 +10,7 @@ follow the "Suggested order of the first week" in the plan.
 ## Phase 0 — Scaffold & harness
 - [x] 0.1 Package layout + config.py — check: `pytest -q` green; `python -c "from config import Config; print(Config())"` prints all grouped fields with sane defaults.
 - [x] 0.2 CLI runner for the existing cascade (scripts/run_image.py, graph.to_dict) — check: run on a real orchard image with `--passes 3`; overlay resembles Gradio output; `out/<stem>_graph.json` opens and node count matches the logged pass stats.
-- [~] 0.3 Dataset loader (eval/datasets.py) — check: `python -m eval.datasets --root <yolo-split> --fmt yolo`; the saved GT overlay boxes sit on real fruit. Also `run_image.py --draw-gt` saves out/<stem>_gt.jpg.
+- [x] 0.3 Dataset loader (eval/datasets.py) — check: `python -m eval.datasets --root <yolo-split> --fmt yolo`; the saved GT overlay boxes sit on real fruit. Also `run_image.py --draw-gt` saves out/<stem>_gt.jpg.
 
 ## Phase 1 — FM+V-IP verifier
 - [x] 1.1 Query sets + generation script (verifier/queries.py, queries/green_citrus.json) — check: read queries/green_citrus.json by hand — every query answerable from a 256px crop; templates (T/D/S) match your intuition; edit freely. `pytest -q` green.
@@ -20,8 +20,8 @@ follow the "Suggested order of the first week" in the plan.
 - [x] 1.5 Pipeline integration behind verifier="vip" flag — check: `scripts/run_image.py --passes 2` twice per verifier mode, diff the two overlays + graph JSONs, spot-check 5 differing nodes with demo_verify. NOTE: run_image.py has no --verifier flag yet (out of 1.5's file scope); see handoff for how to exercise the vip path meanwhile.
 
 ## Phase 2 — Belief state
-- [~] 2.1 Support, jitter, signatures on nodes (graph.py, pipeline dedup branch) — check: 3-pass run; print top-10 nodes by `support` from the graph JSON — stable fruits should have support>=2, one-off junk support==1.
-- [ ] 2.2 belief.py: w_i, U, discovery curve, phi summary
+- [x] 2.1 Support, jitter, signatures on nodes (graph.py, pipeline dedup branch) — check: 3-pass run; print top-10 nodes by `support` from the graph JSON — stable fruits should have support>=2, one-off junk support==1.
+- [~] 2.2 belief.py: w_i, U, discovery curve, phi summary — check: pytest; then print φ (belief.summarize) after each pass in run_image — U (belief.uncertainty) should visibly drop across passes on an easy image.
 
 ## Phase 3 — Actions & cost
 - [ ] 3.1 Action layer (agent/actions.py)
@@ -35,8 +35,8 @@ follow the "Suggested order of the first week" in the plan.
 - [ ] 5.2 VLM policy with strict validation (agent/policy_vlm.py)
 
 ## Phase 6 — Evaluation
-- [~] 6.1 Matching & detection metrics (eval/matching.py) — check: `pytest -q tests/test_matching.py`; then run matching on one real image vs GT — draw matched GT green, missed red, save to out/ (manual script).
-- [~] 6.2 Sweep runner (eval/run_eval.py) [REDUCED: oneshot/cascade/tiled/convergence only] — check: `--limit 5` on citrus for {oneshot,cascade}x{ioc,vip}; open CSV — pool_recall(cascade) >= pool_recall(oneshot); vip-vs-ioc precision delta shows if the verifier earns its cost.
+- [x] 6.1 Matching & detection metrics (eval/matching.py) — check: `pytest -q tests/test_matching.py`; then run matching on one real image vs GT — draw matched GT green, missed red, save to out/ (manual script).
+- [x] 6.2 Sweep runner (eval/run_eval.py) [REDUCED: oneshot/cascade/tiled/convergence only] — check: `--limit 5` on citrus for {oneshot,cascade}x{ioc,vip}; open CSV — pool_recall(cascade) >= pool_recall(oneshot); vip-vs-ioc precision delta shows if the verifier earns its cost.
 - [ ] 6.3 Results table & accuracy-vs-cost plot (eval/report.py)
 
 ## Notes / decisions log
@@ -104,6 +104,17 @@ follow the "Suggested order of the first week" in the plan.
   image_np=img_np. NOT DONE (out of 1.5's file scope): run_image.py has no
   --verifier flag, so the plan's "run_image.py per verifier mode" manual check
   can't be run as written yet — needs a small step-0.2-file follow-up.
+- 2026-07-04 (2.2): belief.py pure functions, formulas verbatim from the proposal.
+  s_bar = node.scores["detection_confidence"] (no running-aggregate score exists yet).
+  support_score's plausible-area term reads cfg.area_min/area_max via getattr with
+  inert defaults [0, inf] (config has no area bounds and 2.2 can't touch config.py),
+  so the lambda_A term is a no-op until bounds are added. uncertainty sums over
+  non-spurious nodes (per plan); summarize's w/s/k/delta lists cover ALL K_t nodes
+  (per proposal phi). tiling_status derived from signatures (any ':tiled:' present),
+  since summarize isn't passed tiling state. saturated(m, delta) requires a full
+  window (len >= m) so it can't fire before m passes. NOTE for later: 6.2's
+  N_supp/N_cons can now be upgraded to use support_score/support k (still deferred
+  until a step revisits run_eval).
 - 2026-07-04 (2.1): OrchardNode gains support(k)/signatures(set)/jitter/area +
   reinforce(box, signature). jitter = running mean of Euclidean center displacement
   of re-detections vs the representative box center. Also record the CREATING
