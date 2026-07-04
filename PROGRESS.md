@@ -37,7 +37,7 @@ follow the "Suggested order of the first week" in the plan.
 ## Phase 6 — Evaluation
 - [x] 6.1 Matching & detection metrics (eval/matching.py) — check: `pytest -q tests/test_matching.py`; then run matching on one real image vs GT — draw matched GT green, missed red, save to out/ (manual script).
 - [x] 6.2 Sweep runner (eval/run_eval.py) [REDUCED: oneshot/cascade/tiled/convergence only] — check: `--limit 5` on citrus for {oneshot,cascade}x{ioc,vip}; open CSV — pool_recall(cascade) >= pool_recall(oneshot); vip-vs-ioc precision delta shows if the verifier earns its cost.
-- [~] 6.3 Results table & accuracy-vs-cost plot (eval/report.py) — check: run report on your sweep CSV(s); the accuracy-vs-cost plot is the paper figure — confirm the policy story (one-shot → cascade → tiled → convergence → heuristic → VLM) is readable.
+- [x] 6.3 Results table & accuracy-vs-cost plot (eval/report.py) — check: run report on your sweep CSV(s); the accuracy-vs-cost plot is the paper figure — confirm the policy story (one-shot → cascade → tiled → convergence → heuristic → VLM) is readable.
 
 ## Notes / decisions log
 <!-- Append dated one-liners here when a step deviates from the plan. -->
