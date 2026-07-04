@@ -1,0 +1,118 @@
+{
+  "concept": "green citrus",
+  "classes": ["target", "distractor", "spurious"],
+  "class_names": {"target": "fruit", "distractor": "leaf", "spurious": "clutter"},
+  "epsilon": 0.15,
+  "queries": [
+    {
+      "id": "q01",
+      "text": "Is the central object approximately round or spherical in outline?",
+      "templates": {"target": 1, "distractor": -1, "spurious": 0}
+    },
+    {
+      "id": "q02",
+      "text": "Does the central object have a smooth, waxy-looking surface?",
+      "templates": {"target": 1, "distractor": 0, "spurious": -1}
+    },
+    {
+      "id": "q03",
+      "text": "Is there a bright specular highlight indicating a curved, glossy surface?",
+      "templates": {"target": 1, "distractor": 0, "spurious": -1}
+    },
+    {
+      "id": "q04",
+      "text": "Is the central object a fairly uniform, solid color across its surface?",
+      "templates": {"target": 1, "distractor": 0, "spurious": -1}
+    },
+    {
+      "id": "q05",
+      "text": "Are thin branching veins visible across the surface of the object?",
+      "templates": {"target": -1, "distractor": 1, "spurious": 0}
+    },
+    {
+      "id": "q06",
+      "text": "Is the object a flat, thin structure rather than a solid rounded body?",
+      "templates": {"target": -1, "distractor": 1, "spurious": 0}
+    },
+    {
+      "id": "q07",
+      "text": "Does the object have a pointed tip or an elongated leaf-like outline?",
+      "templates": {"target": -1, "distractor": 1, "spurious": 0}
+    },
+    {
+      "id": "q08",
+      "text": "Is a short stem or calyx visible where the object attaches to a branch?",
+      "templates": {"target": 1, "distractor": 0, "spurious": -1}
+    },
+    {
+      "id": "q09",
+      "text": "Is the crop dominated by rough brown bark or woody branch texture?",
+      "templates": {"target": -1, "distractor": -1, "spurious": 1}
+    },
+    {
+      "id": "q10",
+      "text": "Is a large portion of the crop plain open sky?",
+      "templates": {"target": -1, "distractor": -1, "spurious": 1}
+    },
+    {
+      "id": "q11",
+      "text": "Is the crop dominated by bare soil, ground, or dead debris?",
+      "templates": {"target": -1, "distractor": -1, "spurious": 1}
+    },
+    {
+      "id": "q12",
+      "text": "Is the crop blurry or out of focus so that no object is clearly identifiable?",
+      "templates": {"target": -1, "distractor": -1, "spurious": 1}
+    },
+    {
+      "id": "q13",
+      "text": "Is the dominant object predominantly green?",
+      "templates": {"target": 1, "distractor": 1, "spurious": -1}
+    },
+    {
+      "id": "q14",
+      "text": "Does the object appear to be a solid three-dimensional ball rather than a flat surface?",
+      "templates": {"target": 1, "distractor": -1, "spurious": 0}
+    },
+    {
+      "id": "q15",
+      "text": "Is the object compact and roughly as wide as it is tall?",
+      "templates": {"target": 1, "distractor": -1, "spurious": 0}
+    },
+    {
+      "id": "q16",
+      "text": "Is there smooth shading that curves around a rounded form?",
+      "templates": {"target": 1, "distractor": 0, "spurious": -1}
+    },
+    {
+      "id": "q17",
+      "text": "Does the surface show a fine pebbled or dimpled rind texture?",
+      "templates": {"target": 1, "distractor": -1, "spurious": 0}
+    },
+    {
+      "id": "q18",
+      "text": "Does the crop contain many small mixed elements rather than one clear object?",
+      "templates": {"target": -1, "distractor": -1, "spurious": 1}
+    },
+    {
+      "id": "q19",
+      "text": "Is there one clearly dominant object centered in the crop?",
+      "templates": {"target": 1, "distractor": 1, "spurious": -1}
+    },
+    {
+      "id": "q20",
+      "text": "Is a single central midrib line running along the object visible?",
+      "templates": {"target": -1, "distractor": 1, "spurious": 0}
+    },
+    {
+      "id": "q21",
+      "text": "Is the surface matte and rough rather than smooth?",
+      "templates": {"target": -1, "distractor": 0, "spurious": 1}
+    },
+    {
+      "id": "q22",
+      "text": "Is a large portion of the crop a flat, bright, washed-out background region?",
+      "templates": {"target": -1, "distractor": -1, "spurious": 1}
+    }
+  ]
+}

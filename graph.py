@@ -104,3 +104,9 @@ class OrchardGraph:
                 neg_boxes.append(node.box)
         
         return np.array(pos_boxes), np.array(neg_boxes)
+
+    def to_dict(self) -> dict:
+        """
+        Serializes all nodes for JSON export
+        """
+        return {"nodes": [node.to_dict() for node in self.nodes.values()]}
