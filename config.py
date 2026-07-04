@@ -23,7 +23,7 @@ class Config:
     nms_mode: str = "dualgate"
 
     # --- verifier ---
-    verifier_mode: str = "ioc"  # "ioc" (default, unchanged) | "vip" (opt-in)
+    verifier_mode: str = "ioc"  # "ioc" (default, unchanged) | "vip" (opt-in) | "off" (disabled)
     vip_query_file: str = "queries/green_citrus.json"
     vip_epsilon: float = 0.15
     vip_stop: float = 0.10

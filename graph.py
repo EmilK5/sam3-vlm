@@ -36,17 +36,27 @@ class OrchardNode:
         self.tree_roi = None
         self.cached_leaf_boxes = None
 
+        # FM+V-IP verifier trace (populated only when verifier="vip"); left None
+        # under the default IoC verifier so to_dict output is unchanged.
+        self.vip_chain = None                        # [{"q": text, "a": "yes/no/unsure"}, ...]
+        self.vip_posterior = None                    # posterior over classes, as a list
+
     def to_dict(self) -> dict:
         """
         Helper to print out node details
         """
-        return {
+        d = {
             "id": self.id,
             "box": self.box,
             "found_in_pass": self.found_in_pass,
             "scores": self.scores,
             "classification": self.classification
         }
+        if self.vip_chain is not None:
+            d["vip_chain"] = self.vip_chain
+        if self.vip_posterior is not None:
+            d["vip_posterior"] = self.vip_posterior
+        return d
 
 
 class OrchardGraph:

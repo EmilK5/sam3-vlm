@@ -17,7 +17,7 @@ follow the "Suggested order of the first week" in the plan.
 - [x] 1.2 Oracles (MockOracle, QwenOracle, Sam3Oracle) — check: `pytest -q tests/test_oracle.py`; then a REPL smoke test with a real QwenOracle on one fruit crop — answers visibly sane (round=yes, veins=no).
 - [x] 1.3 Training-free V-IP core (verifier/vip.py, pure numpy) — check: `pytest -v tests/test_vip.py` — read the four test names; they are the spec.
 - [x] 1.4 Verify API + demo (verifier/verify.py, scripts/demo_verify.py)  ← GO/NO-GO checkpoint — check: run demo on 3 hand-picked boxes (clear fruit, clear leaf, junk) with `--oracle qwen`; the three chains should read like sensible reasoning. Tweak queries/epsilon in the JSON and re-run. This is where you judge whether the whole idea works.
-- [ ] 1.5 Pipeline integration behind verifier="vip" flag
+- [x] 1.5 Pipeline integration behind verifier="vip" flag — check: `scripts/run_image.py --passes 2` twice per verifier mode, diff the two overlays + graph JSONs, spot-check 5 differing nodes with demo_verify. NOTE: run_image.py has no --verifier flag yet (out of 1.5's file scope); see handoff for how to exercise the vip path meanwhile.
 
 ## Phase 2 — Belief state
 - [ ] 2.1 Support, jitter, signatures on nodes (graph.py, pipeline dedup branch)
@@ -93,6 +93,26 @@ follow the "Suggested order of the first week" in the plan.
   step can add the field to Query. MockOracle "flip" = replace the clean
   template answer with a uniformly-chosen other value in {-1,0,1} (noise=1.0
   flips every query); Sam3Oracle presence answer = +1 if score>=tau else -1.
+- 2026-07-04 (1.5): Branch on `cfg.verifier_mode` (actual field name; plan wrote
+  cfg.verifier). VIP path is a pure early-continue inserted after add_candidate;
+  the IoC gate below is byte-for-byte unchanged (verified via git diff: no `-`
+  lines in the gate). 12px skip applies ONLY to the VIP branch (applying it to
+  IoC would break the byte-for-byte guarantee). verifier_mode="vip" without
+  oracle/query_set/image_np raises ValueError rather than silently falling back
+  (IoC stays the safe default; misconfig surfaces loudly). Threaded
+  cfg/oracle/query_set through execute_pass as optional None-default params +
+  image_np=img_np. NOT DONE (out of 1.5's file scope): run_image.py has no
+  --verifier flag, so the plan's "run_image.py per verifier mode" manual check
+  can't be run as written yet — needs a small step-0.2-file follow-up.
+- 2026-07-04 (post-1.5, user request): Added verifier "off" mode (config.py
+  comment + pipeline.py): registers candidates but does no classification, so
+  nodes stay "unresolved" (no-verifier baseline). Added `--verifier {ioc,vip,off}`
+  + `--oracle {mock,qwen}` + `--query-file` + `--mock-class` to run_image.py
+  (user authorized touching this 0.2 file), threading cfg/oracle/query_set into
+  execute_pass. run_image now tags output files with the verifier mode
+  (`<stem>_<mode>_overlay.jpg`) so ioc/vip/off runs don't overwrite each other —
+  this makes the plan's 1.5 "diff the two overlays" check runnable; default
+  output filename thus changed from `<stem>_overlay.jpg` to `<stem>_ioc_...`.
 - 2026-07-04 (0.2 bugfix): `scripts/run_image.py` imported `config` BEFORE adding
   the repo root to sys.path, so `python scripts/run_image.py` (script invocation,
   which puts scripts/ — not the repo root — on sys.path) failed with

@@ -7,6 +7,7 @@ graph JSON. Makes no changes to pipeline.execute_pass.
 """
 
 import argparse
+import dataclasses
 import json
 import logging
 import os
@@ -21,6 +22,9 @@ from config import Config
 _cfg = Config()
 if _cfg.sam3_repo not in sys.path:
     sys.path.append(_cfg.sam3_repo)
+
+from verifier.queries import load_query_set
+from verifier.oracle import MockOracle, QwenOracle
 
 from PIL import Image
 import torch
@@ -40,14 +44,41 @@ def parse_args(argv=None):
     parser.add_argument("--tiling", action="store_true", help="Enable tiled inference.")
     parser.add_argument("--clahe", action="store_true", help="Enable CLAHE enhancement.")
     parser.add_argument("--conf", type=float, default=_cfg.conf, help="Confidence threshold.")
+    parser.add_argument("--verifier", choices=["ioc", "vip", "off"], default=_cfg.verifier_mode,
+                        help="Candidate verifier: ioc (default), vip (FM+V-IP), or off (disabled).")
+    parser.add_argument("--oracle", choices=["mock", "qwen"], default="qwen",
+                        help="Oracle for --verifier vip (ignored otherwise).")
+    parser.add_argument("--query-file", default=None,
+                        help="Query set JSON for --verifier vip (defaults to cfg.vip_query_file).")
+    parser.add_argument("--mock-class", default="target",
+                        help="true_class for --oracle mock (offline vip runs).")
     return parser.parse_args(argv)
 
 
-def build_output_paths(image_path: str, output_dir: str) -> tuple:
-    """Returns (overlay_path, graph_path) for a given input image."""
+def build_verifier(args):
+    """Return (cfg, oracle, query_set) for the requested verifier mode.
+
+    oracle/query_set are None unless --verifier vip is selected.
+    """
+    cfg = dataclasses.replace(_cfg, verifier_mode=args.verifier)
+    if args.verifier != "vip":
+        return cfg, None, None
+
+    query_set = load_query_set(args.query_file or cfg.vip_query_file)
+    oracle = MockOracle(args.mock_class) if args.oracle == "mock" else QwenOracle(cfg)
+    return cfg, oracle, query_set
+
+
+def build_output_paths(image_path: str, output_dir: str, suffix: str = "") -> tuple:
+    """Returns (overlay_path, graph_path) for a given input image.
+
+    `suffix` (e.g. the verifier mode) is inserted into the filename so runs in
+    different modes on the same image don't overwrite each other.
+    """
     stem = os.path.splitext(os.path.basename(image_path))[0]
-    overlay_path = os.path.join(output_dir, f"{stem}_overlay.jpg")
-    graph_path = os.path.join(output_dir, f"{stem}_graph.json")
+    tag = f"_{suffix}" if suffix else ""
+    overlay_path = os.path.join(output_dir, f"{stem}{tag}_overlay.jpg")
+    graph_path = os.path.join(output_dir, f"{stem}{tag}_graph.json")
     return overlay_path, graph_path
 
 
@@ -63,6 +94,9 @@ def main():
     bpe_path = f"{_cfg.sam3_repo}/assets/bpe_simple_vocab_16e6.txt.gz"
     _, processor = inference.load_sam3_model(bpe_path, args.conf, device=device)
 
+    cfg, oracle, query_set = build_verifier(args)
+    logging.info(f"Verifier mode: {cfg.verifier_mode}")
+
     image_pil = Image.open(args.image).convert("RGB")
     orchard_graph = graph_module.OrchardGraph()
 
@@ -76,11 +110,14 @@ def main():
             tiling=args.tiling,
             pass_number=pass_number,
             prompt=args.prompt,
+            cfg=cfg,
+            oracle=oracle,
+            query_set=query_set,
         )
         logging.info(f"Pass {pass_number}: {stats.as_row()}")
 
     os.makedirs(_cfg.output_dir, exist_ok=True)
-    overlay_path, graph_path = build_output_paths(args.image, _cfg.output_dir)
+    overlay_path, graph_path = build_output_paths(args.image, _cfg.output_dir, suffix=cfg.verifier_mode)
 
     inference.plot_graph_scene(image_pil, orchard_graph, output_path=overlay_path)
     with open(graph_path, "w") as f:

@@ -7,6 +7,10 @@ Controls the execution of the loop using a full-frame spatial cross-reference ga
 import numpy as np
 import logging
 import inference
+from verifier import verify
+
+# target/distractor/spurious -> the graph's classification tags.
+_VIP_TAG = {"target": "fruit", "distractor": "leaf", "spurious": "spurious"}
 
 # ==========================================
 #   Diagnostics-Carrying Return Type
@@ -85,14 +89,33 @@ def compute_ioc(candidate_box, leaf_box):
 
     return inter_area / float(candidate_area) if candidate_area > 0 else 0.0
 
-def register_and_verify_candidates(candidate_boxes, candidate_scores, leaf_boxes, graph, pass_number, iou_threshold=0.40):
+def register_and_verify_candidates(candidate_boxes, candidate_scores, leaf_boxes, graph, pass_number, iou_threshold=0.40,
+                                   cfg=None, oracle=None, query_set=None, image_np=None):
     """
     Dedicated registration function. Cross-references fruit candidates against
     globally detected leaf maps to apply semantic verdicts without cropping.
 
-    Returns (added_nodes, duplicates_rejected). The verification gate below is
-    UNCHANGED -- only an inter-pass duplicate counter was added for diagnostics.
+    Verifier selection (backward compatible):
+        cfg is None or cfg.verifier_mode == "ioc" (default)
+            -> the occlusion-aware IoC logic gate below, UNCHANGED.
+        cfg.verifier_mode == "vip"
+            -> FM+V-IP verification via verify.verify_candidate on a crop; the
+               IoC gate is not run. Requires oracle, query_set, and image_np.
+               Candidates smaller than 12px on a side are left "unresolved".
+        cfg.verifier_mode == "off"
+            -> verification disabled: candidates are registered but not
+               classified, so every node stays "unresolved". Useful as a
+               no-verifier baseline / ablation.
+
+    Returns (added_nodes, duplicates_rejected). The inter-pass duplicate counter
+    was added for diagnostics.
     """
+    mode = getattr(cfg, "verifier_mode", "ioc") if cfg is not None else "ioc"
+    use_vip = mode == "vip"
+    verify_off = mode == "off"
+    if use_vip and (oracle is None or query_set is None or image_np is None):
+        raise ValueError("verifier_mode='vip' requires oracle, query_set, and image_np.")
+
     added_nodes = 0
     duplicates_rejected = 0
 
@@ -116,6 +139,30 @@ def register_and_verify_candidates(candidate_boxes, candidate_scores, leaf_boxes
 
         # --- REGISTER: Initialize the candidate node in our database ---
         node_id = graph.add_candidate(box, score, found_in_pass=pass_number)
+
+        # --- VERIFIER OFF: register only; leave the node "unresolved" ---
+        if verify_off:
+            added_nodes += 1
+            continue
+
+        # --- VIP VERIFIER (opt-in): crop-based FM+V-IP classification ---
+        if use_vip:
+            # Skip verification for tiny boxes; leave them unresolved.
+            if (box[2] - box[0]) < 12 or (box[3] - box[1]) < 12:
+                graph.nodes[node_id].classification = "unresolved"
+                added_nodes += 1
+                continue
+
+            result = verify.verify_candidate(image_np, box, oracle, query_set, cfg)
+            node = graph.nodes[node_id]
+            dist_idx = query_set.classes.index("distractor") if "distractor" in query_set.classes else 0
+            node.scores["fruit_verification"] = float(result["p_target"])
+            node.scores["leaf_verification"] = float(result["posterior"][dist_idx])
+            node.classification = _VIP_TAG.get(result["verdict"], "unresolved")
+            node.vip_chain = result["chain"]
+            node.vip_posterior = result["posterior"]
+            added_nodes += 1
+            continue
 
         # --- VERIFY: Find the maximum containment within the global leaf detection map ---
         max_leaf_ioc = 0.0
@@ -322,7 +369,8 @@ def tiled_engine(processor, image_pil, confidence, clahe, prompt, pos_boxes=None
 # ==========================================
 
 def execute_pass(processor, image_pil, graph, conf, clahe, tiling, pass_number, prompt,
-                 disable_size_filter=False, nms_mode="dualgate", use_concentric=False):
+                 disable_size_filter=False, nms_mode="dualgate", use_concentric=False,
+                 cfg=None, oracle=None, query_set=None):
     """
     Runs one full pass of SAM3 pipeline
     Propose -> Register -> Verify -> Feedback
@@ -429,7 +477,11 @@ def execute_pass(processor, image_pil, graph, conf, clahe, tiling, pass_number, 
         leaf_boxes=global_leaf_boxes,
         graph=graph,
         pass_number=pass_number,
-        iou_threshold=0.40
+        iou_threshold=0.40,
+        cfg=cfg,
+        oracle=oracle,
+        query_set=query_set,
+        image_np=img_np,
     )
 
     return PassStats(

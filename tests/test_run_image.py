@@ -47,6 +47,12 @@ def test_build_output_paths(run_image_module):
     assert graph_json == "out/img_042_graph.json"
 
 
+def test_build_output_paths_with_mode_suffix(run_image_module):
+    overlay, graph_json = run_image_module.build_output_paths("/data/img_042.png", "out", suffix="vip")
+    assert overlay == "out/img_042_vip_overlay.jpg"
+    assert graph_json == "out/img_042_vip_graph.json"
+
+
 def test_parse_args_defaults_and_flags(run_image_module):
     ns = run_image_module.parse_args(
         ["--image", "a.jpg", "--prompt", "green fruit", "--passes", "3", "--tiling"]
@@ -57,6 +63,35 @@ def test_parse_args_defaults_and_flags(run_image_module):
     assert ns.tiling is True
     assert ns.clahe is False
     assert ns.conf == 0.35  # default pulled from Config().conf
+    assert ns.verifier == "ioc"  # default keeps the old behavior
+
+
+def test_parse_args_verifier_choices(run_image_module):
+    for mode in ("ioc", "vip", "off"):
+        ns = run_image_module.parse_args(["--image", "a.jpg", "--prompt", "x", "--verifier", mode])
+        assert ns.verifier == mode
+    with pytest.raises(SystemExit):
+        run_image_module.parse_args(["--image", "a.jpg", "--prompt", "x", "--verifier", "bogus"])
+
+
+def test_build_verifier_off_and_ioc_have_no_oracle(run_image_module):
+    for mode in ("ioc", "off"):
+        ns = run_image_module.parse_args(["--image", "a.jpg", "--prompt", "x", "--verifier", mode])
+        cfg, oracle, query_set = run_image_module.build_verifier(ns)
+        assert cfg.verifier_mode == mode
+        assert oracle is None and query_set is None
+
+
+def test_build_verifier_vip_mock_builds_oracle_and_queries(run_image_module):
+    query_file = os.path.join(REPO_ROOT, "queries", "green_citrus.json")
+    ns = run_image_module.parse_args(
+        ["--image", "a.jpg", "--prompt", "x", "--verifier", "vip",
+         "--oracle", "mock", "--query-file", query_file]
+    )
+    cfg, oracle, query_set = run_image_module.build_verifier(ns)
+    assert cfg.verifier_mode == "vip"
+    assert oracle is not None
+    assert query_set is not None and len(query_set.queries) > 0
 
 
 def test_parse_args_requires_image_and_prompt(run_image_module):
