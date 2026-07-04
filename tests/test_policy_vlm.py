@@ -119,3 +119,24 @@ def test_no_action_accepts_raw_coordinates():
     fx = _fixture()
     action = _choose('{"action": "query", "args": {"bbox": [0, 0, 10, 10], "conf": 0.4}}', fx)
     assert action == _heuristic_action(fx)
+
+
+# ----------------------- make_vlm_policy (episode adapter) -----------------------
+
+def test_make_vlm_policy_inspects_then_chooses():
+    from agent import runner
+    from agent.actions import ActionContext
+    from PIL import Image
+
+    cfg, graph, phi, partition, z, _, _ = _fixture()
+    ctx = ActionContext(image_pil=Image.new("RGB", (256, 128)), graph=graph, cfg=cfg,
+                        partition=partition)
+
+    inspect_client = _FakeClient('{"target_present": true, "density": "dense", '
+                                 '"object_scale": "small", "occlusion": "low", '
+                                 '"recommend": "tile", "notes": ""}')
+    vlm_client = _FakeClient('{"action": "tile", "args": {"conf": 0.3}}')
+
+    policy = runner.make_vlm_policy(ctx, inspect_client=inspect_client, vlm_client=vlm_client)
+    action = policy(phi, partition, cfg)   # t=1 -> inspect fires, then VLM chooses tile
+    assert isinstance(action, TileQueryA) and action.conf == 0.3

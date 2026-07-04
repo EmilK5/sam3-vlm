@@ -7,6 +7,8 @@ from PIL import Image
 
 from config import Config
 from graph import OrchardGraph
+from agent.actions import StopA
+from agent.budget import CostMeter
 from eval import metrics, run_eval
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -36,14 +38,14 @@ def test_normalized_cost_uses_cfg_weights():
 
 # ----------------------- estimators -----------------------
 
-def test_estimate_counts_counts_fruit_and_unresolved():
+def test_evaluate_image_uses_real_belief_estimators():
+    from agent.belief import count_estimates
     g = OrchardGraph()
     for cls in ("fruit", "fruit", "leaf", "spurious", "unresolved"):
         nid = g.add_candidate([0, 0, 5, 5], 0.9, found_in_pass=1)
         g.nodes[nid].classification = cls
-    est = run_eval.estimate_counts(g)
-    assert est["N_obs"] == 3          # 2 fruit + 1 unresolved
-    assert est["N_supp"] == est["N_cons"] == 3  # placeholders until Phase 2
+    est = count_estimates(g, Config())
+    assert est["N_obs"] == 3          # 2 fruit + 1 unresolved; leaf/spurious excluded
 
 
 # ----------------------- run_policy with a stub execute_pass -----------------------
@@ -79,37 +81,60 @@ def _run(policy, cfg, per_pass):
 
 
 def test_oneshot_runs_one_global_pass():
-    graph, counts, n_actions = _run("oneshot", Config(), [3])
-    assert counts["n_global"] == 1 and counts["n_tile"] == 0
+    graph, cost, n_actions = _run("oneshot", Config(), [3])
+    assert cost.n_sam == 1 and cost.n_tile == 0
     assert n_actions == 1
     assert len(graph.nodes) == 3
 
 
 def test_cascade_runs_four_global_passes():
-    _, counts, n_actions = _run("cascade", Config(), [1, 1, 1, 1])
-    assert counts["n_global"] == 4 and n_actions == 4
+    _, cost, n_actions = _run("cascade", Config(), [1, 1, 1, 1])
+    assert cost.n_sam == 4 and n_actions == 4
 
 
 def test_tiled_runs_four_tiled_passes():
-    _, counts, n_actions = _run("tiled", Config(), [1, 1, 1, 1])
-    assert counts["n_tile"] == 4 and counts["n_global"] == 0 and n_actions == 4
+    _, cost, n_actions = _run("tiled", Config(), [1, 1, 1, 1])
+    assert cost.n_tile == 4 and cost.n_sam == 0 and n_actions == 4
 
 
 def test_convergence_stops_when_no_new_candidates():
-    _, counts, n_actions = _run("convergence", Config(), [2, 1, 0, 5])
+    _, _cost, n_actions = _run("convergence", Config(), [2, 1, 0, 5])
     assert n_actions == 3          # pass 3 returns 0 -> stop (the 5 is never reached)
 
 
 def test_vip_counts_verify_calls():
     cfg = dataclasses.replace(Config(), verifier_mode="vip")
-    _, counts, _ = _run("oneshot", cfg, [4])
-    assert counts["n_verify"] == 4  # sum of post_verify
+    _, cost, _ = _run("oneshot", cfg, [4])
+    assert cost.n_verify == 4  # sum of post_verify
 
 
-def test_agent_policies_not_implemented():
-    for policy in ("heuristic", "vlm"):
-        with pytest.raises(NotImplementedError):
-            _run(policy, Config(), [1])
+def _episode_stub(script):
+    """Action-level executor stub for agent episodes: adds `script[i]` fruit nodes."""
+    state = {"i": 0}
+
+    def fn(action, ctx):
+        if isinstance(action, StopA):
+            return 0
+        n = script[min(state["i"], len(script) - 1)]
+        for j in range(n):
+            nid = ctx.graph.add_candidate([j, 0, j + 5, 5], 0.9, len(ctx.discovery.counts) + 1)
+            ctx.graph.nodes[nid].classification = "fruit"
+        state["i"] += 1
+        return n
+
+    return fn
+
+
+def test_heuristic_policy_runs_an_episode():
+    cfg = dataclasses.replace(Config(), delta_U=1e9, delta_disc=1.0)  # stop on saturation
+    graph, cost, n_actions = run_eval.run_policy(
+        "heuristic", processor=None, image_pil=Image.new("RGB", (64, 64)), cfg=cfg,
+        oracle=None, query_set=None, prompt="green fruit", conf=0.35,
+        episode_execute_fn=_episode_stub([3, 0, 0, 0]),
+    )
+    assert isinstance(cost, CostMeter)
+    assert 1 <= n_actions <= 6
+    assert len(graph.nodes) >= 1
 
 
 # ----------------------- build_verifier -----------------------

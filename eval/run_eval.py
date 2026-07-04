@@ -36,9 +36,11 @@ import numpy as np
 
 from config import Config
 from graph import OrchardGraph
+from agent.belief import count_estimates
+from agent.budget import CostMeter
 from eval.datasets import load_split
 from eval.matching import match, pool_recall, per_pass_pool_recall
-from eval.metrics import mae, rmse, exact, normalized_cost
+from eval.metrics import mae, rmse, exact
 
 logger = logging.getLogger(__name__)
 
@@ -62,13 +64,6 @@ def predicted_nodes(graph):
     return [n for n in graph.nodes.values() if n.classification in _TARGET_CLASSES]
 
 
-def estimate_counts(graph) -> dict:
-    """Zero-shot count estimates. N_supp/N_cons are placeholders (== N_obs) until
-    Phase 2 (support tracking + belief.py estimators)."""
-    n_obs = len(predicted_nodes(graph))
-    return {"N_obs": n_obs, "N_supp": n_obs, "N_cons": n_obs}
-
-
 def build_verifier(verifier: str, base_cfg=None, query_file=None, oracle=None):
     """Return (cfg, oracle, query_set) for a verifier mode. Oracle/query_set are
     None unless verifier == 'vip'. A prebuilt oracle may be injected (tests)."""
@@ -83,16 +78,12 @@ def build_verifier(verifier: str, base_cfg=None, query_file=None, oracle=None):
     return cfg, oracle, query_set
 
 
-def run_policy(policy, processor, image_pil, cfg, oracle, query_set, prompt, conf,
-               execute_pass_fn=None):
-    """Execute a fixed policy, returning (graph, counts, n_actions).
-
-    execute_pass_fn is injectable for testing; defaults to pipeline.execute_pass.
-    """
+def _run_fixed_policy(policy, processor, image_pil, cfg, oracle, query_set, prompt, conf,
+                      graph, execute_pass_fn):
+    """oneshot / cascade / tiled / convergence. Returns (CostMeter, n_actions)."""
     if execute_pass_fn is None:
         from pipeline import execute_pass as execute_pass_fn
 
-    graph = OrchardGraph()
     counts = {"n_global": 0, "n_tile": 0, "n_verify": 0}
 
     def do_pass(pass_number, tiling):
@@ -116,19 +107,51 @@ def run_policy(policy, processor, image_pil, cfg, oracle, query_set, prompt, con
         for p in range(1, CONVERGENCE_MAX_PASSES + 1):
             if do_pass(p, tiling=False) == 0:
                 break
-    elif policy in AGENT_POLICIES:
-        raise NotImplementedError(
-            f"policy '{policy}' requires the agent runner (Phase 4/5), not yet built."
-        )
     else:
-        raise ValueError(f"Unknown policy {policy!r}.")
+        raise ValueError(f"Unknown fixed policy {policy!r}.")
 
-    n_actions = counts["n_global"] + counts["n_tile"]
-    return graph, counts, n_actions
+    cost = CostMeter(n_sam=counts["n_global"], n_tile=counts["n_tile"], n_verify=counts["n_verify"])
+    return cost, counts["n_global"] + counts["n_tile"]
+
+
+def _run_agent_policy(policy, processor, image_pil, cfg, oracle, query_set,
+                      graph, episode_execute_fn):
+    """heuristic / vlm episodes. Returns (CostMeter, n_actions)."""
+    from agent.actions import ActionContext
+    from agent.belief import DiscoveryCurve
+    from agent import runner, policy_heuristic
+
+    w, h = image_pil.size
+    ctx = ActionContext(
+        processor=processor, image_pil=image_pil, graph=graph, cfg=cfg,
+        oracle=oracle, query_set=query_set, discovery=DiscoveryCurve(),
+        partition=[(0, 0, w, h)], cost=CostMeter(),
+    )
+    pol = policy_heuristic.choose if policy == "heuristic" else runner.make_vlm_policy(ctx)
+    result = runner.run_episode(image_pil, ctx, pol, max_actions=cfg.budget_max_actions,
+                                execute_fn=episode_execute_fn)
+    return ctx.cost, len(result["log"])
+
+
+def run_policy(policy, processor, image_pil, cfg, oracle, query_set, prompt, conf,
+               execute_pass_fn=None, episode_execute_fn=None):
+    """Run a policy on one image. Returns (graph, CostMeter, n_actions).
+
+    Fixed policies call execute_pass directly; agent policies (heuristic/vlm) run
+    an episode via agent.runner. Executors are injectable for testing.
+    """
+    graph = OrchardGraph()
+    if policy in AGENT_POLICIES:
+        cost, n_actions = _run_agent_policy(
+            policy, processor, image_pil, cfg, oracle, query_set, graph, episode_execute_fn)
+    else:
+        cost, n_actions = _run_fixed_policy(
+            policy, processor, image_pil, cfg, oracle, query_set, prompt, conf, graph, execute_pass_fn)
+    return graph, cost, n_actions
 
 
 def evaluate_image(sample, policy, cfg, oracle, query_set, processor, prompt, conf,
-                   execute_pass_fn=None, seed=0) -> dict:
+                   execute_pass_fn=None, episode_execute_fn=None, seed=0) -> dict:
     """Run one image through one policy+verifier and build its CSV row."""
     from PIL import Image
 
@@ -136,8 +159,9 @@ def evaluate_image(sample, policy, cfg, oracle, query_set, processor, prompt, co
     image_pil = Image.open(sample["image_path"]).convert("RGB")
 
     t0 = time.time()
-    graph, counts, n_actions = run_policy(
-        policy, processor, image_pil, cfg, oracle, query_set, prompt, conf, execute_pass_fn
+    graph, cost_meter, n_actions = run_policy(
+        policy, processor, image_pil, cfg, oracle, query_set, prompt, conf,
+        execute_pass_fn=execute_pass_fn, episode_execute_fn=episode_execute_fn,
     )
     seconds = time.time() - t0
 
@@ -145,7 +169,7 @@ def evaluate_image(sample, policy, cfg, oracle, query_set, processor, prompt, co
     pred_boxes = [n.box for n in predicted_nodes(graph)]
     all_boxes = [n.box for n in graph.nodes.values()]
     m = match(pred_boxes, gt)
-    est = estimate_counts(graph)
+    est = count_estimates(graph, cfg)  # real Phase-2 estimators
 
     return {
         "image": os.path.basename(sample["image_path"]),
@@ -160,7 +184,7 @@ def evaluate_image(sample, policy, cfg, oracle, query_set, processor, prompt, co
         "f1": round(m["f1"], 4),
         "pool_recall": round(pool_recall(all_boxes, gt), 4),
         "per_pass_pool_recall": json.dumps(per_pass_pool_recall(graph, gt)),
-        "cost": round(normalized_cost(counts, cfg), 4),
+        "cost": round(cost_meter.total(cfg), 4),
         "n_actions": n_actions,
         "seconds": round(seconds, 3),
     }

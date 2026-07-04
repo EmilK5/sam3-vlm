@@ -12,8 +12,29 @@ import logging
 from agent import belief
 from agent.actions import StopA
 from agent.actions import execute as default_execute
+from agent import policy_vlm
+from agent.inspect import inspect_scene, should_inspect
 
 logger = logging.getLogger(__name__)
+
+
+def make_vlm_policy(ctx, inspect_client=None, vlm_client=None):
+    """Adapt the VLM orchestrator into a runner policy `callable(phi, partition, cfg)`.
+
+    Maintains the episode step counter and last scene assessment z. Runs
+    inspect_scene only when the fixed protocol (should_inspect) fires, then asks
+    policy_vlm.choose to pick an action (which hard-validates and falls back to
+    the heuristic on any violation). Clients are injectable for offline testing.
+    """
+    state = {"t": 0, "last_z": None}
+
+    def policy(phi, partition, cfg):
+        state["t"] += 1
+        if should_inspect(state["t"], phi, state["last_z"]):
+            state["last_z"] = inspect_scene(ctx.image_pil, phi, cfg, client=inspect_client)
+        return policy_vlm.choose(phi, state["last_z"], partition, ctx.graph, cfg, client=vlm_client)
+
+    return policy
 
 
 def run_episode(image, ctx, policy, max_actions, execute_fn=None) -> dict:

@@ -32,12 +32,12 @@ follow the "Suggested order of the first week" in the plan.
 
 ## Phase 5 — VLM orchestrator
 - [x] 5.1 Scene inspection z_t (agent/inspect.py) — check: run inspect_scene on a dense-canopy image and a sparse one; compare the two JSONs against your own eyes.
-- [~] 5.2 VLM policy with strict validation (agent/policy_vlm.py) — check: run a full VLM episode with prompt logging; read one full prompt+response pair; confirm every executed action was validated (grep the policy_vlm logs for "fallback"). NOTE: the VLM episode loop (inspect->z, log-prompts wiring) is not in 5.2's files; see handoff.
+- [x] 5.2 VLM policy with strict validation (agent/policy_vlm.py) — check: run a full VLM episode with prompt logging; read one full prompt+response pair; confirm every executed action was validated (grep the policy_vlm logs for "fallback"). NOTE: the VLM episode loop (inspect->z, log-prompts wiring) is not in 5.2's files; see handoff.
 
 ## Phase 6 — Evaluation
 - [x] 6.1 Matching & detection metrics (eval/matching.py) — check: `pytest -q tests/test_matching.py`; then run matching on one real image vs GT — draw matched GT green, missed red, save to out/ (manual script).
 - [x] 6.2 Sweep runner (eval/run_eval.py) [REDUCED: oneshot/cascade/tiled/convergence only] — check: `--limit 5` on citrus for {oneshot,cascade}x{ioc,vip}; open CSV — pool_recall(cascade) >= pool_recall(oneshot); vip-vs-ioc precision delta shows if the verifier earns its cost.
-- [ ] 6.3 Results table & accuracy-vs-cost plot (eval/report.py)
+- [~] 6.3 Results table & accuracy-vs-cost plot (eval/report.py) — check: run report on your sweep CSV(s); the accuracy-vs-cost plot is the paper figure — confirm the policy story (one-shot → cascade → tiled → convergence → heuristic → VLM) is readable.
 
 ## Notes / decisions log
 <!-- Append dated one-liners here when a step deviates from the plan. -->
@@ -104,6 +104,21 @@ follow the "Suggested order of the first week" in the plan.
   image_np=img_np. NOT DONE (out of 1.5's file scope): run_image.py has no
   --verifier flag, so the plan's "run_image.py per verifier mode" manual check
   can't be run as written yet — needs a small step-0.2-file follow-up.
+- 2026-07-04 (6.3): eval/report.py reads sweep CSVs, prints a markdown table
+  (policy x verifier: MAE/RMSE/Exact/F1/pool_recall/mean cost) and saves
+  out/accuracy_vs_cost.png via a headless Agg Figure (no seaborn); verifier =
+  marker style, policy annotated. Added tests/test_report.py (plan named no test
+  file; ground rule requires one).
+- 2026-07-04 (follow-ups A+B, user request): (A) agent/runner.make_vlm_policy wraps
+  should_inspect->inspect_scene->policy_vlm.choose into a runner-compatible
+  callable(phi,partition,cfg) with injectable clients — the full VLM episode loop.
+  (B) eval/run_eval now uses belief.count_estimates (real N_supp/N_cons, no longer
+  == N_obs) and CostMeter.total for cost; --policy heuristic/vlm now run real
+  episodes via runner.run_episode (previously raised NotImplementedError). run_policy
+  returns (graph, CostMeter, n_actions); split into _run_fixed_policy/_run_agent_policy;
+  evaluate_image gained episode_execute_fn injection. Updated test_eval_sweep
+  accordingly (cost.n_* asserts, heuristic-episode test) + make_vlm_policy test.
+  This lifts the 6.2 "REDUCED" caveat.
 - 2026-07-04 (5.2): policy_vlm.choose(phi,z,partition,graph,cfg) one text call, no
   image; NO retry — any parse failure or validation violation falls straight back to
   policy_heuristic.choose (the safety net). VLM references regions/nodes by id only
