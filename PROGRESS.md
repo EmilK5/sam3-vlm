@@ -31,8 +31,8 @@ follow the "Suggested order of the first week" in the plan.
 - [x] 4.1 VoI heuristic policy + episode runner (agent/policy_heuristic.py, agent/runner.py) — check: run episodes on 3 images (sparse, dense, empty-of-fruit); read the JSON action traces — dense should trigger TileQuery/Subdivide, empty should stop within ~3 actions.
 
 ## Phase 5 — VLM orchestrator
-- [~] 5.1 Scene inspection z_t (agent/inspect.py) — check: run inspect_scene on a dense-canopy image and a sparse one; compare the two JSONs against your own eyes.
-- [ ] 5.2 VLM policy with strict validation (agent/policy_vlm.py)
+- [x] 5.1 Scene inspection z_t (agent/inspect.py) — check: run inspect_scene on a dense-canopy image and a sparse one; compare the two JSONs against your own eyes.
+- [~] 5.2 VLM policy with strict validation (agent/policy_vlm.py) — check: run a full VLM episode with prompt logging; read one full prompt+response pair; confirm every executed action was validated (grep the policy_vlm logs for "fallback"). NOTE: the VLM episode loop (inspect->z, log-prompts wiring) is not in 5.2's files; see handoff.
 
 ## Phase 6 — Evaluation
 - [x] 6.1 Matching & detection metrics (eval/matching.py) — check: `pytest -q tests/test_matching.py`; then run matching on one real image vs GT — draw matched GT green, missed red, save to out/ (manual script).
@@ -104,6 +104,16 @@ follow the "Suggested order of the first week" in the plan.
   image_np=img_np. NOT DONE (out of 1.5's file scope): run_image.py has no
   --verifier flag, so the plan's "run_image.py per verifier mode" manual check
   can't be run as written yet — needs a small step-0.2-file follow-up.
+- 2026-07-04 (5.2): policy_vlm.choose(phi,z,partition,graph,cfg) one text call, no
+  image; NO retry — any parse failure or validation violation falls straight back to
+  policy_heuristic.choose (the safety net). VLM references regions/nodes by id only
+  (no action accepts coordinates -> no box injection). Validation: region_id indexes
+  partition, conf in [0.1,0.9] (bool rejected), optional prompt must == target concept
+  (getattr target_prompt default "green fruit"), verify node_ids must be in-graph AND
+  unresolved-or-low-w (support_score < tau_w). Injectable client for tests; openai
+  lazy; logs prompt+response+"fallback" for the manual grep. NOT in 5.2's files
+  (deferred): the VLM episode loop that runs should_inspect->inspect_scene->passes z,
+  and a --log-prompts CLI — needs a runner/orchestrator touch beyond policy_vlm.py.
 - 2026-07-04 (5.1): inspect_scene mirrors QwenOracle (base64 image, strict JSON
   parse + retry + neutral fallback with recommend="query"); injectable client for
   offline tests; openai imported lazily. Strict _parse_z rejects missing keys / bad
