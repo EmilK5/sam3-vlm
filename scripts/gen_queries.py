@@ -84,7 +84,8 @@ def main():
     api_key = os.environ.get("QWEN_API_KEY")
     model = os.environ.get("QWEN_MODEL")
     if not base_url or not model:
-        raise SystemExit("Set QWEN_BASE_URL and QWEN_MODEL (and QWEN_API_KEY) in the environment.")
+        raise SystemExit("Set QWEN_BASE_URL and QWEN_MODEL "
+                         "(QWEN_API_KEY is optional for keyless local servers like vLLM).")
 
     # Imported lazily so the rest of the repo does not depend on `openai`.
     from openai import OpenAI

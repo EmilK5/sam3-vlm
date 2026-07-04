@@ -65,7 +65,8 @@ class QwenOracle:
     "unresolved" — never a wrong confident verdict).
 
     `client` may be injected for offline testing; otherwise an `openai` client is
-    built lazily from the config + QWEN_API_KEY env var.
+    built lazily from cfg.oracle_base_url. QWEN_API_KEY is optional: it defaults
+    to a placeholder that keyless local servers (e.g. vLLM) ignore.
     """
 
     SYSTEM_PROMPT = (
