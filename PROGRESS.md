@@ -25,10 +25,10 @@ follow the "Suggested order of the first week" in the plan.
 
 ## Phase 3 — Actions & cost
 - [x] 3.1 Action layer (agent/actions.py) — check: REPL execute one QueryA on a quadrant of a real image (build ActionContext, execute(QueryA(region=quadrant,...), ctx)); overlay shows detections only inside that quadrant.
-- [~] 3.2 Cost meter (agent/budget.py) — check: 2-pass run prints a cost line (CostMeter.total); recount by hand from the logs once.
+- [x] 3.2 Cost meter (agent/budget.py) — check: 2-pass run prints a cost line (CostMeter.total); recount by hand from the logs once.
 
 ## Phase 4 — Heuristic controller
-- [ ] 4.1 VoI heuristic policy + episode runner
+- [~] 4.1 VoI heuristic policy + episode runner (agent/policy_heuristic.py, agent/runner.py) — check: run episodes on 3 images (sparse, dense, empty-of-fruit); read the JSON action traces — dense should trigger TileQuery/Subdivide, empty should stop within ~3 actions.
 
 ## Phase 5 — VLM orchestrator
 - [ ] 5.1 Scene inspection z_t (agent/inspect.py)
@@ -104,6 +104,17 @@ follow the "Suggested order of the first week" in the plan.
   image_np=img_np. NOT DONE (out of 1.5's file scope): run_image.py has no
   --verifier flag, so the plan's "run_image.py per verifier mode" manual check
   can't be run as written yet — needs a small step-0.2-file follow-up.
+- 2026-07-04 (4.1): Prompt required estimators "in belief.py" (not in 4.1's Files
+  line) -> added count_estimates there (N_obs/N_supp/N_cons over non-leaf/non-spurious
+  nodes, consistent with 6.2's predicted_nodes; thresholds tau_w=0.5/k_min=2/
+  tau_high=0.5 via getattr, to be promoted to config later). Extended belief.summarize
+  to add U/ids/centers/area/classification so choose(phi,partition,cfg) is
+  self-contained (the region VoI proxies + VerifyA node_ids need per-node geometry;
+  existing summarize tests check key-presence, unaffected). policy_heuristic proxies
+  all documented in the choose docstring; c0/target_prompt/small_area via getattr
+  defaults. TileQuery cost proxy = c_tile*4 (real tile count only known post-hoc).
+  runner takes an injectable execute_fn; policy is a callable(phi,partition,cfg).
+  Stop-by-step-5 test relaxes delta_U so the stop hinges on discovery saturation.
 - 2026-07-04 (3.2): Files named budget.py/actions.py/test, but the Prompt required
   the tile count "from tiled_engine" -> additive pipeline.py edits (all backward
   compatible, hard-constraint #1 permits additive tiled_engine params): tiled_engine

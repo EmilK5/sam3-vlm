@@ -93,10 +93,18 @@ def summarize(graph, discovery, budget, cfg) -> dict:
     nodes = list(graph.nodes.values())
     tiling_status = any(":tiled:" in sig for n in nodes for sig in n.signatures)
 
+    def center(box):
+        return [round((box[0] + box[2]) / 2.0, 1), round((box[1] + box[3]) / 2.0, 1)]
+
     return {
         "K": len(nodes),
         "n_t": discovery.counts[-1] if discovery.counts else 0,
         "D": discovery.as_list(),
+        "U": round(uncertainty(graph, discovery, cfg), 3),
+        "ids": [n.id for n in nodes],
+        "centers": [center(n.box) for n in nodes],
+        "area": [round(n.area, 1) for n in nodes],
+        "classification": [n.classification for n in nodes],
         "w": [round(support_score(n, cfg), 3) for n in nodes],
         "s": [round(n.scores["detection_confidence"], 3) for n in nodes],
         "k": [n.support for n in nodes],
@@ -104,3 +112,33 @@ def summarize(graph, discovery, budget, cfg) -> dict:
         "tiling_status": tiling_status,
         "remaining_budget": budget,
     }
+
+
+# ----------------------- zero-shot count estimators -----------------------
+
+def _countable_nodes(graph):
+    """Nodes that count toward the target: verified fruit + still-unresolved
+    candidates (leaf / spurious are excluded from all count estimators)."""
+    return [n for n in graph.nodes.values() if n.classification in ("fruit", "unresolved")]
+
+
+def count_estimates(graph, cfg) -> dict:
+    """The three zero-shot count estimators (proposal §"Zero-Shot Count Estimates").
+
+        N_obs  = |countable candidates|
+        N_supp = #{ w_i >= tau_w }
+        N_cons = #{ k_i >= k_min OR s_bar_i >= tau_high }
+
+    Thresholds are read from cfg via getattr with documented defaults (config has
+    no such fields yet; a later step should promote them): tau_w=0.5, k_min=2,
+    tau_high=0.5.
+    """
+    tau_w = getattr(cfg, "tau_w", 0.5)
+    k_min = getattr(cfg, "k_min", 2)
+    tau_high = getattr(cfg, "tau_high", 0.5)
+
+    nodes = _countable_nodes(graph)
+    n_supp = sum(1 for n in nodes if support_score(n, cfg) >= tau_w)
+    n_cons = sum(1 for n in nodes
+                 if n.support >= k_min or n.scores["detection_confidence"] >= tau_high)
+    return {"N_obs": len(nodes), "N_supp": n_supp, "N_cons": n_cons}
