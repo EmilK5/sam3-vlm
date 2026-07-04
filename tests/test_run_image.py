@@ -7,10 +7,14 @@ sys.modules so the pure argparse / path logic can be exercised without any
 model machinery. No network, no weights.
 """
 
+import os
+import subprocess
 import sys
 import types
 
 import pytest
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 @pytest.fixture
@@ -58,3 +62,17 @@ def test_parse_args_defaults_and_flags(run_image_module):
 def test_parse_args_requires_image_and_prompt(run_image_module):
     with pytest.raises(SystemExit):
         run_image_module.parse_args(["--prompt", "x"])
+
+
+def test_script_invocation_can_import_config():
+    """Regression: `python scripts/run_image.py` must add the repo root to
+    sys.path BEFORE importing config. Run from a foreign cwd so only the
+    script's own directory is auto-added. The run may still fail later on the
+    missing `torch`, but it must NOT fail with 'No module named config'."""
+    script = os.path.join(REPO_ROOT, "scripts", "run_image.py")
+    proc = subprocess.run(
+        [sys.executable, script, "--help"],
+        capture_output=True, text=True, cwd=os.path.dirname(REPO_ROOT),
+    )
+    combined = proc.stdout + proc.stderr
+    assert "No module named 'config'" not in combined

@@ -12,12 +12,15 @@ import logging
 import os
 import sys
 
+# Make the repo root importable when run as `python scripts/run_image.py`
+# (running a script file puts scripts/ on sys.path, not the repo root).
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from config import Config
 
 _cfg = Config()
 if _cfg.sam3_repo not in sys.path:
     sys.path.append(_cfg.sam3_repo)
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from PIL import Image
 import torch

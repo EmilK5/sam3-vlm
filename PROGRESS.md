@@ -93,6 +93,14 @@ follow the "Suggested order of the first week" in the plan.
   step can add the field to Query. MockOracle "flip" = replace the clean
   template answer with a uniformly-chosen other value in {-1,0,1} (noise=1.0
   flips every query); Sam3Oracle presence answer = +1 if score>=tau else -1.
+- 2026-07-04 (0.2 bugfix): `scripts/run_image.py` imported `config` BEFORE adding
+  the repo root to sys.path, so `python scripts/run_image.py` (script invocation,
+  which puts scripts/ — not the repo root — on sys.path) failed with
+  "No module named 'config'". Moved the repo-root sys.path.append above the
+  config import (matching demo_verify.py/gen_queries.py). Added a subprocess
+  regression test (test_run_image.py) that runs the script from a foreign cwd;
+  the prior unit tests missed it because pytest already has the repo root on
+  the path. Fix is confined to 0.2's own file; step left [x].
 - 2026-07-04 (1.4): `extract_crop` returns a PIL image (oracles consume crop_pil;
   mirrors Image.fromarray in verify_box_semantics) and guards degenerate/zero-area
   boxes so cv2.resize never fails. Prior is uniform (proposal allows uniform or
