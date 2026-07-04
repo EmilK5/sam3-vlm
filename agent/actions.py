@@ -22,6 +22,7 @@ import dataclasses
 import numpy as np
 
 from verifier.verify import verify_candidate  # torch-free
+from agent.budget import CostMeter
 
 # target/distractor/spurious -> candidate-graph classification tags (mirrors pipeline).
 _VIP_TAG = {"target": "fruit", "distractor": "leaf", "spurious": "spurious"}
@@ -68,6 +69,7 @@ class ActionContext:
     query_set: object = None
     discovery: object = None
     partition: list = dataclasses.field(default_factory=list)
+    cost: CostMeter = dataclasses.field(default_factory=CostMeter)
 
 
 # ----------------------- helpers -----------------------
@@ -94,14 +96,30 @@ def _next_pass_number(ctx) -> int:
 
 def _execute_query(action, ctx, tiling, roi_override) -> int:
     from pipeline import execute_pass  # lazy: pipeline imports torch/inference
+    pass_number = _next_pass_number(ctx)
     stats = execute_pass(
         processor=ctx.processor, image_pil=ctx.image_pil, graph=ctx.graph,
         conf=action.conf, clahe=False, tiling=tiling,
-        pass_number=_next_pass_number(ctx), prompt=action.prompt,
+        pass_number=pass_number, prompt=action.prompt,
         cfg=ctx.cfg, oracle=ctx.oracle, query_set=ctx.query_set,
         roi_override=roi_override,
     )
+    _meter_query(ctx, tiling, pass_number, stats)
     return int(stats)
+
+
+def _meter_query(ctx, tiling, pass_number, stats):
+    """Cost of a Query/TileQuery. A tiled pass counts its tiles (n_tile); a global
+    query counts one SAM3 call (n_sam). Either way, the pass-1 leaf map is a global
+    SAM3 call (execute_pass generates it on the first pass)."""
+    if ctx.cost is None:
+        return
+    if tiling:
+        ctx.cost.n_tile += int(getattr(stats, "n_tiles", 0))
+    else:
+        ctx.cost.n_sam += 1
+    if pass_number == 1:
+        ctx.cost.n_sam += 1  # background leaf map
 
 
 def _execute_subdivide(action, ctx) -> int:
@@ -128,11 +146,16 @@ def _execute_verify(action, ctx) -> int:
         node.classification = _VIP_TAG.get(result["verdict"], "unresolved")
         node.vip_chain = result["chain"]
         node.vip_posterior = result["posterior"]
+        # n_oracle_calls is 1 (batched) or the chain length (sequential).
+        if ctx.cost is not None:
+            ctx.cost.n_verify += int(result["n_oracle_calls"])
     return 0  # verification doesn't create new tracks
 
 
 def execute(action, ctx) -> int:
     """Dispatch an action, returning the number of new candidate tracks created."""
+    if ctx.cost is not None:
+        ctx.cost.n_orch += 1  # one orchestration decision per executed action
     if isinstance(action, QueryA):
         return _execute_query(action, ctx, tiling=False, roi_override=action.region)
     if isinstance(action, TileQueryA):

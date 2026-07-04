@@ -24,8 +24,8 @@ follow the "Suggested order of the first week" in the plan.
 - [x] 2.2 belief.py: w_i, U, discovery curve, phi summary — check: pytest; then print φ (belief.summarize) after each pass in run_image — U (belief.uncertainty) should visibly drop across passes on an easy image.
 
 ## Phase 3 — Actions & cost
-- [~] 3.1 Action layer (agent/actions.py) — check: REPL execute one QueryA on a quadrant of a real image (build ActionContext, execute(QueryA(region=quadrant,...), ctx)); overlay shows detections only inside that quadrant.
-- [ ] 3.2 Cost meter (agent/budget.py)
+- [x] 3.1 Action layer (agent/actions.py) — check: REPL execute one QueryA on a quadrant of a real image (build ActionContext, execute(QueryA(region=quadrant,...), ctx)); overlay shows detections only inside that quadrant.
+- [~] 3.2 Cost meter (agent/budget.py) — check: 2-pass run prints a cost line (CostMeter.total); recount by hand from the logs once.
 
 ## Phase 4 — Heuristic controller
 - [ ] 4.1 VoI heuristic policy + episode runner
@@ -104,6 +104,18 @@ follow the "Suggested order of the first week" in the plan.
   image_np=img_np. NOT DONE (out of 1.5's file scope): run_image.py has no
   --verifier flag, so the plan's "run_image.py per verifier mode" manual check
   can't be run as written yet — needs a small step-0.2-file follow-up.
+- 2026-07-04 (3.2): Files named budget.py/actions.py/test, but the Prompt required
+  the tile count "from tiled_engine" -> additive pipeline.py edits (all backward
+  compatible, hard-constraint #1 permits additive tiled_engine params): tiled_engine
+  gains return_tile_count=False (default still returns the 2-tuple; n_tiles =
+  len(x_offsets)*len(y_offsets)); execute_pass captures it; PassStats gains n_tiles=0.
+  CostMeter lives on ActionContext (default_factory) so execute() meters in place;
+  n_orch += 1 per executed action (incl. Subdivide/Stop). Leaf-map +1 (n_sam) on
+  pass 1 applies to BOTH Query and TileQuery (it's the same physical global call in
+  execute_pass); the Prompt only named it under QueryA. VerifyA uses
+  result["n_oracle_calls"] (1 batched / chain length sequential) so both modes are
+  handled uniformly. Canopy Pass-0 SAM3 call is NOT separately metered (matches the
+  Prompt's simplified model; QueryA skips canopy anyway via roi_override).
 - 2026-07-04 (3.1): Files line named only actions.py + test, but the Prompt required
   adding roi_override to execute_pass (pipeline.py) — did that additive change
   (default None = canopy-gated behavior byte-for-byte; verified via diff + IoC golden

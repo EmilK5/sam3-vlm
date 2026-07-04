@@ -30,12 +30,13 @@ class PassStats(int):
         duplicates_rejected - candidates dropped by inter-pass dedup (vs prior fruit)
         accepted            - alias for the int value itself
     """
-    def __new__(cls, value, raw_proposals=0, post_nms=0, post_verify=0, duplicates_rejected=0):
+    def __new__(cls, value, raw_proposals=0, post_nms=0, post_verify=0, duplicates_rejected=0, n_tiles=0):
         obj = super().__new__(cls, value)
         obj.raw_proposals = raw_proposals
         obj.post_nms = post_nms
         obj.post_verify = post_verify
         obj.duplicates_rejected = duplicates_rejected
+        obj.n_tiles = n_tiles
         obj.accepted = int(value)
         return obj
 
@@ -294,9 +295,13 @@ def global_engine(processor, image_np, conf, prompt, pos_boxes=None, neg_boxes=N
     """
     return run_inference_block(processor, image_np, conf, prompt, pos_boxes, neg_boxes, disable_size_filter)
 
-def tiled_engine(processor, image_pil, confidence, clahe, prompt, pos_boxes=None, neg_boxes=None, global_leaf_boxes=None, disable_size_filter=False):
+def tiled_engine(processor, image_pil, confidence, clahe, prompt, pos_boxes=None, neg_boxes=None, global_leaf_boxes=None, disable_size_filter=False, return_tile_count=False):
     """
     Run tiled inference
+
+    return_tile_count: additive, backward-compatible. When True, also returns the
+    number of tiles actually run (len(x_offsets) * len(y_offsets)); the boxes/scores
+    outputs are unchanged.
     """
     master_w, master_h = image_pil.size
     tile_size = min(master_w, master_h) // 2
@@ -369,6 +374,8 @@ def tiled_engine(processor, image_pil, confidence, clahe, prompt, pos_boxes=None
 
     boxes = np.array(tiled_boxes_list) if tiled_boxes_list else np.empty((0, 4))
     scores = np.array(tiled_scores_list) if tiled_scores_list else np.empty((0,))
+    if return_tile_count:
+        return boxes, scores, len(x_offsets) * len(y_offsets)
     return boxes, scores
 
 # ==========================================
@@ -423,15 +430,16 @@ def execute_pass(processor, image_pil, graph, conf, clahe, tiling, pass_number, 
     master_scores = []
 
     # --- RUN COMPOSABLE PROPOSAL GENERATION ---
+    n_tiles = 0
     if tiling:
         logging.info("Tiled inference started...")
         # Only pass background leaves if pass_number > 1
         current_leaf_inhibitors = leaf_boxes if pass_number > 1 else None
 
-        candidate_boxes, candidate_scores = tiled_engine(
+        candidate_boxes, candidate_scores, n_tiles = tiled_engine(
             processor, roi_image_pil, conf, clahe, prompt,
             pos_boxes=pos_boxes, neg_boxes=neg_boxes, global_leaf_boxes=current_leaf_inhibitors,
-            disable_size_filter=disable_size_filter
+            disable_size_filter=disable_size_filter, return_tile_count=True
         )
         logging.info("Tiled inference ended...")
     else:
@@ -463,7 +471,7 @@ def execute_pass(processor, image_pil, graph, conf, clahe, tiling, pass_number, 
 
     if not master_boxes:
         logging.info("No new structures located in this generation sweep.")
-        return PassStats(0)
+        return PassStats(0, n_tiles=n_tiles)
 
     all_boxes = np.vstack(master_boxes)
     all_scores = np.concatenate(master_scores)
@@ -505,4 +513,5 @@ def execute_pass(processor, image_pil, graph, conf, clahe, tiling, pass_number, 
         post_nms=post_nms_count,
         post_verify=post_nms_count,
         duplicates_rejected=duplicates_rejected,
+        n_tiles=n_tiles,
     )
