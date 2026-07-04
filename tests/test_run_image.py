@@ -72,6 +72,27 @@ def test_parse_args_draw_gt_flag(run_image_module):
     assert ns.draw_gt is True
 
 
+def test_find_label_file_images_split_layout(run_image_module, tmp_path):
+    # dataset/images/train/img.png -> dataset/labels/train/img.txt
+    img = tmp_path / "images" / "train"
+    lbl = tmp_path / "labels" / "train"
+    img.mkdir(parents=True)
+    lbl.mkdir(parents=True)
+    (img / "img.png").write_bytes(b"")
+    label = lbl / "img.txt"
+    label.write_text("0 0.5 0.5 0.2 0.2\n")
+
+    found = run_image_module.find_label_file(str(img / "img.png"))
+    assert found is not None and os.path.abspath(found) == os.path.abspath(str(label))
+
+
+def test_find_label_file_missing_returns_none(run_image_module, tmp_path):
+    img = tmp_path / "images" / "train"
+    img.mkdir(parents=True)
+    (img / "img.png").write_bytes(b"")
+    assert run_image_module.find_label_file(str(img / "img.png")) is None
+
+
 def test_parse_args_verifier_choices(run_image_module):
     for mode in ("ioc", "vip", "off"):
         ns = run_image_module.parse_args(["--image", "a.jpg", "--prompt", "x", "--verifier", mode])

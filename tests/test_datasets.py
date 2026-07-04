@@ -35,13 +35,17 @@ def stub_heavy_deps():
                 sys.modules[name] = mod
 
 
-def _make_yolo_split(root, layout="subdirs"):
-    """Two 100x100 images + YOLO labels. a: 2 boxes, b: 1 box."""
-    if layout == "subdirs":
+def _make_yolo_split(root, split="train", flat=False):
+    """Two 100x100 images + YOLO labels in root/images/<split> + root/labels/<split>.
+
+    a: 2 boxes, b: 1 box. If flat=True, use root/images + root/labels (no split subdir).
+    """
+    if flat:
         img_dir = root / "images"
         lbl_dir = root / "labels"
     else:
-        img_dir = lbl_dir = root
+        img_dir = root / "images" / split
+        lbl_dir = root / "labels" / split
     img_dir.mkdir(parents=True, exist_ok=True)
     lbl_dir.mkdir(parents=True, exist_ok=True)
 
@@ -52,8 +56,8 @@ def _make_yolo_split(root, layout="subdirs"):
 
 
 def test_load_yolo_counts_and_coords(tmp_path, stub_heavy_deps):
-    _make_yolo_split(tmp_path, layout="subdirs")
-    samples = datasets.load_split(str(tmp_path), "yolo")
+    _make_yolo_split(tmp_path, split="train")
+    samples = datasets.load_split(str(tmp_path), "yolo", split="train")
 
     assert [s["count"] for s in samples] == [2, 1]  # sorted a, b
     a = samples[0]
@@ -64,26 +68,45 @@ def test_load_yolo_counts_and_coords(tmp_path, stub_heavy_deps):
     assert np.allclose(samples[1]["gt_boxes"][0], [30, 30, 70, 70])
 
 
-def test_load_yolo_same_dir_layout(tmp_path, stub_heavy_deps):
-    _make_yolo_split(tmp_path, layout="flat")
-    samples = datasets.load_split(str(tmp_path), "yolo")
+def test_load_yolo_selects_requested_split(tmp_path, stub_heavy_deps):
+    _make_yolo_split(tmp_path, split="train")          # 2 images
+    val_img = tmp_path / "images" / "val"
+    val_lbl = tmp_path / "labels" / "val"
+    val_img.mkdir(parents=True)
+    val_lbl.mkdir(parents=True)
+    Image.new("RGB", (100, 100)).save(val_img / "v.png")
+    (val_lbl / "v.txt").write_text("0 0.5 0.5 0.2 0.2\n")
+
+    assert len(datasets.load_split(str(tmp_path), "yolo", split="train")) == 2
+    val = datasets.load_split(str(tmp_path), "yolo", split="val")
+    assert len(val) == 1 and val[0]["count"] == 1
+
+
+def test_load_yolo_flat_layout_fallback(tmp_path, stub_heavy_deps):
+    _make_yolo_split(tmp_path, flat=True)
+    samples = datasets.load_split(str(tmp_path), "yolo", split="train")  # falls back to flat
     assert [s["count"] for s in samples] == [2, 1]
 
 
+def test_load_yolo_missing_dir_raises(tmp_path, stub_heavy_deps):
+    with pytest.raises(FileNotFoundError):
+        datasets.load_split(str(tmp_path), "yolo", split="train")  # nothing created
+
+
 def test_load_yolo_missing_label_is_empty(tmp_path, stub_heavy_deps):
-    (tmp_path / "images").mkdir()
-    (tmp_path / "labels").mkdir()
-    Image.new("RGB", (50, 50)).save(tmp_path / "images" / "c.png")  # no c.txt
-    samples = datasets.load_split(str(tmp_path), "yolo")
+    (tmp_path / "images" / "train").mkdir(parents=True)
+    (tmp_path / "labels" / "train").mkdir(parents=True)
+    Image.new("RGB", (50, 50)).save(tmp_path / "images" / "train" / "c.png")  # no c.txt
+    samples = datasets.load_split(str(tmp_path), "yolo", split="train")
     assert samples[0]["count"] == 0
     assert samples[0]["gt_boxes"].shape == (0, 4)
 
 
 def test_load_minneapple_instance_masks(tmp_path):
-    img_dir = tmp_path / "images"
-    mask_dir = tmp_path / "masks"
-    img_dir.mkdir()
-    mask_dir.mkdir()
+    img_dir = tmp_path / "images" / "train"
+    mask_dir = tmp_path / "masks" / "train"
+    img_dir.mkdir(parents=True)
+    mask_dir.mkdir(parents=True)
     Image.new("RGB", (100, 100)).save(img_dir / "x.png")
 
     mask = np.zeros((100, 100), dtype=np.uint8)
@@ -91,7 +114,7 @@ def test_load_minneapple_instance_masks(tmp_path):
     mask[50:55, 60:70] = 2   # instance 2 -> xs[60,69], ys[50,54]
     Image.fromarray(mask, mode="L").save(mask_dir / "x.png")
 
-    samples = datasets.load_split(str(tmp_path), "minneapple")
+    samples = datasets.load_split(str(tmp_path), "minneapple", split="train")
     assert samples[0]["count"] == 2
     boxes = samples[0]["gt_boxes"]
     # half-open max: [xmin, ymin, xmax+1, ymax+1]

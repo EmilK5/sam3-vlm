@@ -58,10 +58,21 @@ def parse_args(argv=None):
 
 
 def find_label_file(image_path: str):
-    """Locate a YOLO <stem>.txt label for an image (labels/ sibling, then same dir)."""
+    """Locate a YOLO <stem>.txt label for an image.
+
+    Handles the dataset layout images/<split>/img.png -> labels/<split>/img.txt
+    (by swapping an 'images' path component for 'labels'), plus a labels/ sibling
+    and same-directory fallback.
+    """
     directory = os.path.dirname(image_path)
     stem = os.path.splitext(os.path.basename(image_path))[0]
-    candidates = [
+
+    candidates = []
+    parts = directory.split(os.sep)
+    if "images" in parts:
+        swapped = [("labels" if p == "images" else p) for p in parts]
+        candidates.append(os.path.join(os.sep.join(swapped), stem + ".txt"))
+    candidates += [
         os.path.join(directory, "..", "labels", stem + ".txt"),
         os.path.join(directory, "labels", stem + ".txt"),
         os.path.join(directory, stem + ".txt"),

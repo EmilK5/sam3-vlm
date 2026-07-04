@@ -4,17 +4,24 @@ eval/datasets.py
 Ground-truth dataset loaders for evaluation. No labeled data is used before
 evaluation; these loaders exist only to score the zero-shot system.
 
-load_split(root, fmt) -> list of samples, each a dict:
+load_split(root, fmt, split) -> list of samples, each a dict:
     {"image_path": str, "gt_boxes": np.ndarray (N,4) float xyxy, "count": int}
 
 Coordinate frame: gt_boxes are global-frame xyxy pixels.
 
+Expected dataset layout (a per-split subdirectory under each kind):
+    root/
+      images/<split>/*.png|jpg
+      labels/<split>/*.txt         (yolo)
+      masks/<split>/*.png          (minneapple)
+where <split> is one of train / val / test. If the <split> subdirectory is
+absent, the loader falls back to the flat root/images (+ labels/masks) layout.
+
 Supported formats:
     "yolo"       - per-image <stem>.txt with rows "cls xc yc w h" (normalized),
-                   converted with inference.yolo_to_xyxy. Images and labels may
-                   live in root/images + root/labels, or side-by-side in root.
-    "minneapple" - per-image instance mask PNG (root/masks) where each object
-                   has a distinct pixel value/color; one box per instance id.
+                   converted with inference.yolo_to_xyxy.
+    "minneapple" - per-image instance mask PNG where each object has a distinct
+                   pixel value/color; one box per instance id.
 """
 
 import argparse
@@ -53,15 +60,21 @@ def parse_yolo_labels(label_path: str, img_w: int, img_h: int) -> np.ndarray:
     return np.array(boxes, dtype=float).reshape(-1, 4)
 
 
-def _resolve_dirs(root: str, image_sub: str, label_sub: str):
-    """Return (image_dir, label_dir), falling back to root when subdirs absent."""
-    image_dir = os.path.join(root, image_sub)
-    if not os.path.isdir(image_dir):
-        image_dir = root
-    label_dir = os.path.join(root, label_sub)
-    if not os.path.isdir(label_dir):
-        label_dir = root
-    return image_dir, label_dir
+def _split_dir(root: str, kind: str, split: str) -> str:
+    """Locate root/<kind>/<split>, falling back to the flat root/<kind>.
+
+    Raises FileNotFoundError (with a helpful message) if neither exists.
+    """
+    with_split = os.path.join(root, kind, split)
+    if os.path.isdir(with_split):
+        return with_split
+    flat = os.path.join(root, kind)
+    if os.path.isdir(flat):
+        return flat
+    raise FileNotFoundError(
+        f"Could not find '{kind}' for split '{split}': tried {with_split} and {flat}. "
+        f"Expected layout root/{kind}/<split>/."
+    )
 
 
 def _list_images(image_dir: str):
@@ -69,8 +82,9 @@ def _list_images(image_dir: str):
     return [n for n in names if os.path.splitext(n)[1].lower() in IMAGE_EXTS]
 
 
-def _load_yolo(root: str) -> list:
-    image_dir, label_dir = _resolve_dirs(root, "images", "labels")
+def _load_yolo(root: str, split: str) -> list:
+    image_dir = _split_dir(root, "images", split)
+    label_dir = _split_dir(root, "labels", split)
     samples = []
     for fname in _list_images(image_dir):
         stem = os.path.splitext(fname)[0]
@@ -112,8 +126,9 @@ def masks_to_boxes(mask_path: str) -> np.ndarray:
     return np.array(boxes, dtype=float).reshape(-1, 4)
 
 
-def _load_minneapple(root: str) -> list:
-    image_dir, mask_dir = _resolve_dirs(root, "images", "masks")
+def _load_minneapple(root: str, split: str) -> list:
+    image_dir = _split_dir(root, "images", split)
+    mask_dir = _split_dir(root, "masks", split)
     samples = []
     for fname in _list_images(image_dir):
         stem = os.path.splitext(fname)[0]
@@ -126,12 +141,12 @@ def _load_minneapple(root: str) -> list:
 
 # ----------------------- public API -----------------------
 
-def load_split(root: str, fmt: str) -> list:
-    """Load a dataset split. fmt in {"yolo", "minneapple"}."""
+def load_split(root: str, fmt: str, split: str = "train") -> list:
+    """Load a dataset split. fmt in {"yolo", "minneapple"}; split in train/val/test."""
     if fmt == "yolo":
-        return _load_yolo(root)
+        return _load_yolo(root, split)
     if fmt == "minneapple":
-        return _load_minneapple(root)
+        return _load_minneapple(root, split)
     raise ValueError(f"Unknown dataset fmt {fmt!r}; expected 'yolo' or 'minneapple'.")
 
 
@@ -155,13 +170,14 @@ def draw_gt_overlay(image_pil, gt_boxes, output_path: str):
 
 def main():
     parser = argparse.ArgumentParser(description="Inspect a ground-truth dataset split.")
-    parser.add_argument("--root", required=True, help="Dataset split root directory.")
+    parser.add_argument("--root", required=True, help="Dataset root (contains images/ and labels/).")
     parser.add_argument("--fmt", choices=["yolo", "minneapple"], required=True)
+    parser.add_argument("--split", default="train", help="Split subdir: train / val / test.")
     parser.add_argument("--out", default="out/gt_overlay.jpg", help="Where to save one GT overlay.")
     args = parser.parse_args()
 
-    samples = load_split(args.root, args.fmt)
-    print(f"Dataset size: {len(samples)} images")
+    samples = load_split(args.root, args.fmt, args.split)
+    print(f"Dataset '{args.split}' size: {len(samples)} images")
     for s in samples[:5]:
         print(f"  {os.path.basename(s['image_path'])}: {s['count']} objects")
 

@@ -104,6 +104,12 @@ follow the "Suggested order of the first week" in the plan.
   image_np=img_np. NOT DONE (out of 1.5's file scope): run_image.py has no
   --verifier flag, so the plan's "run_image.py per verifier mode" manual check
   can't be run as written yet — needs a small step-0.2-file follow-up.
+- 2026-07-04 (0.3 refactor, user request): datasets now use the layout
+  root/images/<split>/ + root/labels/<split>/ (+ masks/<split>/), split in
+  train/val/test. load_split gained a `split` param (default "train"); falls back
+  to flat root/images if the split subdir is absent, else raises FileNotFoundError.
+  main() gained --split. run_image find_label_file now maps images/<split>/img.png
+  -> labels/<split>/img.txt by swapping the 'images' path component for 'labels'.
 - 2026-07-04 (6.1): Did 6.1 before the remaining Phase 2-5 steps per the plan's
   suggested week-1 order (quantify vip-vs-ioc early). `scipy` (already listed in
   requirements.txt) was not installed in this dev env; installed scipy 1.18.0 to
