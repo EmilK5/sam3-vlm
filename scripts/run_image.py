@@ -52,7 +52,24 @@ def parse_args(argv=None):
                         help="Query set JSON for --verifier vip (defaults to cfg.vip_query_file).")
     parser.add_argument("--mock-class", default="target",
                         help="true_class for --oracle mock (offline vip runs).")
+    parser.add_argument("--draw-gt", action="store_true",
+                        help="Also save a GT overlay from the image's YOLO label (<stem>.txt).")
     return parser.parse_args(argv)
+
+
+def find_label_file(image_path: str):
+    """Locate a YOLO <stem>.txt label for an image (labels/ sibling, then same dir)."""
+    directory = os.path.dirname(image_path)
+    stem = os.path.splitext(os.path.basename(image_path))[0]
+    candidates = [
+        os.path.join(directory, "..", "labels", stem + ".txt"),
+        os.path.join(directory, "labels", stem + ".txt"),
+        os.path.join(directory, stem + ".txt"),
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return None
 
 
 def build_verifier(args):
@@ -124,6 +141,19 @@ def main():
         json.dump(orchard_graph.to_dict(), f, indent=2)
 
     logging.info(f"Saved overlay to {overlay_path} and graph to {graph_path}")
+
+    if args.draw_gt:
+        from eval.datasets import parse_yolo_labels, draw_gt_overlay
+        label_path = find_label_file(args.image)
+        if label_path is None:
+            logging.warning("--draw-gt: no YOLO label found next to %s", args.image)
+        else:
+            img_w, img_h = image_pil.size
+            gt_boxes = parse_yolo_labels(label_path, img_w, img_h)
+            stem = os.path.splitext(os.path.basename(args.image))[0]
+            gt_path = os.path.join(_cfg.output_dir, f"{stem}_gt.jpg")
+            draw_gt_overlay(image_pil, gt_boxes, gt_path)
+            logging.info(f"Saved GT overlay to {gt_path} ({len(gt_boxes)} boxes)")
 
 
 if __name__ == "__main__":

@@ -64,6 +64,12 @@ def test_parse_args_defaults_and_flags(run_image_module):
     assert ns.clahe is False
     assert ns.conf == 0.35  # default pulled from Config().conf
     assert ns.verifier == "ioc"  # default keeps the old behavior
+    assert ns.draw_gt is False
+
+
+def test_parse_args_draw_gt_flag(run_image_module):
+    ns = run_image_module.parse_args(["--image", "a.jpg", "--prompt", "x", "--draw-gt"])
+    assert ns.draw_gt is True
 
 
 def test_parse_args_verifier_choices(run_image_module):

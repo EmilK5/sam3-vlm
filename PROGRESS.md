@@ -10,7 +10,7 @@ follow the "Suggested order of the first week" in the plan.
 ## Phase 0 — Scaffold & harness
 - [x] 0.1 Package layout + config.py — check: `pytest -q` green; `python -c "from config import Config; print(Config())"` prints all grouped fields with sane defaults.
 - [x] 0.2 CLI runner for the existing cascade (scripts/run_image.py, graph.to_dict) — check: run on a real orchard image with `--passes 3`; overlay resembles Gradio output; `out/<stem>_graph.json` opens and node count matches the logged pass stats.
-- [ ] 0.3 Dataset loader (eval/datasets.py)
+- [~] 0.3 Dataset loader (eval/datasets.py) — check: `python -m eval.datasets --root <yolo-split> --fmt yolo`; the saved GT overlay boxes sit on real fruit. Also `run_image.py --draw-gt` saves out/<stem>_gt.jpg.
 
 ## Phase 1 — FM+V-IP verifier
 - [x] 1.1 Query sets + generation script (verifier/queries.py, queries/green_citrus.json) — check: read queries/green_citrus.json by hand — every query answerable from a 256px crop; templates (T/D/S) match your intuition; edit freely. `pytest -q` green.
@@ -104,6 +104,15 @@ follow the "Suggested order of the first week" in the plan.
   image_np=img_np. NOT DONE (out of 1.5's file scope): run_image.py has no
   --verifier flag, so the plan's "run_image.py per verifier mode" manual check
   can't be run as written yet — needs a small step-0.2-file follow-up.
+- 2026-07-04 (0.3): eval/datasets.py imports inference.yolo_to_xyxy LAZILY so the
+  module (and its MinneApple/overlay paths) stay torch-free; the YOLO test stubs
+  torch+transformers to load the real yolo_to_xyxy. YOLO loader supports both
+  images/+labels/ subdirs and same-dir layouts. MinneApple boxes use half-open
+  max [xmin,ymin,xmax+1,ymax+1] per instance id; handles grayscale (value=id) and
+  RGB (color=id) masks. draw_gt_overlay uses a headless Agg Figure (no global
+  matplotlib.use) so tests need no display. run_image --draw-gt auto-locates the
+  image's YOLO <stem>.txt (labels/ sibling, then same dir) and saves
+  out/<stem>_gt.jpg via the datasets helper.
 - 2026-07-04 (post-1.5, user request): Added verifier "off" mode (config.py
   comment + pipeline.py): registers candidates but does no classification, so
   nodes stay "unresolved" (no-verifier baseline). Added `--verifier {ioc,vip,off}`
