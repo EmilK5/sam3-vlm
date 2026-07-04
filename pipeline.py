@@ -90,7 +90,7 @@ def compute_ioc(candidate_box, leaf_box):
     return inter_area / float(candidate_area) if candidate_area > 0 else 0.0
 
 def register_and_verify_candidates(candidate_boxes, candidate_scores, leaf_boxes, graph, pass_number, iou_threshold=0.40,
-                                   cfg=None, oracle=None, query_set=None, image_np=None):
+                                   cfg=None, oracle=None, query_set=None, image_np=None, signature=None):
     """
     Dedicated registration function. Cross-references fruit candidates against
     globally detected leaf maps to apply semantic verdicts without cropping.
@@ -121,7 +121,7 @@ def register_and_verify_candidates(candidate_boxes, candidate_scores, leaf_boxes
 
     for box, score in zip(candidate_boxes, candidate_scores):
         # --- Inter-Pass Deduplication: Skip if this box overlaps an existing valid object ---
-        is_duplicate = False
+        matched_node = None
         for existing_node in graph.nodes.values():
             # Only deduplicate against confirmed target detections ("fruit")
             if existing_node.classification == "fruit":
@@ -129,16 +129,23 @@ def register_and_verify_candidates(candidate_boxes, candidate_scores, leaf_boxes
                 existing_box = getattr(existing_node, 'bbox', getattr(existing_node, 'box', None))
 
                 if existing_box is not None and compute_iou(box, existing_box) > iou_threshold:
-                    is_duplicate = True
+                    matched_node = existing_node
                     break
 
-        if is_duplicate:
-            logging.info("Cross-pass duplicate detected. Skipping node registration.")
+        if matched_node is not None:
+            # Rejected as a duplicate (registration unchanged) but reinforce the
+            # matched track's support/jitter/signatures.
+            logging.info("Cross-pass duplicate detected. Reinforcing existing track.")
+            matched_node.reinforce(box, signature)
             duplicates_rejected += 1
             continue
 
         # --- REGISTER: Initialize the candidate node in our database ---
         node_id = graph.add_candidate(box, score, found_in_pass=pass_number)
+        if signature is not None:
+            # Record the query signature of the detection that created this track,
+            # so support == number of distinct signatures (k = |Q|).
+            graph.nodes[node_id].signatures.add(signature)
 
         # --- VERIFIER OFF: register only; leave the node "unresolved" ---
         if verify_off:
@@ -471,6 +478,8 @@ def execute_pass(processor, image_pil, graph, conf, clahe, tiling, pass_number, 
     global_leaf_boxes = translate_roi_to_global(leaf_boxes, roi)
 
     # --- GLOBAL CROSS-REFERENCE VERIFICATION ---
+    mode = "tiled" if tiling else "global"
+    signature = f"{pass_number}:{mode}:{prompt}:{conf:.2f}"
     added_nodes, duplicates_rejected = register_and_verify_candidates(
         candidate_boxes=global_candidate_boxes,
         candidate_scores=roi_scores_final,
@@ -482,6 +491,7 @@ def execute_pass(processor, image_pil, graph, conf, clahe, tiling, pass_number, 
         oracle=oracle,
         query_set=query_set,
         image_np=img_np,
+        signature=signature,
     )
 
     return PassStats(

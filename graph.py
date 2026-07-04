@@ -41,6 +41,35 @@ class OrchardNode:
         self.vip_chain = None                        # [{"q": text, "a": "yes/no/unsure"}, ...]
         self.vip_posterior = None                    # posterior over classes, as a list
 
+        # Belief-state support statistics (proposal §"Candidate Graph").
+        self.support = 1                             # k_i: number of detections backing this track
+        self.signatures = set()                      # Q_i: distinct query signatures that hit it
+        self.jitter = 0.0                            # Delta_i: running-mean center displacement (px)
+        self.area = self._box_area()                 # A_i: representative box area (px^2)
+
+    def _box_area(self) -> float:
+        return float((self.box[2] - self.box[0]) * (self.box[3] - self.box[1]))
+
+    def _center(self, box) -> tuple:
+        return ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0)
+
+    def reinforce(self, box: list, signature: str):
+        """Record a cross-pass re-detection of this track.
+
+        Increments support k, adds the query signature, and folds the re-detection's
+        center displacement (from this node's representative box) into jitter as a
+        running mean over the re-detections.
+        """
+        cx, cy = self._center(box)
+        rx, ry = self._center(self.box)
+        displacement = ((cx - rx) ** 2 + (cy - ry) ** 2) ** 0.5
+
+        self.support += 1
+        if signature is not None:
+            self.signatures.add(signature)
+        n_redetections = self.support - 1            # this is the k-1'th re-detection
+        self.jitter += (displacement - self.jitter) / n_redetections
+
     def to_dict(self) -> dict:
         """
         Helper to print out node details
@@ -50,7 +79,11 @@ class OrchardNode:
             "box": self.box,
             "found_in_pass": self.found_in_pass,
             "scores": self.scores,
-            "classification": self.classification
+            "classification": self.classification,
+            "support": self.support,
+            "jitter": self.jitter,
+            "area": self.area,
+            "signatures": sorted(self.signatures),
         }
         if self.vip_chain is not None:
             d["vip_chain"] = self.vip_chain

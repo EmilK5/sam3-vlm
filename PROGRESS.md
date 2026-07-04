@@ -20,7 +20,7 @@ follow the "Suggested order of the first week" in the plan.
 - [x] 1.5 Pipeline integration behind verifier="vip" flag — check: `scripts/run_image.py --passes 2` twice per verifier mode, diff the two overlays + graph JSONs, spot-check 5 differing nodes with demo_verify. NOTE: run_image.py has no --verifier flag yet (out of 1.5's file scope); see handoff for how to exercise the vip path meanwhile.
 
 ## Phase 2 — Belief state
-- [ ] 2.1 Support, jitter, signatures on nodes (graph.py, pipeline dedup branch)
+- [~] 2.1 Support, jitter, signatures on nodes (graph.py, pipeline dedup branch) — check: 3-pass run; print top-10 nodes by `support` from the graph JSON — stable fruits should have support>=2, one-off junk support==1.
 - [ ] 2.2 belief.py: w_i, U, discovery curve, phi summary
 
 ## Phase 3 — Actions & cost
@@ -104,6 +104,17 @@ follow the "Suggested order of the first week" in the plan.
   image_np=img_np. NOT DONE (out of 1.5's file scope): run_image.py has no
   --verifier flag, so the plan's "run_image.py per verifier mode" manual check
   can't be run as written yet — needs a small step-0.2-file follow-up.
+- 2026-07-04 (2.1): OrchardNode gains support(k)/signatures(set)/jitter/area +
+  reinforce(box, signature). jitter = running mean of Euclidean center displacement
+  of re-detections vs the representative box center. Also record the CREATING
+  signature on the accepted node (pipeline accept branch) so support == |signatures|
+  (proposal k=|Q|); the plan only named reinforce, noting the addition. to_dict now
+  emits support/jitter/area/signatures (signatures as sorted list) — needed for the
+  "top-10 by k from graph JSON" check; existing to_dict tests check key presence not
+  exclusivity, so unaffected. Dedup branch: captures the matched fruit node and calls
+  reinforce; acceptance/rejection behavior byte-for-byte unchanged (signature defaults
+  None -> no-op on the IoC golden path). Signature built in execute_pass:
+  f"{pass_number}:{mode}:{prompt}:{conf:.2f}", mode = tiled/global.
 - 2026-07-04 (6.2 REDUCED): Implemented per the plan's suggested-order milestone
   "6.2 with {oneshot, cascade} only" because Phases 2-5 don't exist yet. IN:
   metrics.py (mae/rmse/exact + normalized_cost from a call-counts dict + cfg
