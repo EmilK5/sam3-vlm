@@ -21,10 +21,10 @@ follow the "Suggested order of the first week" in the plan.
 
 ## Phase 2 — Belief state
 - [x] 2.1 Support, jitter, signatures on nodes (graph.py, pipeline dedup branch) — check: 3-pass run; print top-10 nodes by `support` from the graph JSON — stable fruits should have support>=2, one-off junk support==1.
-- [~] 2.2 belief.py: w_i, U, discovery curve, phi summary — check: pytest; then print φ (belief.summarize) after each pass in run_image — U (belief.uncertainty) should visibly drop across passes on an easy image.
+- [x] 2.2 belief.py: w_i, U, discovery curve, phi summary — check: pytest; then print φ (belief.summarize) after each pass in run_image — U (belief.uncertainty) should visibly drop across passes on an easy image.
 
 ## Phase 3 — Actions & cost
-- [ ] 3.1 Action layer (agent/actions.py)
+- [~] 3.1 Action layer (agent/actions.py) — check: REPL execute one QueryA on a quadrant of a real image (build ActionContext, execute(QueryA(region=quadrant,...), ctx)); overlay shows detections only inside that quadrant.
 - [ ] 3.2 Cost meter (agent/budget.py)
 
 ## Phase 4 — Heuristic controller
@@ -104,6 +104,16 @@ follow the "Suggested order of the first week" in the plan.
   image_np=img_np. NOT DONE (out of 1.5's file scope): run_image.py has no
   --verifier flag, so the plan's "run_image.py per verifier mode" manual check
   can't be run as written yet — needs a small step-0.2-file follow-up.
+- 2026-07-04 (3.1): Files line named only actions.py + test, but the Prompt required
+  adding roi_override to execute_pass (pipeline.py) — did that additive change
+  (default None = canopy-gated behavior byte-for-byte; verified via diff + IoC golden
+  still green). partition lives on ActionContext (plan: "on the episode state");
+  SubdivideA mutates it in place and execute still returns int 0. pass_number for
+  Query/TileQuery derived as len(discovery.counts)+1 (no explicit episode pass
+  counter). TileQueryA = global tiled (roi_override=None). actions.py imports pipeline
+  LAZILY (torch) but verify_candidate at top (torch-free), so the module + Subdivide/
+  Verify are CPU-testable; Query/TileQuery tested via a sys.modules pipeline stub.
+  SubdivideA raises ValueError if the region isn't in the partition (surfaces policy bugs).
 - 2026-07-04 (2.2): belief.py pure functions, formulas verbatim from the proposal.
   s_bar = node.scores["detection_confidence"] (no running-aggregate score exists yet).
   support_score's plausible-area term reads cfg.area_min/area_max via getattr with

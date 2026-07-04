@@ -377,7 +377,7 @@ def tiled_engine(processor, image_pil, confidence, clahe, prompt, pos_boxes=None
 
 def execute_pass(processor, image_pil, graph, conf, clahe, tiling, pass_number, prompt,
                  disable_size_filter=False, nms_mode="dualgate", use_concentric=False,
-                 cfg=None, oracle=None, query_set=None):
+                 cfg=None, oracle=None, query_set=None, roi_override=None):
     """
     Runs one full pass of SAM3 pipeline
     Propose -> Register -> Verify -> Feedback
@@ -394,7 +394,12 @@ def execute_pass(processor, image_pil, graph, conf, clahe, tiling, pass_number, 
     img_h, img_w = img_np.shape[:2]
 
     # --- RUN OR RETRIEVE CANOPY GATE [PASS 0] ---
-    roi = initialize_canopy_roi(processor, img_np, graph)
+    # roi_override (region-restricted query) skips canopy detection entirely and
+    # uses the given xyxy region; default None keeps the canopy-gated behavior.
+    if roi_override is not None:
+        roi = [int(v) for v in roi_override]
+    else:
+        roi = initialize_canopy_roi(processor, img_np, graph)
     roi_x1, roi_y1, roi_x2, roi_y2 = roi
 
     # Crop the PIL image tightly to the tree zone for the processing track
