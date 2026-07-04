@@ -35,7 +35,7 @@ follow the "Suggested order of the first week" in the plan.
 - [ ] 5.2 VLM policy with strict validation (agent/policy_vlm.py)
 
 ## Phase 6 — Evaluation
-- [ ] 6.1 Matching & detection metrics (eval/matching.py)
+- [~] 6.1 Matching & detection metrics (eval/matching.py) — check: `pytest -q tests/test_matching.py`; then run matching on one real image vs GT — draw matched GT green, missed red, save to out/ (manual script).
 - [ ] 6.2 Sweep runner (eval/run_eval.py)
 - [ ] 6.3 Results table & accuracy-vs-cost plot (eval/report.py)
 
@@ -104,6 +104,15 @@ follow the "Suggested order of the first week" in the plan.
   image_np=img_np. NOT DONE (out of 1.5's file scope): run_image.py has no
   --verifier flag, so the plan's "run_image.py per verifier mode" manual check
   can't be run as written yet — needs a small step-0.2-file follow-up.
+- 2026-07-04 (6.1): Did 6.1 before the remaining Phase 2-5 steps per the plan's
+  suggested week-1 order (quantify vip-vs-ioc early). `scipy` (already listed in
+  requirements.txt) was not installed in this dev env; installed scipy 1.18.0 to
+  run tests — no new dependency, no code/requirements change. match() maximizes
+  total IoU via linear_sum_assignment then drops sub-threshold pairs (one-to-one).
+  pool_recall is COVERAGE (each GT matched by any candidate), not one-to-one, per
+  the proposal. Empty-GT -> recall/pool_recall 0.0 (guarded). per_pass_pool_recall
+  is cumulative (pool at pass p = candidates with found_in_pass <= p), over ALL
+  node boxes regardless of classification (discovery, not verification).
 - 2026-07-04 (0.3): eval/datasets.py imports inference.yolo_to_xyxy LAZILY so the
   module (and its MinneApple/overlay paths) stay torch-free; the YOLO test stubs
   torch+transformers to load the real yolo_to_xyxy. YOLO loader supports both
