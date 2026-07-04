@@ -1,8 +1,13 @@
-# Tier B Testing Guide — vLLM + Qwen + real SAM3
+# Tier B Testing Guide — Qwen VLM server (vLLM or Ollama) + real SAM3
 
 This walks you, end to end, through:
-1. Starting a **local Qwen vision server** with vLLM (no API key).
+1. Starting a **local Qwen vision server** — pick **Option A (vLLM)** or
+   **Option B (Ollama)**. Both expose an OpenAI-compatible endpoint, so the
+   project code is identical; only two env vars differ. No API key either way.
 2. Running **all the Tier B tests** (the real-model checks for Phases 0 and 1).
+
+The project talks to whichever server through `QWEN_BASE_URL` + `QWEN_MODEL`;
+nothing in the code is vLLM- or Ollama-specific.
 
 Everything is copy-paste. Placeholders are only `IMG` (your test image) — every
 other value is derived automatically.
@@ -11,8 +16,11 @@ other value is derived automatically.
 
 ## Before you start
 
-You need a machine with an **NVIDIA GPU**. You'll use **two terminals**:
-- **Terminal A** — runs the Qwen vLLM server (stays open the whole time).
+SAM3 itself needs a machine that can load `facebook/sam3` (a CUDA GPU in
+practice). For the **VLM server**: vLLM needs an NVIDIA GPU; Ollama also runs on
+Apple Silicon / AMD / CPU (vision models are slow on CPU but fine for a few test
+images). You'll use **two terminals**:
+- **Terminal A** — runs the Qwen VLM server (stays open the whole time).
 - **Terminal B** — runs the project tests.
 
 In **Terminal B**, from the project root, make sure the project deps are installed:
@@ -28,7 +36,9 @@ download can take a few minutes. That's normal.
 
 ## Part 1 — Start the Qwen vision server (Terminal A)
 
-### 1.1 Install vLLM (in its OWN environment)
+Do **either** Option A or Option B, then continue to Part 2.
+
+### Option A — vLLM (NVIDIA GPU)
 
 vLLM ships its own copy of torch, so install it in a **separate** virtualenv to
 avoid disturbing the project's environment:
@@ -42,23 +52,44 @@ pip install --upgrade vllm
 > Use a **recent** vLLM — Qwen3-VL support landed in late-2025 releases. If the
 > serve command later complains about an unknown architecture, upgrade vLLM.
 
-### 1.2 Launch the server
-
 ```bash
 vllm serve Qwen/Qwen3-VL-8B-Instruct \
   --served-model-name qwen3-vl \
   --port 8000
 ```
 
-- The **first launch downloads the model** (several GB). Wait until you see a
-  line like `Uvicorn running on http://0.0.0.0:8000`.
-- `--served-model-name qwen3-vl` is what makes `QWEN_MODEL=qwen3-vl` work below,
-  regardless of which Qwen model you actually load.
+- First launch **downloads the model** (several GB). Wait for `Uvicorn running on
+  http://0.0.0.0:8000`.
+- `--served-model-name qwen3-vl` is what makes `QWEN_MODEL=qwen3-vl` work below.
+- OOM? add `--max-model-len 8192` or use `Qwen/Qwen3-VL-4B-Instruct` /
+  `-2B-Instruct`. Multi-GPU: `--tensor-parallel-size N`.
 
-**If you run out of GPU memory**, either add `--max-model-len 8192`, or pick a
-smaller model — swap the first argument for one of:
-`Qwen/Qwen3-VL-4B-Instruct` or `Qwen/Qwen3-VL-2B-Instruct`.
-**Multiple GPUs?** add `--tensor-parallel-size N`.
+For vLLM, in Part 2 use `QWEN_BASE_URL=http://localhost:8000/v1` and
+`QWEN_MODEL=qwen3-vl`.
+
+### Option B — Ollama (NVIDIA / AMD / Apple Silicon / CPU)
+
+```bash
+# install Ollama (https://ollama.com), then:
+ollama pull qwen2.5-vl:7b        # a VISION model (needed for the oracle + inspect crops)
+ollama serve                     # usually already running as a service
+```
+
+- The **model tag** you pull (e.g. `qwen2.5-vl:7b`) is exactly what `QWEN_MODEL`
+  must be — check with `ollama list`. Use whatever Qwen-VL tag your Ollama has;
+  it **must be vision-capable**.
+- Ollama serves the OpenAI-compatible API at **port 11434** by default.
+- **Context length:** Ollama models default to a small `num_ctx`. The VLM-policy
+  prompt (φ) can be long; if you see truncated/garbage JSON, raise it via a
+  Modelfile:
+  ```bash
+  printf 'FROM qwen2.5-vl:7b\nPARAMETER num_ctx 8192\n' > Modelfile
+  ollama create qwen2.5-vl-8k -f Modelfile
+  # then use QWEN_MODEL=qwen2.5-vl-8k
+  ```
+
+For Ollama, in Part 2 use `QWEN_BASE_URL=http://localhost:11434/v1` and
+`QWEN_MODEL=<your pulled tag>`.
 
 Leave this terminal running.
 
@@ -66,16 +97,22 @@ Leave this terminal running.
 
 ## Part 2 — Point the project at the server (Terminal B)
 
+Use the pair matching the option you started (no API key needed either way):
+
 ```bash
+# Option A — vLLM
 export QWEN_BASE_URL=http://localhost:8000/v1
 export QWEN_MODEL=qwen3-vl
-# No API key needed for a local vLLM server.
+
+# Option B — Ollama
+export QWEN_BASE_URL=http://localhost:11434/v1
+export QWEN_MODEL=qwen2.5-vl:7b        # must match `ollama list`
 ```
 
-Confirm the server is reachable — this should list `qwen3-vl`:
+Confirm the server is reachable — this should list your model:
 
 ```bash
-curl http://localhost:8000/v1/models
+curl "$QWEN_BASE_URL/models"
 ```
 
 ---
@@ -171,7 +208,9 @@ defensible one.
 ## Part 4 — Stopping
 
 - In **Terminal B**, nothing to stop.
-- In **Terminal A**, press **Ctrl-C** to shut down the vLLM server.
+- **vLLM** (Terminal A): press **Ctrl-C**.
+- **Ollama**: it runs as a background service; `ollama stop <model>` unloads the
+  model from memory (or leave it — it idles out).
 
 ---
 
@@ -179,9 +218,12 @@ defensible one.
 
 | Symptom | Fix |
 |---|---|
-| `curl .../v1/models` fails | Server still loading, or wrong port. Wait for the `Uvicorn running` line; make sure `QWEN_BASE_URL` ends in `/v1`. |
-| Every oracle answer is `0` / `unsure` | The model isn't returning valid JSON. Confirm `QWEN_MODEL` matches `--served-model-name`; try a larger Qwen3-VL model. |
+| `curl "$QWEN_BASE_URL/models"` fails | Server still loading, or wrong port/URL. vLLM: wait for `Uvicorn running`; Ollama: `ollama serve` running on 11434. Make sure `QWEN_BASE_URL` ends in `/v1`. |
+| Every oracle answer is `0` / `unsure` | The model isn't returning valid JSON. Confirm `QWEN_MODEL` matches the served name (`ollama list` for Ollama); try a larger Qwen-VL model. |
+| Answers ignore the image / describe nothing | The model isn't vision-capable, or the endpoint dropped the image. Use a `*-vl` / `-vision` tag; on Ollama confirm the tag supports images. |
+| VLM policy JSON truncated / cut off | Prompt exceeds the model context. Ollama: raise `num_ctx` via a Modelfile (see Option B). vLLM: raise `--max-model-len`. |
 | vLLM: "unknown model architecture" | Upgrade vLLM: `pip install --upgrade vllm`. |
-| GPU out of memory on the server | Add `--max-model-len 8192`, or use `Qwen/Qwen3-VL-4B-Instruct` / `-2B-Instruct`. |
+| Ollama: `model not found` | Pull it first (`ollama pull <tag>`) and set `QWEN_MODEL` to the exact `ollama list` tag. |
+| GPU out of memory on the server | vLLM: `--max-model-len 8192` or a smaller model. Ollama: use a smaller tag (e.g. `:3b`). |
 | SAM3 first run is slow | Expected — weight download + `torch.compile` warm-up. |
 | `run_image.py` can't find the image | Use a path relative to where you run the command, e.g. `dataset/images/val/xyz.png`. |
