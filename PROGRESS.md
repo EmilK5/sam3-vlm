@@ -14,7 +14,7 @@ follow the "Suggested order of the first week" in the plan.
 
 ## Phase 1 — FM+V-IP verifier
 - [x] 1.1 Query sets + generation script (verifier/queries.py, queries/green_citrus.json) — check: read queries/green_citrus.json by hand — every query answerable from a 256px crop; templates (T/D/S) match your intuition; edit freely. `pytest -q` green.
-- [ ] 1.2 Oracles (MockOracle, QwenOracle, Sam3Oracle)
+- [x] 1.2 Oracles (MockOracle, QwenOracle, Sam3Oracle) — check: `pytest -q tests/test_oracle.py`; then a REPL smoke test with a real QwenOracle on one fruit crop — answers visibly sane (round=yes, veins=no).
 - [x] 1.3 Training-free V-IP core (verifier/vip.py, pure numpy) — check: `pytest -v tests/test_vip.py` — read the four test names; they are the spec.
 - [ ] 1.4 Verify API + demo (verifier/verify.py, scripts/demo_verify.py)  ← GO/NO-GO checkpoint
 - [ ] 1.5 Pipeline integration behind verifier="vip" flag
@@ -82,3 +82,14 @@ follow the "Suggested order of the first week" in the plan.
   uninformative row, CMI >= 0, empty-S == prior, max_q cap, prior-driven
   verdict), and new test_run_image.py (+3) exercising the argparse/path helpers
   via sys.modules stubs for torch/inference/pipeline. Suite: 14 -> 39, all green.
+- 2026-07-04 (1.2): Did 1.2 after 1.3 per the plan's suggested week-1 order.
+  `torch` and `openai` are imported LAZILY inside the methods that need them
+  (Sam3Oracle._presence_score / QwenOracle._client), so oracle.py imports on a
+  CPU box with neither installed and Mock/Qwen stay testable offline. QwenOracle
+  takes an optional injectable `client` for offline testing (the canned fake).
+  Sam3Oracle reads `sam3_phrase` via getattr(query, ...) — the Query dataclass
+  (step 1.1) has no such field and 1.2 may not touch queries.py, so with the
+  current query sets Sam3Oracle returns all-zeros and calls no model; a later
+  step can add the field to Query. MockOracle "flip" = replace the clean
+  template answer with a uniformly-chosen other value in {-1,0,1} (noise=1.0
+  flips every query); Sam3Oracle presence answer = +1 if score>=tau else -1.
