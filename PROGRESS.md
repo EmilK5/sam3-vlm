@@ -16,7 +16,7 @@ follow the "Suggested order of the first week" in the plan.
 - [x] 1.1 Query sets + generation script (verifier/queries.py, queries/green_citrus.json) — check: read queries/green_citrus.json by hand — every query answerable from a 256px crop; templates (T/D/S) match your intuition; edit freely. `pytest -q` green.
 - [x] 1.2 Oracles (MockOracle, QwenOracle, Sam3Oracle) — check: `pytest -q tests/test_oracle.py`; then a REPL smoke test with a real QwenOracle on one fruit crop — answers visibly sane (round=yes, veins=no).
 - [x] 1.3 Training-free V-IP core (verifier/vip.py, pure numpy) — check: `pytest -v tests/test_vip.py` — read the four test names; they are the spec.
-- [ ] 1.4 Verify API + demo (verifier/verify.py, scripts/demo_verify.py)  ← GO/NO-GO checkpoint
+- [x] 1.4 Verify API + demo (verifier/verify.py, scripts/demo_verify.py)  ← GO/NO-GO checkpoint — check: run demo on 3 hand-picked boxes (clear fruit, clear leaf, junk) with `--oracle qwen`; the three chains should read like sensible reasoning. Tweak queries/epsilon in the JSON and re-run. This is where you judge whether the whole idea works.
 - [ ] 1.5 Pipeline integration behind verifier="vip" flag
 
 ## Phase 2 — Belief state
@@ -93,3 +93,13 @@ follow the "Suggested order of the first week" in the plan.
   step can add the field to Query. MockOracle "flip" = replace the clean
   template answer with a uniformly-chosen other value in {-1,0,1} (noise=1.0
   flips every query); Sam3Oracle presence answer = +1 if score>=tau else -1.
+- 2026-07-04 (1.4): `extract_crop` returns a PIL image (oracles consume crop_pil;
+  mirrors Image.fromarray in verify_box_semantics) and guards degenerate/zero-area
+  boxes so cv2.resize never fails. Prior is uniform (proposal allows uniform or
+  confidence-derived; plan unspecified). Epsilon comes from query_set.epsilon via
+  vip.likelihood_table (what 1.3 tested), NOT cfg.vip_epsilon — cfg.vip_epsilon is
+  currently unused/redundant; flag for later reconciliation. Sequential mode
+  re-implements the greedy loop here (interleaving oracle calls) using vip
+  primitives; batched uses vip.run_ip. demo_verify displays the winning class's
+  posterior mass max(posterior), not p_target, so a non-target verdict reads
+  sensibly (e.g. "-> distractor (0.92)").
