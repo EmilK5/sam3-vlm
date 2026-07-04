@@ -1,0 +1,14 @@
+# Core (versions pinned by your SAM3 setup — install torch/transformers per the
+# SAM3 repo instructions first, then the rest)
+torch
+transformers
+numpy
+opencv-python
+pillow
+matplotlib
+scipy
+gradio
+# Verifier / agent
+openai        # client only, for the OpenAI-compatible Qwen endpoint
+# Dev
+pytest

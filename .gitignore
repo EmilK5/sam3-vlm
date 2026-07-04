@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+out/*
+!out/.gitkeep
+session_output.jpg
+.env
+venv/
+.venv/
+# personal Claude Code settings stay local
+.claude/settings.local.json
