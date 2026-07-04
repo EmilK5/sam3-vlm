@@ -36,7 +36,7 @@ follow the "Suggested order of the first week" in the plan.
 
 ## Phase 6 — Evaluation
 - [~] 6.1 Matching & detection metrics (eval/matching.py) — check: `pytest -q tests/test_matching.py`; then run matching on one real image vs GT — draw matched GT green, missed red, save to out/ (manual script).
-- [ ] 6.2 Sweep runner (eval/run_eval.py)
+- [~] 6.2 Sweep runner (eval/run_eval.py) [REDUCED: oneshot/cascade/tiled/convergence only] — check: `--limit 5` on citrus for {oneshot,cascade}x{ioc,vip}; open CSV — pool_recall(cascade) >= pool_recall(oneshot); vip-vs-ioc precision delta shows if the verifier earns its cost.
 - [ ] 6.3 Results table & accuracy-vs-cost plot (eval/report.py)
 
 ## Notes / decisions log
@@ -104,6 +104,19 @@ follow the "Suggested order of the first week" in the plan.
   image_np=img_np. NOT DONE (out of 1.5's file scope): run_image.py has no
   --verifier flag, so the plan's "run_image.py per verifier mode" manual check
   can't be run as written yet — needs a small step-0.2-file follow-up.
+- 2026-07-04 (6.2 REDUCED): Implemented per the plan's suggested-order milestone
+  "6.2 with {oneshot, cascade} only" because Phases 2-5 don't exist yet. IN:
+  metrics.py (mae/rmse/exact + normalized_cost from a call-counts dict + cfg
+  ratios) and run_eval.py with policies oneshot/cascade/tiled/convergence, CSV +
+  aggregate + resume-safe + per-image numpy seed. DEFERRED (all forward-compatible):
+  (a) N_supp/N_cons are placeholders == N_obs until support tracking (2.1) +
+  belief.py estimators (2.2); estimate_counts() is the single swap point.
+  (b) --policy heuristic/vlm kept in the CLI but raise NotImplementedError until
+  the runner (4.1/5.2). (c) cost is a pass-count approximation (n_global/n_tile/
+  n_verify) pending CostMeter (3.2) — normalized_cost already matches the proposal
+  formula, so CostMeter just feeds it real counts later. N_obs = predicted nodes =
+  classification in {fruit, unresolved} (so verifier="off" still yields a count).
+  execute_pass is injected (execute_pass_fn) so run_policy is testable without torch.
 - 2026-07-04 (0.3 refactor, user request): datasets now use the layout
   root/images/<split>/ + root/labels/<split>/ (+ masks/<split>/), split in
   train/val/test. load_split gained a `split` param (default "train"); falls back
