@@ -3,18 +3,17 @@ eval/run_eval.py
 
 Policy x verifier sweep over a dataset split, writing one CSV row per image.
 
-Policies (this reduced version, per the plan's suggested-order "6.2 with
-{oneshot, cascade} only" milestone):
+Policies:
     oneshot     - 1 global pass
     cascade     - 4 fixed global passes
     tiled       - 4 fixed tiled passes
     convergence - global passes until a pass discovers 0 new candidates
-    heuristic / vlm - require the agent runner (Phase 4/5); not built -> raise.
+    heuristic / vlm - agent episodes via agent.runner.run_episode.
 
-Count estimators: N_obs = predicted (fruit / unresolved) node count. N_supp and
-N_cons are placeholders equal to N_obs until belief.py (step 2.2) and support
-tracking (step 2.1) land; run_eval will then call the real estimators. Cost is a
-pass-count approximation (n_global / n_tile / n_verify) pending CostMeter (3.2).
+Count estimators come from agent.belief.count_estimates (N_obs / N_supp /
+N_cons). Cost comes from a CostMeter fed by the actual per-pass call counts on
+PassStats (n_sam_calls / n_tiles / n_verify_calls), so fixed policies and agent
+episodes are metered on the same scale.
 
 The sweep is resume-safe (skips image/policy/verifier rows already in the CSV)
 and uses a fixed numpy seed per image for reproducibility.
@@ -64,6 +63,13 @@ def predicted_nodes(graph):
     return [n for n in graph.nodes.values() if n.classification in _TARGET_CLASSES]
 
 
+def verifier_label(cfg) -> str:
+    """CSV 'verifier' value: the verifier mode, tagged when mask overlap is on,
+    so box and mask sweeps of the same policy don't collide on resume."""
+    tag = "+mask" if getattr(cfg, "overlap_mode", "box") == "mask" else ""
+    return cfg.verifier_mode + tag
+
+
 def build_verifier(verifier: str, base_cfg=None, query_file=None, oracle=None):
     """Return (cfg, oracle, query_set) for a verifier mode. Oracle/query_set are
     None unless verifier == 'vip'. A prebuilt oracle may be injected (tests)."""
@@ -84,7 +90,7 @@ def _run_fixed_policy(policy, processor, image_pil, cfg, oracle, query_set, prom
     if execute_pass_fn is None:
         from pipeline import execute_pass as execute_pass_fn
 
-    counts = {"n_global": 0, "n_tile": 0, "n_verify": 0}
+    cost = CostMeter()
 
     def do_pass(pass_number, tiling):
         stats = execute_pass_fn(
@@ -92,10 +98,15 @@ def _run_fixed_policy(policy, processor, image_pil, cfg, oracle, query_set, prom
             clahe=False, tiling=tiling, pass_number=pass_number, prompt=prompt,
             cfg=cfg, oracle=oracle, query_set=query_set,
         )
-        counts["n_tile" if tiling else "n_global"] += 1
-        if cfg.verifier_mode == "vip":
-            counts["n_verify"] += int(getattr(stats, "post_verify", 0))
+        # Meter from the pass's actual call counts (canopy + leaf map + proposal
+        # in n_sam_calls; tiles; real vip oracle calls) — same scale as episodes.
+        cost.n_sam += int(getattr(stats, "n_sam_calls", 0))
+        cost.n_tile += int(getattr(stats, "n_tiles", 0))
+        cost.n_verify += int(getattr(stats, "n_verify_calls", 0))
+        do_pass.n_passes += 1
         return int(stats)
+
+    do_pass.n_passes = 0
 
     if policy == "oneshot":
         do_pass(1, tiling=False)
@@ -110,8 +121,7 @@ def _run_fixed_policy(policy, processor, image_pil, cfg, oracle, query_set, prom
     else:
         raise ValueError(f"Unknown fixed policy {policy!r}.")
 
-    cost = CostMeter(n_sam=counts["n_global"], n_tile=counts["n_tile"], n_verify=counts["n_verify"])
-    return cost, counts["n_global"] + counts["n_tile"]
+    return cost, do_pass.n_passes
 
 
 def _run_agent_policy(policy, processor, image_pil, cfg, oracle, query_set,
@@ -121,11 +131,25 @@ def _run_agent_policy(policy, processor, image_pil, cfg, oracle, query_set,
     from agent.belief import DiscoveryCurve
     from agent import runner, policy_heuristic
 
-    w, h = image_pil.size
+    cost = CostMeter()
+
+    # Partition starts as [tree_roi] (plan 4.1): anchor the episode's regions to
+    # the canopy so region queries don't waste budget on soil/sky. Needs SAM3, so
+    # with no processor (offline tests / stubbed executors) fall back to the full
+    # frame. The canopy sweep is one real global SAM3 call -> metered.
+    if processor is not None:
+        from pipeline import initialize_canopy_roi  # lazy: pipeline imports torch
+        roi = initialize_canopy_roi(processor, np.array(image_pil), graph)
+        cost.n_sam += 1
+        partition = [tuple(int(v) for v in roi)]
+    else:
+        w, h = image_pil.size
+        partition = [(0, 0, w, h)]
+
     ctx = ActionContext(
         processor=processor, image_pil=image_pil, graph=graph, cfg=cfg,
         oracle=oracle, query_set=query_set, discovery=DiscoveryCurve(),
-        partition=[(0, 0, w, h)], cost=CostMeter(),
+        partition=partition, cost=cost,
     )
     pol = policy_heuristic.choose if policy == "heuristic" else runner.make_vlm_policy(ctx)
     result = runner.run_episode(image_pil, ctx, pol, max_actions=cfg.budget_max_actions,
@@ -174,7 +198,7 @@ def evaluate_image(sample, policy, cfg, oracle, query_set, processor, prompt, co
     return {
         "image": os.path.basename(sample["image_path"]),
         "policy": policy,
-        "verifier": cfg.verifier_mode,
+        "verifier": verifier_label(cfg),
         "N_gt": sample["count"],
         "N_obs": est["N_obs"],
         "N_supp": est["N_supp"],
@@ -241,6 +265,8 @@ def parse_args(argv=None):
     parser.add_argument("--policy", required=True,
                         choices=["oneshot", "cascade", "tiled", "convergence", "heuristic", "vlm"])
     parser.add_argument("--verifier", choices=["ioc", "vip", "off"], default="ioc")
+    parser.add_argument("--overlap-mode", choices=["box", "mask"], default="box",
+                        help="NMS IoU/IoM + cross-pass dedup on boxes (default) or SAM3 masks.")
     parser.add_argument("--prompt", default="green fruit")
     parser.add_argument("--conf", type=float, default=None, help="Detection conf (default cfg.conf).")
     parser.add_argument("--query-file", default=None)
@@ -257,6 +283,11 @@ def main():
     base_cfg = Config()
     conf = args.conf if args.conf is not None else base_cfg.conf
     cfg, oracle, query_set = build_verifier(args.verifier, base_cfg, args.query_file)
+    # Agent policies read the concept/confidence from cfg (fixed policies get them
+    # as arguments), so mirror the CLI values there: --prompt/--conf apply to ALL
+    # policies. --overlap-mode selects box vs mask IoU/IoM everywhere.
+    cfg = dataclasses.replace(cfg, target_prompt=args.prompt, conf=conf,
+                              overlap_mode=args.overlap_mode)
 
     samples = load_split(args.root, args.fmt, args.split)
     if args.limit is not None:
@@ -272,8 +303,9 @@ def main():
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     done = existing_keys(args.out)
 
+    label = verifier_label(cfg)
     for i, sample in enumerate(samples):
-        key = (os.path.basename(sample["image_path"]), args.policy, args.verifier)
+        key = (os.path.basename(sample["image_path"]), args.policy, label)
         if key in done:
             logger.info("skip (already done): %s", key)
             continue
@@ -282,7 +314,7 @@ def main():
         append_row(args.out, row)
         logger.info("row: %s", {k: row[k] for k in ("image", "N_gt", "N_obs", "f1", "pool_recall", "cost")})
 
-    print_aggregate(args.out, args.policy, args.verifier)
+    print_aggregate(args.out, args.policy, label)
 
 
 if __name__ == "__main__":

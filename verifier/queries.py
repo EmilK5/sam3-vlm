@@ -28,10 +28,14 @@ class Query:
     templates maps each class name to tau in {-1, 0, +1}:
     +1 = a "yes" is expected for that class, -1 = a "no" is expected,
     0 = the query is uninformative for that class.
+
+    sam3_phrase (optional): a segmentable noun phrase (e.g. "stem") for the
+    SAM3-presence oracle channel; None means only VLM oracles answer this query.
     """
     id: str
     text: str
     templates: dict
+    sam3_phrase: str = None
 
 
 @dataclasses.dataclass
@@ -113,7 +117,12 @@ def _validate(data: dict) -> QuerySet:
                     f"must be one of {sorted(VALID_TEMPLATE_VALUES)}."
                 )
 
-        queries.append(Query(id=qid, text=q["text"], templates=dict(templates)))
+        sam3_phrase = q.get("sam3_phrase")
+        if sam3_phrase is not None and (not isinstance(sam3_phrase, str) or not sam3_phrase.strip()):
+            raise ValueError(f"Query '{qid}' has a non-string/empty 'sam3_phrase': {sam3_phrase!r}.")
+
+        queries.append(Query(id=qid, text=q["text"], templates=dict(templates),
+                             sam3_phrase=sam3_phrase))
 
     return QuerySet(
         concept=concept,

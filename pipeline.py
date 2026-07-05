@@ -28,15 +28,25 @@ class PassStats(int):
         post_nms            - survivors after NMS (baseline IoU or dual-gate)
         post_verify         - candidates that reached the verification gate
         duplicates_rejected - candidates dropped by inter-pass dedup (vs prior fruit)
+        n_tiles             - tile-level SAM3 calls run by this pass (tiled passes)
+        n_sam_calls         - global SAM3 calls actually made by this pass
+                              (canopy pass-0 if it ran + leaf map if generated +
+                              the global proposal call when not tiling)
+        n_verify_calls      - FM+V-IP oracle calls actually made (vip mode only:
+                              excludes dedup-rejected and <12px-skipped candidates;
+                              chain lengths in sequential answer mode)
         accepted            - alias for the int value itself
     """
-    def __new__(cls, value, raw_proposals=0, post_nms=0, post_verify=0, duplicates_rejected=0, n_tiles=0):
+    def __new__(cls, value, raw_proposals=0, post_nms=0, post_verify=0, duplicates_rejected=0,
+                n_tiles=0, n_sam_calls=0, n_verify_calls=0):
         obj = super().__new__(cls, value)
         obj.raw_proposals = raw_proposals
         obj.post_nms = post_nms
         obj.post_verify = post_verify
         obj.duplicates_rejected = duplicates_rejected
         obj.n_tiles = n_tiles
+        obj.n_sam_calls = n_sam_calls
+        obj.n_verify_calls = n_verify_calls
         obj.accepted = int(value)
         return obj
 
@@ -90,8 +100,33 @@ def compute_ioc(candidate_box, leaf_box):
 
     return inter_area / float(candidate_area) if candidate_area > 0 else 0.0
 
+def compute_mask_iou(box_a, mask_a, box_b, mask_b):
+    """IoU of two instance masks stored as box-cropped boolean arrays.
+
+    box_a/box_b are global-frame xyxy pixels; mask_a/mask_b are boolean arrays
+    whose row 0 / col 0 correspond to their box's y1 / x1 (frame-independent, so
+    masks recorded under different ROIs remain comparable). Returns 0.0 when the
+    boxes don't intersect.
+    """
+    ax1, ay1 = int(round(box_a[0])), int(round(box_a[1]))
+    bx1, by1 = int(round(box_b[0])), int(round(box_b[1]))
+
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax1 + mask_a.shape[1], bx1 + mask_b.shape[1])
+    iy2 = min(ay1 + mask_a.shape[0], by1 + mask_b.shape[0])
+    if ix2 <= ix1 or iy2 <= iy1:
+        return 0.0
+
+    sub_a = mask_a[iy1 - ay1:iy2 - ay1, ix1 - ax1:ix2 - ax1]
+    sub_b = mask_b[iy1 - by1:iy2 - by1, ix1 - bx1:ix2 - bx1]
+    inter = float(np.count_nonzero(np.logical_and(sub_a, sub_b)))
+    union = float(np.count_nonzero(mask_a)) + float(np.count_nonzero(mask_b)) - inter
+    return inter / union if union > 0 else 0.0
+
 def register_and_verify_candidates(candidate_boxes, candidate_scores, leaf_boxes, graph, pass_number, iou_threshold=0.40,
-                                   cfg=None, oracle=None, query_set=None, image_np=None, signature=None):
+                                   cfg=None, oracle=None, query_set=None, image_np=None, signature=None,
+                                   candidate_masks=None, call_counter=None):
     """
     Dedicated registration function. Cross-references fruit candidates against
     globally detected leaf maps to apply semantic verdicts without cropping.
@@ -108,6 +143,14 @@ def register_and_verify_candidates(candidate_boxes, candidate_scores, leaf_boxes
                classified, so every node stays "unresolved". Useful as a
                no-verifier baseline / ablation.
 
+    candidate_masks: optional list of box-cropped boolean masks aligned with
+    candidate_boxes (overlap_mode="mask"). When a candidate and an existing node
+    both carry masks, cross-pass dedup uses mask IoU instead of box IoU; the mask
+    is stored on newly registered nodes.
+
+    call_counter: optional dict; when given, 'n_oracle_calls' is incremented by
+    the oracle calls actually made on the VIP path (for cost metering).
+
     Returns (added_nodes, duplicates_rejected). The inter-pass duplicate counter
     was added for diagnostics.
     """
@@ -117,19 +160,37 @@ def register_and_verify_candidates(candidate_boxes, candidate_scores, leaf_boxes
     if use_vip and (oracle is None or query_set is None or image_np is None):
         raise ValueError("verifier_mode='vip' requires oracle, query_set, and image_np.")
 
+    # Dedup match set. The validated IoC gate only ever deduplicates against
+    # confirmed "fruit" (unchanged). vip/off also match "unresolved" tracks:
+    # under those modes candidates can legitimately stay unresolved (vip <12px
+    # skips; all of "off"), and without this every pass would re-register the
+    # same objects as new nodes, inflating N_obs and breaking convergence.
+    dedup_classes = ("fruit",) if mode == "ioc" else ("fruit", "unresolved")
+
     added_nodes = 0
     duplicates_rejected = 0
 
-    for box, score in zip(candidate_boxes, candidate_scores):
+    for cand_idx, (box, score) in enumerate(zip(candidate_boxes, candidate_scores)):
+        cand_mask = candidate_masks[cand_idx] if candidate_masks is not None else None
+
         # --- Inter-Pass Deduplication: Skip if this box overlaps an existing valid object ---
         matched_node = None
         for existing_node in graph.nodes.values():
-            # Only deduplicate against confirmed target detections ("fruit")
-            if existing_node.classification == "fruit":
+            if existing_node.classification in dedup_classes:
                 # Defensive check: safely grab coordinate array whether named .bbox or .box
                 existing_box = getattr(existing_node, 'bbox', getattr(existing_node, 'box', None))
+                if existing_box is None:
+                    continue
 
-                if existing_box is not None and compute_iou(box, existing_box) > iou_threshold:
+                # Mask IoU when both sides carry masks (overlap_mode="mask"),
+                # else the original box IoU.
+                existing_mask = getattr(existing_node, "mask", None)
+                if cand_mask is not None and existing_mask is not None:
+                    overlap = compute_mask_iou(box, cand_mask, existing_box, existing_mask)
+                else:
+                    overlap = compute_iou(box, existing_box)
+
+                if overlap > iou_threshold:
                     matched_node = existing_node
                     break
 
@@ -147,6 +208,8 @@ def register_and_verify_candidates(candidate_boxes, candidate_scores, leaf_boxes
             # Record the query signature of the detection that created this track,
             # so support == number of distinct signatures (k = |Q|).
             graph.nodes[node_id].signatures.add(signature)
+        if cand_mask is not None:
+            graph.nodes[node_id].mask = cand_mask
 
         # --- VERIFIER OFF: register only; leave the node "unresolved" ---
         if verify_off:
@@ -162,10 +225,15 @@ def register_and_verify_candidates(candidate_boxes, candidate_scores, leaf_boxes
                 continue
 
             result = verify.verify_candidate(image_np, box, oracle, query_set, cfg)
+            if call_counter is not None:
+                call_counter["n_oracle_calls"] = (
+                    call_counter.get("n_oracle_calls", 0) + int(result["n_oracle_calls"])
+                )
             node = graph.nodes[node_id]
-            dist_idx = query_set.classes.index("distractor") if "distractor" in query_set.classes else 0
+            has_distractor = "distractor" in query_set.classes
+            dist_score = result["posterior"][query_set.classes.index("distractor")] if has_distractor else 0.0
             node.scores["fruit_verification"] = float(result["p_target"])
-            node.scores["leaf_verification"] = float(result["posterior"][dist_idx])
+            node.scores["leaf_verification"] = float(dist_score)
             node.classification = _VIP_TAG.get(result["verdict"], "unresolved")
             node.vip_chain = result["chain"]
             node.vip_posterior = result["posterior"]
@@ -277,23 +345,30 @@ def translate_roi_to_global(boxes, roi):
 # 3. Inference Block
 # ==========================================
 
-def run_inference_block(processor, image_np, conf, prompt, pos_boxes=None, neg_boxes=None, disable_size_filter=False):
+def run_inference_block(processor, image_np, conf, prompt, pos_boxes=None, neg_boxes=None, disable_size_filter=False,
+                        return_masks=False):
     """
     Atomic block to run one SAM 3 pass
+
+    return_masks: additive, backward-compatible passthrough to
+    inference.run_raw_inference (False keeps the legacy 2-tuple return).
     """
     return inference.run_raw_inference(
-        processor, image_np, conf, prompt=prompt, pos_boxes=pos_boxes, neg_boxes=neg_boxes, disable_size_filter=disable_size_filter
+        processor, image_np, conf, prompt=prompt, pos_boxes=pos_boxes, neg_boxes=neg_boxes,
+        disable_size_filter=disable_size_filter, return_masks=return_masks
     )
 
 # ==========================================
 # 4. Execution Engines
 # ==========================================
 
-def global_engine(processor, image_np, conf, prompt, pos_boxes=None, neg_boxes=None, disable_size_filter=False):
+def global_engine(processor, image_np, conf, prompt, pos_boxes=None, neg_boxes=None, disable_size_filter=False,
+                  return_masks=False):
     """
     Run inference on the entire picture
     """
-    return run_inference_block(processor, image_np, conf, prompt, pos_boxes, neg_boxes, disable_size_filter)
+    return run_inference_block(processor, image_np, conf, prompt, pos_boxes, neg_boxes, disable_size_filter,
+                               return_masks=return_masks)
 
 def tiled_engine(processor, image_pil, confidence, clahe, prompt, pos_boxes=None, neg_boxes=None, global_leaf_boxes=None, disable_size_filter=False, return_tile_count=False):
     """
@@ -399,6 +474,7 @@ def execute_pass(processor, image_pil, graph, conf, clahe, tiling, pass_number, 
     """
     img_np = np.array(image_pil)
     img_h, img_w = img_np.shape[:2]
+    n_sam_calls = 0  # global SAM3 calls made by THIS pass (canopy + leaf map + proposal)
 
     # --- RUN OR RETRIEVE CANOPY GATE [PASS 0] ---
     # roi_override (region-restricted query) skips canopy detection entirely and
@@ -406,6 +482,8 @@ def execute_pass(processor, image_pil, graph, conf, clahe, tiling, pass_number, 
     if roi_override is not None:
         roi = [int(v) for v in roi_override]
     else:
+        if getattr(graph, "tree_roi", None) is None:
+            n_sam_calls += 1  # the canopy pass-0 sweep is a real global SAM3 call
         roi = initialize_canopy_roi(processor, img_np, graph)
     roi_x1, roi_y1, roi_x2, roi_y2 = roi
 
@@ -414,11 +492,18 @@ def execute_pass(processor, image_pil, graph, conf, clahe, tiling, pass_number, 
     roi_img_np = np.array(roi_image_pil)
 
     # --- GENERATE GLOBAL LEAF MAP (Pass 1 Cache Optimization) ---
-    # Check if the persistent graph state already holds the background leaf matrix
-    if not hasattr(graph, "cached_leaf_boxes") or graph.cached_leaf_boxes is None or pass_number == 1:
+    # The cached leaf boxes are ROI-relative, so the cache is keyed by the ROI it
+    # was generated under (graph.cached_leaf_roi) and regenerated whenever the
+    # ROI differs (region-restricted queries change the frame between passes;
+    # reusing across frames would misplace every leaf box).
+    cache_roi = getattr(graph, "cached_leaf_roi", None)
+    if (not hasattr(graph, "cached_leaf_boxes") or graph.cached_leaf_boxes is None
+            or pass_number == 1 or cache_roi != list(roi)):
         logging.info("Generating global leaf map...")
         leaf_boxes, _ = global_engine(processor, roi_img_np, conf, prompt="green leaf")
         graph.cached_leaf_boxes = leaf_boxes
+        graph.cached_leaf_roi = list(roi)
+        n_sam_calls += 1
     else:
         logging.info("Foliage layer unchanged. Reusing cached global leaf map coordinates.")
         leaf_boxes = graph.cached_leaf_boxes
@@ -428,6 +513,18 @@ def execute_pass(processor, image_pil, graph, conf, clahe, tiling, pass_number, 
 
     master_boxes = []
     master_scores = []
+    candidate_masks = None  # per-instance boolean masks (roi frame), mask mode only
+
+    # Mask-based overlap (IoU/IoM via instance masks) is opt-in and currently
+    # limited to global (non-tiled) passes: tile masks would need per-tile
+    # global-frame stitching. Tiled passes fall back to box overlap.
+    use_masks = getattr(cfg, "overlap_mode", "box") == "mask" if cfg is not None else False
+    if use_masks and tiling:
+        logging.warning("overlap_mode='mask' is not supported with tiling; using box overlap for this pass.")
+        use_masks = False
+    if use_masks and nms_mode != "dualgate":
+        logging.warning("overlap_mode='mask' requires nms_mode='dualgate'; using box overlap for this pass.")
+        use_masks = False
 
     # --- RUN COMPOSABLE PROPOSAL GENERATION ---
     n_tiles = 0
@@ -459,10 +556,17 @@ def execute_pass(processor, image_pil, graph, conf, clahe, tiling, pass_number, 
             global_neg_arr = None
 
         img_to_process = inference.apply_clahe(roi_img_np) if clahe else roi_img_np
-        candidate_boxes, candidate_scores = global_engine(
-            processor, img_to_process, conf, prompt, pos_boxes=pos_boxes, neg_boxes=global_neg_arr,
-            disable_size_filter=disable_size_filter
-        )
+        if use_masks:
+            candidate_boxes, candidate_scores, candidate_masks = global_engine(
+                processor, img_to_process, conf, prompt, pos_boxes=pos_boxes, neg_boxes=global_neg_arr,
+                disable_size_filter=disable_size_filter, return_masks=True
+            )
+        else:
+            candidate_boxes, candidate_scores = global_engine(
+                processor, img_to_process, conf, prompt, pos_boxes=pos_boxes, neg_boxes=global_neg_arr,
+                disable_size_filter=disable_size_filter
+            )
+        n_sam_calls += 1
         logging.info("Global inference ended...")
 
     if len(candidate_boxes) > 0:
@@ -471,20 +575,41 @@ def execute_pass(processor, image_pil, graph, conf, clahe, tiling, pass_number, 
 
     if not master_boxes:
         logging.info("No new structures located in this generation sweep.")
-        return PassStats(0, n_tiles=n_tiles)
+        return PassStats(0, n_tiles=n_tiles, n_sam_calls=n_sam_calls)
 
     all_boxes = np.vstack(master_boxes)
     all_scores = np.concatenate(master_scores)
     raw_proposal_count = len(all_boxes)
 
     # Clean duplicates locally within current ROI coordinate context
+    kept_masks = None
     if nms_mode == "dualgate":
-        roi_boxes_final, roi_scores_final = inference.apply_nms_dualgate(
-            all_boxes, all_scores, conf, use_concentric=use_concentric
-        )
+        if use_masks and candidate_masks is not None:
+            # Mask-mode: the dual gates measure IoU/IoM on the instance masks;
+            # return_indices lets us keep the survivors' masks aligned.
+            roi_boxes_final, roi_scores_final, keep_idx = inference.apply_nms_dualgate(
+                all_boxes, all_scores, conf, use_concentric=use_concentric,
+                masks=candidate_masks, return_indices=True
+            )
+            kept_masks = [candidate_masks[int(k)] for k in keep_idx]
+        else:
+            roi_boxes_final, roi_scores_final = inference.apply_nms_dualgate(
+                all_boxes, all_scores, conf, use_concentric=use_concentric
+            )
     else:
         roi_boxes_final, roi_scores_final = inference.apply_nms(all_boxes, all_scores, conf)
     post_nms_count = len(roi_boxes_final)
+
+    # Crop surviving full-frame masks to their boxes: box-cropped masks are
+    # ROI-frame-independent, so cross-pass mask dedup stays valid even when the
+    # ROI changes between passes (only the global-frame box anchors them).
+    mask_crops = None
+    if kept_masks is not None:
+        mask_crops = []
+        for b, m in zip(roi_boxes_final, kept_masks):
+            bx1, by1 = max(0, int(round(b[0]))), max(0, int(round(b[1])))
+            bx2, by2 = int(round(b[2])), int(round(b[3]))
+            mask_crops.append(np.asarray(m[by1:by2, bx1:bx2], dtype=bool))
 
     # --- STEP 5: TRANSLATE REGIONS BACK TO FULL-FRAME GLOBAL PLANE ---
     global_candidate_boxes = translate_roi_to_global(roi_boxes_final, roi)
@@ -493,6 +618,7 @@ def execute_pass(processor, image_pil, graph, conf, clahe, tiling, pass_number, 
     # --- GLOBAL CROSS-REFERENCE VERIFICATION ---
     mode = "tiled" if tiling else "global"
     signature = f"{pass_number}:{mode}:{prompt}:{conf:.2f}"
+    call_counter = {"n_oracle_calls": 0}
     added_nodes, duplicates_rejected = register_and_verify_candidates(
         candidate_boxes=global_candidate_boxes,
         candidate_scores=roi_scores_final,
@@ -505,6 +631,8 @@ def execute_pass(processor, image_pil, graph, conf, clahe, tiling, pass_number, 
         query_set=query_set,
         image_np=img_np,
         signature=signature,
+        candidate_masks=mask_crops,
+        call_counter=call_counter,
     )
 
     return PassStats(
@@ -514,4 +642,6 @@ def execute_pass(processor, image_pil, graph, conf, clahe, tiling, pass_number, 
         post_verify=post_nms_count,
         duplicates_rejected=duplicates_rejected,
         n_tiles=n_tiles,
+        n_sam_calls=n_sam_calls,
+        n_verify_calls=call_counter["n_oracle_calls"],
     )

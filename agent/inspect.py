@@ -59,7 +59,11 @@ def inspect_scene(image_or_crop, phi, oracle_cfg, client=None) -> dict:
     messages = _build_messages(image_or_crop, phi)
 
     for attempt in range(oracle_cfg.oracle_max_retries + 1):
-        content = _request(client, oracle_cfg, messages)
+        try:
+            content = _request(client, oracle_cfg, messages)
+        except Exception as exc:  # network/client error: retry like a parse failure
+            logger.warning("inspect_scene: request failed (%s) (attempt %d).", exc, attempt + 1)
+            continue
         z = _parse_z(content)
         if z is not None:
             return z

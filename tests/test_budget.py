@@ -39,9 +39,12 @@ def test_cost_meter_starts_at_zero():
 # ----------------------- stubbed pipeline -----------------------
 
 class _Stats(int):
-    def __new__(cls, val, n_tiles=0):
+    """Mirrors PassStats' call-count fields (metering reads these)."""
+    def __new__(cls, val, n_tiles=0, n_sam_calls=0, n_verify_calls=0):
         obj = super().__new__(cls, val)
         obj.n_tiles = n_tiles
+        obj.n_sam_calls = n_sam_calls
+        obj.n_verify_calls = n_verify_calls
         return obj
 
 
@@ -51,7 +54,12 @@ def fake_pipeline():
     mod = types.ModuleType("pipeline")
 
     def execute_pass(**kw):
-        return _Stats(0, n_tiles=execute_pass.n_tiles)
+        # Mirror real execute_pass counting: the pass-1 leaf map is one global
+        # SAM3 call; a global pass adds its proposal call; a tiled pass adds tiles.
+        leaf = 1 if kw["pass_number"] == 1 else 0
+        if kw["tiling"]:
+            return _Stats(0, n_tiles=execute_pass.n_tiles, n_sam_calls=leaf)
+        return _Stats(0, n_sam_calls=1 + leaf)
 
     execute_pass.n_tiles = 4
     mod.execute_pass = execute_pass
@@ -87,7 +95,7 @@ def test_query_first_pass_counts_query_plus_leaf_map(fake_pipeline):
 
 def test_query_later_pass_counts_one_sam(fake_pipeline):
     ctx = _ctx()
-    ctx.discovery.append(3)      # one prior pass -> next is pass 2
+    ctx.n_passes = 1             # one prior sensing pass -> next is pass 2
     execute(QueryA(region=(0, 0, 50, 50), prompt="p", conf=0.3), ctx)
     assert ctx.cost.n_sam == 1
     assert ctx.cost.n_orch == 1
@@ -95,7 +103,7 @@ def test_query_later_pass_counts_one_sam(fake_pipeline):
 
 def test_tilequery_counts_tiles(fake_pipeline):
     ctx = _ctx()
-    ctx.discovery.append(3)      # pass 2 so no leaf-map term
+    ctx.n_passes = 1             # pass 2 so no leaf-map term
     execute(TileQueryA(prompt="p", conf=0.3), ctx)
     assert ctx.cost.n_tile == 4  # from the stub's n_tiles
     assert ctx.cost.n_sam == 0
@@ -132,9 +140,7 @@ def test_scripted_sequence_matches_hand_computed_total(fake_pipeline):
     ctx = _ctx(cfg=cfg)
 
     execute(QueryA(region=(0, 0, 50, 50), prompt="p", conf=0.3), ctx)   # pass1: n_sam += 2, orch=1
-    ctx.discovery.append(3)
     execute(TileQueryA(prompt="p", conf=0.3), ctx)                      # pass2: n_tile += 4, orch=2
-    ctx.discovery.append(2)
     execute(SubdivideA(region=(0, 0, 100, 100)), ctx)                   # orch=3
     execute(StopA(estimate_name="N_obs"), ctx)                          # orch=4
 

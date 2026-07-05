@@ -46,6 +46,9 @@ def parse_args(argv=None):
     parser.add_argument("--conf", type=float, default=_cfg.conf, help="Confidence threshold.")
     parser.add_argument("--verifier", choices=["ioc", "vip", "off"], default=_cfg.verifier_mode,
                         help="Candidate verifier: ioc (default), vip (FM+V-IP), or off (disabled).")
+    parser.add_argument("--overlap-mode", choices=["box", "mask"], default=_cfg.overlap_mode,
+                        help="NMS IoU/IoM + cross-pass dedup measured on boxes (default) "
+                             "or SAM3 instance masks (global passes only).")
     parser.add_argument("--oracle", choices=["mock", "qwen"], default="qwen",
                         help="Oracle for --verifier vip (ignored otherwise).")
     parser.add_argument("--query-file", default=None,
@@ -88,7 +91,7 @@ def build_verifier(args):
 
     oracle/query_set are None unless --verifier vip is selected.
     """
-    cfg = dataclasses.replace(_cfg, verifier_mode=args.verifier)
+    cfg = dataclasses.replace(_cfg, verifier_mode=args.verifier, overlap_mode=args.overlap_mode)
     if args.verifier != "vip":
         return cfg, None, None
 
@@ -145,7 +148,10 @@ def main():
         logging.info(f"Pass {pass_number}: {stats.as_row()}")
 
     os.makedirs(_cfg.output_dir, exist_ok=True)
-    overlay_path, graph_path = build_output_paths(args.image, _cfg.output_dir, suffix=cfg.verifier_mode)
+    # Tag outputs with verifier mode (+ overlap mode when non-default) so runs
+    # in different modes on the same image never overwrite each other.
+    suffix = cfg.verifier_mode + ("_mask" if cfg.overlap_mode == "mask" else "")
+    overlay_path, graph_path = build_output_paths(args.image, _cfg.output_dir, suffix=suffix)
 
     inference.plot_graph_scene(image_pil, orchard_graph, output_path=overlay_path)
     with open(graph_path, "w") as f:

@@ -41,7 +41,24 @@ def test_verifier_defaults_keep_ioc_as_the_safe_default():
     cfg = Config()
     assert cfg.verifier_mode == "ioc"
     assert cfg.answer_mode == "batched"
-    assert 0.0 < cfg.vip_epsilon < 0.5
+    # vip_epsilon: None defers to the query set's epsilon (a float overrides it).
+    assert cfg.vip_epsilon is None
+    # box overlap stays the default; mask IoU/IoM is opt-in.
+    assert cfg.overlap_mode == "box"
+
+
+def test_policy_tunables_live_in_config():
+    # These were getattr defaults scattered across belief/policies; they must
+    # live in config (CLAUDE.md: no magic numbers outside config.py).
+    cfg = Config()
+    assert cfg.target_prompt == "green fruit"
+    assert cfg.c0 == 1.0
+    assert cfg.small_area == 1024.0
+    assert cfg.tau_w == 0.5
+    assert cfg.k_min == 2
+    assert cfg.tau_high == 0.5
+    # inert defaults: the lambda_A support term stays a no-op until narrowed
+    assert cfg.area_min == 0.0 and cfg.area_max == float("inf")
 
 
 def test_oracle_config_reads_env(monkeypatch):

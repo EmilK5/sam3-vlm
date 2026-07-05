@@ -47,6 +47,11 @@ class OrchardNode:
         self.jitter = 0.0                            # Delta_i: running-mean center displacement (px)
         self.area = self._box_area()                 # A_i: representative box area (px^2)
 
+        # Optional instance mask (overlap_mode="mask"): a boolean numpy array
+        # cropped to this node's box (row 0 / col 0 = box's y1 / x1). Not
+        # serialized in to_dict. None under the default box-overlap mode.
+        self.mask = None
+
     def _box_area(self) -> float:
         return float((self.box[2] - self.box[0]) * (self.box[3] - self.box[1]))
 
@@ -107,6 +112,7 @@ class OrchardGraph:
         self.nodes.clear()
         self.tree_roi = None
         self.cached_leaf_boxes = None
+        self.cached_leaf_roi = None
     
     def add_candidate(self, box: list, score: float, found_in_pass: int) -> str:
         """

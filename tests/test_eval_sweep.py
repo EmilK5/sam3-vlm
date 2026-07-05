@@ -51,14 +51,19 @@ def test_evaluate_image_uses_real_belief_estimators():
 # ----------------------- run_policy with a stub execute_pass -----------------------
 
 class _FakeStats(int):
-    def __new__(cls, val, post_verify=0):
+    """Mirrors PassStats' call-count fields (the sweep meters from these)."""
+    def __new__(cls, val, n_sam_calls=0, n_tiles=0, n_verify_calls=0):
         obj = super().__new__(cls, val)
-        obj.post_verify = post_verify
+        obj.n_sam_calls = n_sam_calls
+        obj.n_tiles = n_tiles
+        obj.n_verify_calls = n_verify_calls
         return obj
 
 
 def _stub(per_pass):
-    """execute_pass stand-in: returns per_pass[i] and adds that many fruit nodes."""
+    """execute_pass stand-in: returns per_pass[i] and adds that many fruit nodes.
+    Reports one global SAM3 call per global pass, one tile per tiled pass, and
+    one vip oracle call per accepted node."""
     state = {"i": 0}
 
     def fn(**kw):
@@ -68,7 +73,9 @@ def _stub(per_pass):
             nid = graph.add_candidate([j * 10, 0, j * 10 + 8, 8], 0.9, found_in_pass=pass_number)
             graph.nodes[nid].classification = "fruit"
         state["i"] += 1
-        return _FakeStats(n, post_verify=n)
+        tiling = kw["tiling"]
+        return _FakeStats(n, n_sam_calls=0 if tiling else 1, n_tiles=1 if tiling else 0,
+                          n_verify_calls=n)
 
     fn.state = state
     return fn
@@ -105,7 +112,7 @@ def test_convergence_stops_when_no_new_candidates():
 def test_vip_counts_verify_calls():
     cfg = dataclasses.replace(Config(), verifier_mode="vip")
     _, cost, _ = _run("oneshot", cfg, [4])
-    assert cost.n_verify == 4  # sum of post_verify
+    assert cost.n_verify == 4  # sum of the pass's actual n_verify_calls
 
 
 def _episode_stub(script):
@@ -135,6 +142,24 @@ def test_heuristic_policy_runs_an_episode():
     assert isinstance(cost, CostMeter)
     assert 1 <= n_actions <= 6
     assert len(graph.nodes) >= 1
+
+
+def test_verifier_label_tags_mask_mode():
+    assert run_eval.verifier_label(Config()) == "ioc"
+    cfg = dataclasses.replace(Config(), verifier_mode="ioc", overlap_mode="mask")
+    assert run_eval.verifier_label(cfg) == "ioc+mask"
+
+
+def test_evaluate_image_row_uses_mask_tagged_verifier(tmp_path):
+    img_path = tmp_path / "img.png"
+    Image.new("RGB", (64, 64)).save(img_path)
+    sample = {"image_path": str(img_path),
+              "gt_boxes": np.array([[0, 0, 8, 8]], dtype=float), "count": 1}
+    cfg = dataclasses.replace(Config(), overlap_mode="mask")
+    row = run_eval.evaluate_image(sample, "oneshot", cfg, None, None,
+                                  processor=None, prompt="green fruit", conf=0.35,
+                                  execute_pass_fn=_stub([2]))
+    assert row["verifier"] == "ioc+mask"
 
 
 # ----------------------- build_verifier -----------------------

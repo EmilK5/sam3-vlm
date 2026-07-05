@@ -132,7 +132,8 @@ def apply_nms_dualgate(boxes, scores, confidence,
                        min_size_ratio_for_containment=0.40,
                        max_concentric_offset_ratio=0.43,
                        use_concentric=False,
-                       return_indices=False):
+                       return_indices=False,
+                       masks=None):
     """
     Dual-Gate NMS for the citrus pipeline. Ported from the PixMo/CountBench engine
     and re-tuned for small, same-color, clustered fruit.
@@ -156,6 +157,13 @@ def apply_nms_dualgate(boxes, scores, confidence,
 
     A box removed here is therefore always either an IoU duplicate (identical to the
     baseline's intent) or a size-guarded nested duplicate.
+
+    masks: additive, backward-compatible. None (default) keeps the box-based gates
+    byte-for-byte. When given (a list of per-instance boolean arrays in this image's
+    frame, index-aligned with boxes), Gate A IoU and Gate B IoM/size-ratio are
+    measured on the masks instead of the boxes; the boxes still bound which pairs
+    can overlap and the concentric sub-gate stays box-geometry-based. Combine with
+    return_indices=True to subselect the surviving masks.
     """
     empty_idx = np.array([], dtype=int)
     if len(boxes) == 0:
@@ -168,6 +176,9 @@ def apply_nms_dualgate(boxes, scores, confidence,
     if len(valid) == 0:
         return (np.array([]), np.array([]), empty_idx) if return_indices else (np.array([]), np.array([]))
     boxes, scores = boxes[valid], scores[valid]
+    if masks is not None:
+        masks = [masks[int(v)] for v in valid]
+        mask_areas = np.array([float(np.count_nonzero(m)) for m in masks])
 
     x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
     areas = (x2 - x1) * (y2 - y1)
@@ -189,15 +200,28 @@ def apply_nms_dualgate(boxes, scores, confidence,
         yy2 = np.minimum(y2[i], y2[rest])
         inter = np.maximum(0.0, xx2 - xx1) * np.maximum(0.0, yy2 - yy1)
 
+        if masks is not None:
+            # Mask-mode overlap: recompute intersection and areas from the masks.
+            # A pair whose boxes don't touch can't have mask overlap, so the
+            # box intersection bounds which pairs need the (expensive) mask AND.
+            mask_inter = np.zeros_like(inter)
+            for jj, j in enumerate(rest):
+                if inter[jj] > 0:
+                    mask_inter[jj] = float(np.count_nonzero(np.logical_and(masks[i], masks[j])))
+            inter = mask_inter
+            area_i, area_rest = mask_areas[i], mask_areas[rest]
+        else:
+            area_i, area_rest = areas[i], areas[rest]
+
         # --- GATE A: IoU (lateral jitter / cross-pass duplicates) ---
-        union = areas[i] + areas[rest] - inter
+        union = area_i + area_rest - inter
         iou = np.zeros_like(inter)
         m = union > 0
         iou[m] = inter[m] / union[m]
 
         # --- GATE B: IoM containment with size-ratio guard ---
-        min_a = np.minimum(areas[i], areas[rest])
-        max_a = np.maximum(areas[i], areas[rest])
+        min_a = np.minimum(area_i, area_rest)
+        max_a = np.maximum(area_i, area_rest)
         iom = np.zeros_like(inter)
         m2 = min_a > 0
         iom[m2] = inter[m2] / min_a[m2]

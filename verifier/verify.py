@@ -10,6 +10,7 @@ Coordinate frame: boxes are global-frame xyxy pixels; image_np is an RGB
 HxWx3 uint8 array (as produced by np.array(image_pil) elsewhere).
 """
 
+import dataclasses
 import logging
 
 import cv2
@@ -121,6 +122,11 @@ def verify_candidate(image_np, box, oracle, query_set, cfg) -> dict:
         n_oracle_calls : 1 in batched mode, chain length in sequential mode.
     """
     crop = extract_crop(image_np, box, cfg.crop_scale, cfg.crop_size)
+    # cfg.vip_epsilon = None defers to the query set's epsilon; a float overrides it
+    # (the "raise epsilon" knob from the plan's risk mitigations).
+    eps_override = getattr(cfg, "vip_epsilon", None)
+    if eps_override is not None:
+        query_set = dataclasses.replace(query_set, epsilon=float(eps_override))
     table = vip.likelihood_table(query_set)
     K = len(query_set.classes)
     prior = np.full(K, 1.0 / K)

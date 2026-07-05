@@ -48,6 +48,9 @@ def choose(phi, partition, cfg):
       SubdivideA(r)= fraction of r's candidates with k==1              # region still churning
       VerifyA      = sum of instability over unresolved / low-w nodes
     Each value is divided by (c0 + cost_sense(action)).
+
+    VerifyA is only proposed when cfg.verifier_mode == "vip": executing it needs
+    the FM+V-IP oracle/query_set, which episode wiring provides only in vip mode.
     """
     lam = cfg.lambdas
     m = cfg.window_m
@@ -96,8 +99,9 @@ def choose(phi, partition, cfg):
     tile_cost = cfg.c_tile * 4  # ~4 tiles (proxy pending real tile count from execution)
     scored.append((v_tile / (c0 + tile_cost), TileQueryA(prompt=prompt, conf=conf)))
 
-    # --- VerifyA over unresolved / low-support-score nodes ---
-    verify_idxs = [i for i in range(K) if cls[i] == "unresolved" or w[i] < tau_w]
+    # --- VerifyA over unresolved / low-support-score nodes (vip verifier only) ---
+    verify_available = getattr(cfg, "verifier_mode", "ioc") == "vip"
+    verify_idxs = [i for i in range(K) if cls[i] == "unresolved" or w[i] < tau_w] if verify_available else []
     if verify_idxs:
         v_verify = sum(instability(i) for i in verify_idxs)
         verify_cost = cfg.c_verify * len(verify_idxs)

@@ -94,15 +94,18 @@ def _build_messages(phi, z, partition, graph, cfg):
         "query": {"region_id": "int", "conf": "0.1-0.9"},
         "tile": {"conf": "0.1-0.9"},
         "subdivide": {"region_id": "int"},
-        "verify": {"node_ids": ["<verifiable id>"]},
         "stop": {"estimate_name": "N_obs|N_supp|N_cons"},
     }
+    # verify needs the FM+V-IP oracle; only offer it when the vip verifier is on.
+    verify_available = getattr(cfg, "verifier_mode", "ioc") == "vip"
+    if verify_available:
+        menu["verify"] = {"node_ids": ["<verifiable id>"]}
     body = {
         "target_concept": target,
         "phi": _compact_phi(phi),
         "z": z,
         "regions": regions,
-        "verifiable_node_ids": _verifiable_ids(phi),
+        "verifiable_node_ids": _verifiable_ids(phi) if verify_available else [],
         "remaining_budget": phi.get("remaining_budget"),
         "action_menu": menu,
     }
@@ -178,6 +181,8 @@ def _parse_and_validate(content, partition, graph, cfg):
         return SubdivideA(region=tuple(partition[rid]))
 
     if name == "verify":
+        if getattr(cfg, "verifier_mode", "ioc") != "vip":
+            return None  # verify is only legal with the FM+V-IP oracle configured
         node_ids = args.get("node_ids")
         if not _valid_node_ids(node_ids, graph, cfg):
             return None

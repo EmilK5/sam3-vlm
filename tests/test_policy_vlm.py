@@ -28,9 +28,14 @@ class _FakeClient:
         return types.SimpleNamespace(choices=[types.SimpleNamespace(message=msg)])
 
 
-def _fixture():
-    """A graph with one unresolved node (verifiable) and one fruit node; phi + partition."""
-    cfg = Config()
+def _fixture(verifier_mode="vip"):
+    """A graph with one unresolved node (verifiable) and one fruit node; phi + partition.
+
+    verifier_mode defaults to "vip" so the verify action is on the menu; pass
+    "ioc" to exercise the verify-unavailable path.
+    """
+    import dataclasses
+    cfg = dataclasses.replace(Config(), verifier_mode=verifier_mode)
     graph = OrchardGraph()
     unresolved = graph.add_candidate([10, 10, 40, 40], 0.9, 1)          # stays unresolved
     fruit = graph.add_candidate([200, 200, 230, 230], 0.9, 1)
@@ -111,6 +116,26 @@ def test_verify_of_confident_fruit_node_falls_back():
     fruit_id = fx[6]
     action = _choose(json.dumps({"action": "verify", "args": {"node_ids": [fruit_id]}}), fx)
     assert action == _heuristic_action(fx)
+
+
+def test_verify_without_vip_verifier_falls_back():
+    # verify needs the FM+V-IP oracle; under verifier_mode="ioc" it is not on the
+    # menu and a VLM response choosing it must fall back (episode wiring has no
+    # oracle/query_set to execute it with).
+    fx = _fixture(verifier_mode="ioc")
+    unresolved_id = fx[5]
+    action = _choose(json.dumps({"action": "verify", "args": {"node_ids": [unresolved_id]}}), fx)
+    assert not isinstance(action, VerifyA)
+    assert action == _heuristic_action(fx)
+
+
+def test_verify_not_in_menu_without_vip_verifier():
+    fx = _fixture(verifier_mode="ioc")
+    cfg, graph, phi, partition, z, _, _ = fx
+    messages = policy_vlm._build_messages(phi, z, partition, graph, cfg)
+    body = json.loads(messages[-1]["content"].split("\n")[1])
+    assert "verify" not in body["action_menu"]
+    assert body["verifiable_node_ids"] == []
 
 
 def test_no_action_accepts_raw_coordinates():

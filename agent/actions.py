@@ -70,6 +70,8 @@ class ActionContext:
     discovery: object = None
     partition: list = dataclasses.field(default_factory=list)
     cost: CostMeter = dataclasses.field(default_factory=CostMeter)
+    n_passes: int = 0        # sensing passes executed (Query/TileQuery only), so
+                             # Verify/Subdivide/Stop never inflate pass numbers
 
 
 # ----------------------- helpers -----------------------
@@ -89,9 +91,13 @@ def subdivide_region(region) -> list:
 
 
 def _next_pass_number(ctx) -> int:
-    """execute_pass pass_number for the next sensing action in the episode."""
-    n_prior = len(ctx.discovery.counts) if ctx.discovery is not None else 0
-    return n_prior + 1
+    """execute_pass pass_number for the next sensing action in the episode.
+
+    Counts only sensing passes (ctx.n_passes), not all episode actions, so a
+    VerifyA/SubdivideA between queries does not skew pass-dependent behavior in
+    the pipeline (leaf-map caching, exemplar feedback, the pass>=3 IoC guard).
+    """
+    return int(getattr(ctx, "n_passes", 0)) + 1
 
 
 def _execute_query(action, ctx, tiling, roi_override) -> int:
@@ -104,22 +110,20 @@ def _execute_query(action, ctx, tiling, roi_override) -> int:
         cfg=ctx.cfg, oracle=ctx.oracle, query_set=ctx.query_set,
         roi_override=roi_override,
     )
-    _meter_query(ctx, tiling, pass_number, stats)
+    ctx.n_passes = pass_number
+    _meter_query(ctx, stats)
     return int(stats)
 
 
-def _meter_query(ctx, tiling, pass_number, stats):
-    """Cost of a Query/TileQuery. A tiled pass counts its tiles (n_tile); a global
-    query counts one SAM3 call (n_sam). Either way, the pass-1 leaf map is a global
-    SAM3 call (execute_pass generates it on the first pass)."""
+def _meter_query(ctx, stats):
+    """Meter a Query/TileQuery from the pass's actual call counts (PassStats):
+    global SAM3 calls (canopy if run + leaf map if generated + global proposal),
+    tile calls, and any inline FM+V-IP oracle calls made under verifier='vip'."""
     if ctx.cost is None:
         return
-    if tiling:
-        ctx.cost.n_tile += int(getattr(stats, "n_tiles", 0))
-    else:
-        ctx.cost.n_sam += 1
-    if pass_number == 1:
-        ctx.cost.n_sam += 1  # background leaf map
+    ctx.cost.n_sam += int(getattr(stats, "n_sam_calls", 0))
+    ctx.cost.n_tile += int(getattr(stats, "n_tiles", 0))
+    ctx.cost.n_verify += int(getattr(stats, "n_verify_calls", 0))
 
 
 def _execute_subdivide(action, ctx) -> int:
@@ -133,16 +137,23 @@ def _execute_subdivide(action, ctx) -> int:
 
 
 def _execute_verify(action, ctx) -> int:
+    if ctx.oracle is None or ctx.query_set is None:
+        # Surface the misconfiguration loudly (mirrors the pipeline's vip guard):
+        # VerifyA needs the FM+V-IP oracle; the policies only propose it when
+        # cfg.verifier_mode == "vip", so reaching this means bad episode wiring.
+        raise ValueError("VerifyA requires an oracle and query_set on the ActionContext "
+                         "(configure verifier_mode='vip').")
     image_np = np.array(ctx.image_pil)
     classes = ctx.query_set.classes
-    dist_idx = classes.index("distractor") if "distractor" in classes else 0
+    has_distractor = "distractor" in classes
     for node_id in action.node_ids:
         node = ctx.graph.nodes.get(node_id)
         if node is None:
             continue
         result = verify_candidate(image_np, node.box, ctx.oracle, ctx.query_set, ctx.cfg)
+        dist_score = result["posterior"][classes.index("distractor")] if has_distractor else 0.0
         node.scores["fruit_verification"] = float(result["p_target"])
-        node.scores["leaf_verification"] = float(result["posterior"][dist_idx])
+        node.scores["leaf_verification"] = float(dist_score)
         node.classification = _VIP_TAG.get(result["verdict"], "unresolved")
         node.vip_chain = result["chain"]
         node.vip_posterior = result["posterior"]

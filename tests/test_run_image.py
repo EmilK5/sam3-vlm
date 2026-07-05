@@ -101,6 +101,22 @@ def test_parse_args_verifier_choices(run_image_module):
         run_image_module.parse_args(["--image", "a.jpg", "--prompt", "x", "--verifier", "bogus"])
 
 
+def test_parse_args_overlap_mode_defaults_to_box(run_image_module):
+    ns = run_image_module.parse_args(["--image", "a.jpg", "--prompt", "x"])
+    assert ns.overlap_mode == "box"
+    ns = run_image_module.parse_args(["--image", "a.jpg", "--prompt", "x", "--overlap-mode", "mask"])
+    assert ns.overlap_mode == "mask"
+    with pytest.raises(SystemExit):
+        run_image_module.parse_args(["--image", "a.jpg", "--prompt", "x", "--overlap-mode", "bogus"])
+
+
+def test_build_verifier_threads_overlap_mode(run_image_module):
+    ns = run_image_module.parse_args(
+        ["--image", "a.jpg", "--prompt", "x", "--verifier", "off", "--overlap-mode", "mask"])
+    cfg, _, _ = run_image_module.build_verifier(ns)
+    assert cfg.overlap_mode == "mask"
+
+
 def test_build_verifier_off_and_ioc_have_no_oracle(run_image_module):
     for mode in ("ioc", "off"):
         ns = run_image_module.parse_args(["--image", "a.jpg", "--prompt", "x", "--verifier", mode])

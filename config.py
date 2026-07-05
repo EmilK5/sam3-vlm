@@ -21,11 +21,15 @@ class Config:
     # --- detection ---
     conf: float = 0.35
     nms_mode: str = "dualgate"
+    target_prompt: str = "green fruit"  # concept string for agent Query/TileQuery actions
+    overlap_mode: str = "box"  # "box" (default) | "mask": NMS IoU/IoM + cross-pass dedup
+    #     measured on instance masks instead of boxes (global passes only; tiled
+    #     passes fall back to box overlap with a warning).
 
     # --- verifier ---
     verifier_mode: str = "ioc"  # "ioc" (default, unchanged) | "vip" (opt-in) | "off" (disabled)
     vip_query_file: str = "queries/green_citrus.json"
-    vip_epsilon: float = 0.15
+    vip_epsilon: float = None  # None -> use the query set's epsilon; a float overrides it
     vip_stop: float = 0.10
     vip_max_queries: int = 10
     crop_scale: float = 1.4
@@ -60,6 +64,13 @@ class Config:
         }
     )
     budget_max_actions: int = 12
+    c0: float = 1.0            # base orchestration cost in the VoI-per-cost ratio
+    small_area: float = 1024.0 # median candidate area (px^2) below which tiling is boosted
+    tau_w: float = 0.5         # support-score threshold: low-w verification / N_supp
+    k_min: int = 2             # min support k for the N_cons estimator
+    tau_high: float = 0.5      # high-confidence s_bar threshold for N_cons
+    area_min: float = 0.0      # plausible candidate area bounds (px^2) for the
+    area_max: float = float("inf")  # lambda_A term of support_score; defaults are inert
 
     # --- costs (normalized relative to one global SAM3 call) ---
     c_sam: float = 1.0

@@ -89,7 +89,11 @@ class QwenOracle:
         messages = self._build_messages(crop_pil, query_set)
 
         for attempt in range(self.cfg.oracle_max_retries + 1):
-            content = self._request(client, messages)
+            try:
+                content = self._request(client, messages)
+            except Exception as exc:  # network/client error: retry like a parse failure
+                logger.warning("QwenOracle: request failed (%s) (attempt %d).", exc, attempt + 1)
+                continue
             answers = self._parse_answers(content, query_set)
             if answers is not None:
                 return answers

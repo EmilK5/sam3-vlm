@@ -41,6 +41,58 @@ follow the "Suggested order of the first week" in the plan.
 
 ## Notes / decisions log
 <!-- Append dated one-liners here when a step deviates from the plan. -->
+- 2026-07-05 (functional-review fixes, user request): (1) VerifyA now raises a
+  clear ValueError without oracle/query_set, and BOTH policies only propose/accept
+  "verify" when cfg.verifier_mode=="vip" (run_eval only wires an oracle for vip;
+  previously --policy vlm/heuristic --verifier ioc/off could crash mid-sweep).
+  (2) Leaf-map cache is keyed by its generating ROI (graph.cached_leaf_roi) and
+  regenerated when the ROI changes — cross-frame leaf boxes corrupted IoC verdicts
+  and neg exemplars in agent episodes with region queries; canopy-ROI runs are
+  byte-for-byte unchanged. (3) Cross-pass dedup under vip/off also matches
+  "unresolved" tracks (IoC still fruit-only, golden path untouched): "off" no
+  longer re-registers everything each pass, and convergence can converge. (4) Cost
+  is now metered from actual per-pass calls via new additive PassStats fields
+  n_sam_calls/n_verify_calls (canopy + leaf map + proposal; real vip oracle calls
+  incl. inline episode verifications, excl. dedup-rejected/tiny-skipped) — fixed
+  policies and episodes share one scale; agent episodes start their partition at
+  [tree_roi] (plan 4.1) when a processor is present, metering the canopy call.
+  (5) run_eval --prompt/--conf now reach heuristic/vlm via cfg.target_prompt/conf.
+  (6) getattr-default tunables promoted to config.py (target_prompt, c0,
+  small_area, tau_w, k_min, tau_high, area_min/max — inert defaults). vip_epsilon
+  default changed 0.15 -> None: None defers to the query set's epsilon, a float
+  overrides it (the knob was previously dead). (7) queries.py preserves optional
+  sam3_phrase (validated non-empty str) so Sam3Oracle is reachable. (8) QwenOracle
+  and inspect_scene retry request/network exceptions like parse failures (all-
+  zeros / neutral-z fallback instead of aborting the pass). (9) Episode pass_number
+  now counts sensing passes only (ActionContext.n_passes): Verify/Subdivide/Stop
+  no longer inflate pass numbers (the discovery curve still records every action,
+  per the proposal). (10) vip leaf_verification uses the actual "distractor" index
+  (0.0 if that class is absent — index 0 was the target). Tests updated to the new
+  metering/pass semantics + new tests/test_review_fixes.py. Suite 178 -> 200.
+- 2026-07-05 (mask-overlap switch, user request): new cfg.overlap_mode
+  ("box" default | "mask"): NMS Gate A IoU / Gate B IoM measured on SAM3 instance
+  masks via an additive masks= param on apply_nms_dualgate (None -> byte-for-byte
+  box behavior; boxes still bound candidate pairs, concentric sub-gate stays box-
+  based), and cross-pass dedup via pipeline.compute_mask_iou on box-cropped masks
+  stored as OrchardNode.mask (frame-independent; not serialized in to_dict).
+  Masks flow run_raw_inference(return_masks=True) -> dual-gate NMS
+  (return_indices) -> box-cropped -> register_and_verify_candidates
+  (candidate_masks=). Scope: global (non-tiled) dualgate passes only — tiled or
+  nms_mode="iou" passes log a warning and fall back to box overlap (tile masks
+  would need global-frame stitching); the IoC leaf-containment gate stays
+  box-based (leaf map has no masks). tests/test_mask_overlap.py covers the gates,
+  alignment through the confidence filter, dedup, and an execute_pass round trip.
+- 2026-07-05 (testing docs + mask CLI, user request): rewrote docs/tier_b_testing.md
+  as an Ollama-first numbered walkthrough (T0-T12) — each test states Run/Expect/
+  Artifacts/If-it-fails, every command tees to out/T<N>.log, and a failure-report
+  template + env block sits at the top (vLLM demoted to an appendix; fixed the
+  Ollama tag to qwen3-vl:8b / qwen2.5vl, no hyphen). docs/manual_tests.md updated
+  to 204 tests and now references the T-ids; added sections for the review fixes
+  and the mask switch. To make mask mode runnable from the CLI, added additive
+  --overlap-mode {box,mask} flags to scripts/run_image.py (outputs tagged
+  <stem>_<verifier>_mask_* so box/mask runs don't overwrite) and eval/run_eval.py
+  (CSV verifier column becomes e.g. "ioc+mask" via verifier_label() so mask rows
+  don't collide with box rows on resume). Suite 200 -> 204.
 - 2026-07-04 (0.1): Config is a flat dataclass with grouped comments (not nested
   dataclasses) per the plan's field list; fields prefixed to avoid clashes
   across groups (e.g. `verifier_mode`, `oracle_base_url`, `oracle_model_name`).

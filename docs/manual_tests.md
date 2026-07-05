@@ -1,24 +1,28 @@
 # Manual test checklist — per step
 
 Two tiers per step:
-- **Tier A — CPU pytest.** No models, no network; runs anywhere. `pytest -q` for
-  the whole suite should print **175 passed**.
-- **Tier B — real SAM3 + Qwen VLM.** Runs on the GPU box with a VLM server up
-  (vLLM or Ollama — see [tier_b_testing.md](tier_b_testing.md)).
+- **Tier A — CPU pytest.** No models, no network; runs anywhere. `pytest -q`
+  for the whole suite should print **204 passed** in a couple of seconds.
+- **Tier B — real SAM3 + Qwen VLM via Ollama.** Runs on the GPU box. The
+  thorough, copy-paste walkthrough (with expected output and what to send back
+  when something fails) is [tier_b_testing.md](tier_b_testing.md) — steps below
+  reference its test IDs (**T0–T12**).
 
 ## Setup (Tier B)
 
-Point the project at your VLM server (no API key needed):
+Start Ollama with a vision-capable Qwen model (details + context-length notes
+in [tier_b_testing.md](tier_b_testing.md) Part 1), then:
 
 ```bash
-# Ollama
 export QWEN_BASE_URL=http://localhost:11434/v1
-export QWEN_MODEL=qwen2.5-vl:7b        # must match `ollama list`
-# (vLLM: QWEN_BASE_URL=http://localhost:8000/v1, QWEN_MODEL=qwen3-vl)
-
+export QWEN_MODEL=qwen3-vl:8b     # must exactly match `ollama list`
+                                  # (fallback tag: qwen2.5vl:7b — no hyphen)
 export IMG=dataset/images/val/REPLACE.png
 export STEM=$(basename "$IMG" | sed 's/\.[^.]*$//')
 ```
+
+No API key needed. vLLM works too (appendix of the Tier B guide); only the two
+env vars change.
 
 ---
 
@@ -26,21 +30,19 @@ export STEM=$(basename "$IMG" | sed 's/\.[^.]*$//')
 
 ### 0.1 config
 - **A:** `pytest -q tests/test_smoke.py`
-- **B:** `python -c "from config import Config; print(Config())"` — all fields sane;
-  `oracle_base_url` is empty until you `export QWEN_BASE_URL`.
+- **B:** `python -c "from config import Config; print(Config())"` — all fields
+  sane; `oracle_base_url` echoes `QWEN_BASE_URL`; `overlap_mode='box'` and
+  `vip_epsilon=None` are the defaults (**T0**).
 
 ### 0.2 run_image CLI
 - **A:** `pytest -q tests/test_run_image.py`
-- **B:** `python scripts/run_image.py --image "$IMG" --prompt "green fruit" --passes 3`
-  → overlay resembles the Gradio app; `out/${STEM}_ioc_graph.json` node count
-  matches the logged pass stats.
+- **B:** **T1** — 3-pass run + overlay + graph JSON; node count matches the
+  logged pass stats.
 
 ### 0.3 dataset loader
 - **A:** `pytest -q tests/test_datasets.py`
-- **B:** `python -m eval.datasets --root dataset --fmt yolo --split val`
-  → GT overlay (cyan) sits on real fruit. Also
-  `python scripts/run_image.py --image "$IMG" --prompt "green fruit" --passes 1 --draw-gt`
-  writes `out/${STEM}_gt.jpg`.
+- **B:** `python -m eval.datasets --root dataset --fmt yolo --split val` → GT
+  overlay (cyan) sits on real fruit; `--draw-gt` covered inside **T1**.
 
 ---
 
@@ -48,49 +50,29 @@ export STEM=$(basename "$IMG" | sed 's/\.[^.]*$//')
 
 ### 1.1 query set
 - **A:** `pytest -q tests/test_queries.py`
-- **B (read):** open `queries/green_citrus.json` — every query answerable from a
-  256px crop; T/D/S templates match intuition.
+- **B (read):** open `queries/green_citrus.json` — every query answerable from
+  a 256px crop; T/D/S templates match intuition. Optional `sam3_phrase` fields
+  are allowed per query (they enable the Sam3Oracle channel).
 
 ### 1.2 oracles
 - **A:** `pytest -q tests/test_oracle.py`
-- **B (Qwen sanity):**
-  ```python
-  import os, numpy as np; from PIL import Image; from config import Config
-  from verifier.queries import load_query_set; from verifier.oracle import QwenOracle
-  from verifier.verify import extract_crop
-  qs = load_query_set("queries/green_citrus.json"); cfg = Config()
-  img = np.array(Image.open(os.environ["IMG"]).convert("RGB"))
-  crop = extract_crop(img, [120, 340, 175, 400], cfg.crop_scale, cfg.crop_size)  # a fruit box
-  print(list(zip([q.id for q in qs.queries], QwenOracle(cfg).answer_batch(crop, qs))))
-  ```
-  Answers visibly sane: round=+1, veins=−1.
+- **B:** **T2** — QwenOracle on one fruit crop; answers visibly sane
+  (round=+1, veins=−1). All-zeros = parse/request fallback fired; see the log.
 
 ### 1.3 training-free V-IP core
 - **A:** `pytest -v tests/test_vip.py` — the four test names ARE the spec.
 
 ### 1.4 verify API + demo  ← GO/NO-GO
 - **A:** `pytest -q tests/test_verify.py`
-- **B:** pick 3 boxes (fruit / leaf / junk), then
-  ```bash
-  python scripts/demo_verify.py --image "$IMG" \
-    --boxes B1 --boxes B2 --boxes B3 --oracle qwen
-  ```
-  The three query→answer chains should read like sensible reasoning. Tweak
-  `queries/green_citrus.json` and re-run if not.
-  Get candidate boxes to paste:
-  ```bash
-  python -c "import os,json; g=json.load(open(f'out/{os.environ[\"STEM\"]}_ioc_graph.json')); [print(','.join(str(int(v)) for v in n['box'])) for n in g['nodes'][:5]]"
-  ```
+- **B:** **T3** — three chains (fruit/leaf/junk) read like sensible reasoning.
+  Tweak `queries/green_citrus.json` templates/epsilon and re-run if not; or
+  override epsilon without editing the JSON via `Config(vip_epsilon=0.25)`.
 
 ### 1.5 pipeline integration (verifier flag)
 - **A:** `pytest -q tests/test_pipeline_vip.py`
-- **B:**
-  ```bash
-  python scripts/run_image.py --image "$IMG" --prompt "green fruit" --passes 2 --verifier ioc
-  python scripts/run_image.py --image "$IMG" --prompt "green fruit" --passes 2 --verifier vip --oracle qwen
-  diff "out/${STEM}_ioc_graph.json" "out/${STEM}_vip_graph.json" | head -40
-  ```
-  Spot-check 5 differing nodes with `demo_verify`.
+- **B:** **T4** — same image under `--verifier ioc / vip / off`; diff overlays
+  and graphs; spot-check differing verdicts with `demo_verify`. The `off` run
+  is also the dedup regression check: node count must stay ~flat across passes.
 
 ---
 
@@ -98,19 +80,13 @@ export STEM=$(basename "$IMG" | sed 's/\.[^.]*$//')
 
 ### 2.1 support / jitter / signatures
 - **A:** `pytest -q tests/test_graph_support.py`
-- **B:** 3-pass run, then:
-  ```python
-  import os, json; g = json.load(open(f"out/{os.environ['STEM']}_ioc_graph.json"))
-  for n in sorted(g["nodes"], key=lambda x: x["support"], reverse=True)[:10]:
-      print(n["support"], round(n["jitter"], 1), n["area"], n["classification"])
-  ```
-  Stable fruit `support ≥ 2`; one-off junk `support == 1`.
+- **B:** **T5** (first half) — top-10 nodes by support: stable fruit ≥ 2,
+  one-off junk == 1; signatures record `pass:mode:prompt:conf`.
 
 ### 2.2 belief.py (w, U, discovery, φ)
 - **A:** `pytest -q tests/test_belief.py`
-- **B:** print `belief.uncertainty(graph, discovery, cfg)` and
-  `belief.summarize(...)` after each pass — U visibly drops across passes on an
-  easy image.
+- **B:** **T5** (second half) — U visibly drops across 3 passes on an easy
+  image.
 
 ---
 
@@ -118,14 +94,17 @@ export STEM=$(basename "$IMG" | sed 's/\.[^.]*$//')
 
 ### 3.1 action layer
 - **A:** `pytest -q tests/test_actions.py`
-- **B:** build an `ActionContext`, `execute(QueryA(region=<a quadrant>, ...), ctx)`,
-  then `inference.plot_graph_scene(...)` — detections appear only inside that
-  quadrant.
+- **B:** **T6** — one `QueryA` on the top-left quadrant: detections only inside
+  that quadrant. Note: episode pass numbers advance only with sensing actions
+  (`ctx.n_passes`), not with Verify/Subdivide/Stop.
 
 ### 3.2 cost meter
 - **A:** `pytest -q tests/test_budget.py`
-- **B:** after a 2-pass episode: `print(ctx.cost.as_dict(), ctx.cost.total(cfg))`;
-  recount by hand from the logs once.
+- **B:** **T6** — after the single region query expect
+  `n_sam == 2, n_tile == 0, n_orch == 1 → total 2.05`. The meter now counts
+  *actual* SAM3 calls from `PassStats` (canopy when run + leaf map when
+  generated + proposal + real vip oracle calls), identically for fixed policies
+  and episodes.
 
 ---
 
@@ -133,20 +112,12 @@ export STEM=$(basename "$IMG" | sed 's/\.[^.]*$//')
 
 ### 4.1 VoI heuristic + episode runner
 - **A:** `pytest -q tests/test_policy_heuristic.py`
-- **B:**
-  ```python
-  from agent.actions import ActionContext; from agent.belief import DiscoveryCurve
-  from agent.policy_heuristic import choose; from agent import runner
-  from graph import OrchardGraph; from config import Config
-  # processor = inference.load_sam3_model(...); img = Image.open(os.environ["IMG"]).convert("RGB"); W,H = img.size
-  ctx = ActionContext(processor=processor, image_pil=img, graph=OrchardGraph(), cfg=Config(),
-                      discovery=DiscoveryCurve(), partition=[(0, 0, W, H)])
-  out = runner.run_episode(img, ctx, choose, max_actions=12)
-  for e in out["log"]: print(e)
-  print(out["counts"], "cost", out["cost"])
-  ```
-  Run on sparse / dense / empty images: dense triggers `TileQueryA`/`SubdivideA`;
-  empty stops within ~3 actions.
+- **B:** **T7** — episodes via
+  `python -m eval.run_eval --policy heuristic ...` on sparse/dense/empty
+  images: dense triggers `TileQueryA`/`SubdivideA`, empty stops within ~3
+  actions. Under `--verifier ioc/off` the trace must contain **no `VerifyA`**
+  (verify is vip-only now) and must not crash. Episodes anchor their partition
+  to the canopy ROI automatically.
 
 ---
 
@@ -154,14 +125,15 @@ export STEM=$(basename "$IMG" | sed 's/\.[^.]*$//')
 
 ### 5.1 scene inspection z_t
 - **A:** `pytest -q tests/test_inspect.py`
-- **B:** `inspect_scene(dense_img, phi, cfg)` vs `inspect_scene(sparse_img, phi, cfg)`
-  — compare the two JSONs against your own eyes.
+- **B:** **T8** — `inspect_scene` on a dense vs a sparse image; compare the two
+  JSONs against your own eyes. Persistent `notes='fallback'` on a healthy
+  server is reportable.
 
 ### 5.2 VLM policy with validation
 - **A:** `pytest -q tests/test_policy_vlm.py`
-- **B:** run a VLM episode via `runner.make_vlm_policy(ctx)` with logging on;
-  read one prompt+response pair; grep the logs for `fallback` to confirm every
-  executed action was validated.
+- **B:** **T9** — full VLM episode; read one prompt+response pair; grep the log
+  for `fallback`. With `--verifier ioc` the prompt's action menu must not
+  contain `verify`.
 
 ---
 
@@ -173,14 +145,38 @@ export STEM=$(basename "$IMG" | sed 's/\.[^.]*$//')
 
 ### 6.2 sweep runner
 - **A:** `pytest -q tests/test_eval_sweep.py`
-- **B:** `--limit 5` sweep of `{oneshot,cascade} × {ioc,vip}`; open the CSV —
-  `pool_recall(cascade) ≥ pool_recall(oneshot)`, and the vip-vs-ioc precision
-  delta tells you if the verifier earns its cost.
+- **B:** **T11** — `--limit 5` sweep; `pool_recall(cascade) ≥
+  pool_recall(oneshot)`; the vip-vs-ioc precision delta shows if the verifier
+  earns its cost. `--prompt`/`--conf` now apply to heuristic/vlm too. Costs sit
+  on one unified scale (oneshot ≈ 3.0, not 1.0 — canopy + leaf map counted).
 
 ### 6.3 report + plot
 - **A:** `pytest -q tests/test_report.py`
-- **B:** `python -m eval.report --csv out/sweep.csv` — the accuracy-vs-cost plot
-  is the paper figure; confirm the six-policy story is readable.
+- **B:** **T11** — `python -m eval.report --csv out/sweep.csv`; the
+  accuracy-vs-cost plot is the paper figure; the six-policy story must be
+  readable. Mask-mode rows appear as `verifier="ioc+mask"` etc.
+
+---
+
+## 2026-07-05 review fixes + mask-overlap switch
+
+### Functional-review fixes
+- **A:** `pytest -q tests/test_review_fixes.py` (13 tests: VerifyA guard +
+  vip-only gating, ROI-keyed leaf cache, unresolved dedup under vip/off,
+  PassStats call counts, vip_epsilon override, request-exception fallbacks,
+  sam3_phrase round-trip).
+- **B:** **T12** — (a) `--policy heuristic --verifier off` completes without a
+  traceback; (b) `--policy convergence --verifier off` terminates in < 8
+  passes with a sane `N_obs`; (c) a custom `target_prompt` shows up in the
+  episode's node signatures.
+
+### Mask-based IoU/IoM (`overlap_mode="mask"`)
+- **A:** `pytest -q tests/test_mask_overlap.py` (9 tests: mask IoU math, mask
+  dual-gate NMS + alignment through the confidence filter, mask dedup,
+  execute_pass round trip).
+- **B:** **T10** — `run_image.py --overlap-mode mask` on a clustered image:
+  outputs tagged `_ioc_mask_*`; touching-but-distinct fruits survive that box
+  mode suppressed; `--tiling --overlap-mode mask` warns and falls back to box.
 
 ---
 
@@ -188,14 +184,17 @@ export STEM=$(basename "$IMG" | sed 's/\.[^.]*$//')
 
 Whole CPU suite:
 ```bash
-pytest -q            # expect 175 passed
+pytest -q            # expect 204 passed
 ```
 
-Full six-policy sweep (needs the VLM server for vip / vlm):
+Full six-policy sweep (needs the Ollama server for vip / vlm; resume-safe):
 ```bash
 for pol in oneshot cascade tiled convergence heuristic vlm; do for ver in ioc vip; do
   python -m eval.run_eval --root dataset --fmt yolo --split val --limit 5 \
-    --policy $pol --verifier $ver --out out/sweep.csv
+    --policy $pol --verifier $ver --prompt "green fruit" --out out/sweep.csv
 done; done
+# optional mask-mode line for the figure:
+python -m eval.run_eval --root dataset --fmt yolo --split val --limit 5 \
+  --policy cascade --verifier ioc --overlap-mode mask --out out/sweep.csv
 python -m eval.report --csv out/sweep.csv --out out/accuracy_vs_cost.png
 ```
