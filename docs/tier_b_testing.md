@@ -435,8 +435,8 @@ mandatory global bootstrap pass and auto-stops on saturation.
 **Run:**
 
 ```bash
-python -m eval.run_eval --root dataset --fmt yolo --split val --limit 1 \
-  --policy vlm --verifier vip --prompt "green fruit" \
+python -m eval.run_eval --root datasets/citruses_dataset --fmt yolo --split val --limit 1 \
+  --policy vlm --verifier ioc --prompt "green fruit" \
   --out out/T9.csv 2>&1 | tee out/T9.log
 grep -c "policy_vlm prompt"    out/T9.log     # policy-loop prompts sent
 grep -c "policy_vlm response"  out/T9.log     # responses received
@@ -521,7 +521,7 @@ suppression you disagree with, include a crop/screenshot of the cluster.
 
 ```bash
 for pol in oneshot cascade tiled convergence heuristic vlm; do for ver in ioc vip; do
-  python -m eval.run_eval --root dataset --fmt yolo --split val --limit 5 \
+  python -m eval.run_eval --root datasets/citruses_dataset --fmt yolo --split val --limit 5 \
     --policy $pol --verifier $ver --prompt "green fruit" --out out/sweep.csv \
     2>&1 | tee -a out/T11.log
 done; done
