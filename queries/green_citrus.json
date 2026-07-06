@@ -11,37 +11,27 @@
     },
     {
       "id": "q02",
-      "text": "Does the central object look like a solid three-dimensional ball rather than a flat surface?",
+      "text": "Is the central object compact and roughly as wide as it is tall?",
       "templates": {"target": 1, "distractor": -1, "spurious": 0}
     },
     {
       "id": "q03",
-      "text": "Is the central object a fairly uniform, solid color across its whole surface?",
-      "templates": {"target": 1, "distractor": 0, "spurious": -1}
-    },
-    {
-      "id": "q04",
       "text": "Is the central object a flat, thin, leaf-like shape?",
       "templates": {"target": -1, "distractor": 1, "spurious": 0}
     },
     {
-      "id": "q05",
+      "id": "q04",
       "text": "Does the object have a pointed tip or an elongated, tapering leaf outline?",
       "templates": {"target": -1, "distractor": 1, "spurious": 0}
     },
     {
-      "id": "q06",
-      "text": "Is most of the crop plain background such as sky, bare soil, ground, bark, or dead debris?",
+      "id": "q05",
+      "text": "Is most of the crop plain background such as bare soil, ground, bark, or dead debris?",
       "templates": {"target": -1, "distractor": -1, "spurious": 1}
     },
     {
-      "id": "q07",
-      "text": "Is there one clearly dominant object centered in the crop rather than many small mixed elements?",
-      "templates": {"target": 1, "distractor": 1, "spurious": -1}
-    },
-    {
-      "id": "q08",
-      "text": "Is the crop blurry or cluttered so that no single object is clearly identifiable?",
+      "id": "q06",
+      "text": "Is most of the crop open sky or a smooth, out-of-focus background with no leaves or fruit?",
       "templates": {"target": -1, "distractor": -1, "spurious": 1}
     }
   ]
