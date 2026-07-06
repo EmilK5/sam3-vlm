@@ -277,16 +277,28 @@ def register_and_verify_candidates(candidate_boxes, candidate_scores, leaf_boxes
 # ==========================================
 # 2. Coordinate Space Translations
 # ==========================================
-def initialize_canopy_roi(processor, img_np, graph):
+def initialize_canopy_roi(processor, img_np, graph, use_canopy=True):
     """
     [PASS 0] Locates the main tree canopy bounding box globally.
     Gates subsequent micro discovery loops to strip out soil and sky noise.
+
+    use_canopy: additive, backward-compatible (default True = unchanged behavior).
+    False skips the "tree canopy" SAM3 sweep entirely and anchors the ROI to the
+    full frame instead -- for datasets with no canopy concept (e.g. CARPK
+    parking lots, CountBench/PixMo generic photos), where that sweep can only
+    ever return a spurious/empty match and wastes a SAM3 call.
     """
     if hasattr(graph, "tree_roi") and graph.tree_roi is not None:
         return graph.tree_roi
 
-    logging.info("Executing Pass 0: Initializing Canopy ROI Anchor...")
     img_h, img_w = img_np.shape[:2]
+
+    if not use_canopy:
+        graph.tree_roi = [0, 0, img_w, img_h]
+        logging.info("Canopy detection disabled (use_canopy=False); using full frame as ROI.")
+        return graph.tree_roi
+
+    logging.info("Executing Pass 0: Initializing Canopy ROI Anchor...")
 
     # Run a global sweep with a high threshold to find the primary tree structure
     tree_boxes, _ = global_engine(processor, img_np, conf=0.40, prompt="tree canopy")
@@ -459,7 +471,8 @@ def tiled_engine(processor, image_pil, confidence, clahe, prompt, pos_boxes=None
 
 def execute_pass(processor, image_pil, graph, conf, clahe, tiling, pass_number, prompt,
                  disable_size_filter=False, nms_mode="dualgate", use_concentric=False,
-                 gate_mode="dual", cfg=None, oracle=None, query_set=None, roi_override=None):
+                 gate_mode="dual", use_canopy_roi=True, cfg=None, oracle=None, query_set=None,
+                 roi_override=None):
     """
     Runs one full pass of SAM3 pipeline
     Propose -> Register -> Verify -> Feedback
@@ -473,6 +486,11 @@ def execute_pass(processor, image_pil, graph, conf, clahe, tiling, pass_number, 
         countbench-style scenes, "iom_only" for CARPK's dense uniform-size grids).
     use_concentric: forwarded to the dual-gate concentric sub-gate (default OFF;
         only the harness/ablation should turn it on).
+    use_canopy_roi: forwarded to initialize_canopy_roi (default True, unchanged).
+        False anchors the ROI to the full frame instead of running a "tree canopy"
+        SAM3 sweep -- for datasets with no canopy concept (CARPK, CountBench,
+        PixMo). Ignored when roi_override is given (that already skips canopy
+        detection).
 
     Returns a PassStats (an int subclass) so existing callers in app.py are unaffected.
     """
@@ -486,9 +504,9 @@ def execute_pass(processor, image_pil, graph, conf, clahe, tiling, pass_number, 
     if roi_override is not None:
         roi = [int(v) for v in roi_override]
     else:
-        if getattr(graph, "tree_roi", None) is None:
+        if getattr(graph, "tree_roi", None) is None and use_canopy_roi:
             n_sam_calls += 1  # the canopy pass-0 sweep is a real global SAM3 call
-        roi = initialize_canopy_roi(processor, img_np, graph)
+        roi = initialize_canopy_roi(processor, img_np, graph, use_canopy=use_canopy_roi)
     roi_x1, roi_y1, roi_x2, roi_y2 = roi
 
     # Crop the PIL image tightly to the tree zone for the processing track

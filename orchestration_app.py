@@ -207,6 +207,11 @@ def _build_cfg(prompt, verifier, overlap_mode, gate_mode, conf, budget, query_fi
         target_prompt=prompt,
         budget_max_actions=int(budget),
         vip_query_file=query_file or Config().vip_query_file,
+        # None of countbench/pixmo/carpk have a canopy -- the "tree canopy" SAM3
+        # sweep would only ever return a spurious/empty match here, so it's
+        # always off for this app (unlike citrus_orchestration_app.py, whose
+        # single dataset is a real orchard and keeps the default True).
+        use_canopy_roi=False,
     )
 
 
@@ -252,8 +257,10 @@ def _run_episode(image_pil, cfg, policy, oracle, query_set, use_mock, force_tile
 
     if PROCESSOR is not None:
         from pipeline import initialize_canopy_roi
-        roi = initialize_canopy_roi(PROCESSOR, np.array(image_pil), graph)
-        cost.n_sam += 1
+        use_canopy_roi = getattr(cfg, "use_canopy_roi", True)
+        if use_canopy_roi:
+            cost.n_sam += 1
+        roi = initialize_canopy_roi(PROCESSOR, np.array(image_pil), graph, use_canopy=use_canopy_roi)
         partition = [tuple(int(v) for v in roi)]
     else:
         w, h = image_pil.size

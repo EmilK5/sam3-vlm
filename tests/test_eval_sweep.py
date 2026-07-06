@@ -157,6 +157,40 @@ def test_verifier_label_tags_gate_mode_and_force_tile():
     assert run_eval.verifier_label(Config(), force_tile=True) == "ioc+ftile"
 
 
+def test_verifier_label_tags_no_canopy():
+    cfg = dataclasses.replace(Config(), use_canopy_roi=False)
+    assert run_eval.verifier_label(cfg) == "ioc+nocanopy"
+    assert run_eval.verifier_label(Config()) == "ioc"  # default True -> no tag
+
+
+def test_use_canopy_roi_forwarded_to_execute_pass():
+    captured = {}
+
+    def fn(**kw):
+        captured["use_canopy_roi"] = kw.get("use_canopy_roi")
+        graph, pass_number = kw["graph"], kw["pass_number"]
+        nid = graph.add_candidate([0, 0, 5, 5], 0.9, found_in_pass=pass_number)
+        graph.nodes[nid].classification = "fruit"
+        return _FakeStats(1, n_sam_calls=1)
+
+    cfg = dataclasses.replace(Config(), use_canopy_roi=False)
+    run_eval.run_policy("oneshot", processor=None, image_pil=None, cfg=cfg,
+                        oracle=None, query_set=None, prompt="car", conf=0.45,
+                        execute_pass_fn=fn)
+    assert captured["use_canopy_roi"] is False
+
+
+def test_parse_args_canopy_roi_default_auto():
+    args = run_eval.parse_args(["--root", "r", "--fmt", "yolo", "--policy", "oneshot", "--out", "x.csv"])
+    assert args.canopy_roi == "auto"
+
+
+def test_parse_args_canopy_roi_explicit_off():
+    args = run_eval.parse_args(["--dataset", "carpk", "--policy", "oneshot",
+                                "--canopy-roi", "off", "--out", "x.csv"])
+    assert args.canopy_roi == "off"
+
+
 def test_gate_mode_forwarded_to_execute_pass():
     captured = {}
 

@@ -29,6 +29,10 @@ class Config:
     #     over-suppress adjacent-but-distinct boxes, and a fully-contained box is always a
     #     duplicate regardless of its size relative to the container. Only takes effect
     #     when nms_mode == "dualgate".
+    use_canopy_roi: bool = True  # False skips the "tree canopy" SAM3 sweep in
+    #     pipeline.initialize_canopy_roi and anchors the ROI to the full frame instead --
+    #     for datasets with no canopy concept (CARPK, CountBench, PixMo), where that sweep
+    #     wastes a SAM3 call on a prompt that can never legitimately match.
     target_prompt: str = "green fruit"  # concept string for agent Query/TileQuery actions
     overlap_mode: str = "box"  # "box" (default) | "mask": NMS IoU/IoM + cross-pass dedup
     #     measured on instance masks instead of boxes (global passes only; tiled

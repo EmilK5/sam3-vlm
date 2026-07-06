@@ -149,16 +149,19 @@ def _next_pass_number(ctx) -> int:
 def _execute_query(action, ctx, tiling, roi_override) -> int:
     from pipeline import execute_pass  # lazy: pipeline imports torch/inference
     pass_number = _next_pass_number(ctx)
-    # nms_mode/gate_mode read via getattr with execute_pass's own defaults, so an
-    # episode whose cfg doesn't set them (or a bare Config()) is unaffected.
+    # nms_mode/gate_mode/use_canopy_roi read via getattr with execute_pass's own
+    # defaults, so an episode whose cfg doesn't set them (or a bare Config()) is
+    # unaffected.
     nms_mode = getattr(ctx.cfg, "nms_mode", "dualgate")
     gate_mode = getattr(ctx.cfg, "gate_mode", "dual")
+    use_canopy_roi = getattr(ctx.cfg, "use_canopy_roi", True)
     stats = execute_pass(
         processor=ctx.processor, image_pil=ctx.image_pil, graph=ctx.graph,
         conf=action.conf, clahe=False, tiling=tiling,
         pass_number=pass_number, prompt=action.prompt,
         cfg=ctx.cfg, oracle=ctx.oracle, query_set=ctx.query_set,
         roi_override=roi_override, nms_mode=nms_mode, gate_mode=gate_mode,
+        use_canopy_roi=use_canopy_roi,
     )
     ctx.n_passes = pass_number
     _meter_query(ctx, stats)

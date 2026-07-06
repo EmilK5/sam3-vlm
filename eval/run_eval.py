@@ -20,10 +20,13 @@ and uses a fixed numpy seed per image for reproducibility.
 
 --gate-mode picks which apply_nms_dualgate suppression criterion applies (dual
 default | iou_only | iom_only); --force-tile makes the first sensing pass tiled
-regardless of policy. Both are folded into the CSV "verifier" tag (via
-verifier_label) so different settings never collide on resume. Every image
-where N_obs != N_gt gets an annotated mismatch overlay saved under
---mismatch-dir (default: <out dir>/mismatches/<policy>_<verifier tag>/).
+regardless of policy; --canopy-roi controls whether the "tree canopy" SAM3
+sweep runs before sensing at all ('auto' default: on for --dataset local, off
+for pixmo/countbench/carpk, which have no canopy concept). All three are
+folded into the CSV "verifier" tag (via verifier_label) so different settings
+never collide on resume. Every image where N_obs != N_gt gets an annotated
+mismatch overlay saved under --mismatch-dir (default: <out dir>/mismatches/
+<dataset>_<policy>_<verifier tag>/).
 """
 
 import argparse
@@ -77,14 +80,16 @@ def predicted_nodes(graph):
 
 def verifier_label(cfg, force_tile=False) -> str:
     """CSV 'verifier' value: the verifier mode, tagged with any non-default
-    overlap/gate/tiling setting, so different sweeps of the same policy never
-    collide on resume."""
+    overlap/gate/tiling/canopy setting, so different sweeps of the same policy
+    never collide on resume."""
     tag = ""
     if getattr(cfg, "overlap_mode", "box") == "mask":
         tag += "+mask"
     gate = getattr(cfg, "gate_mode", "dual")
     if gate != "dual":
         tag += f"+{gate}"
+    if not getattr(cfg, "use_canopy_roi", True):
+        tag += "+nocanopy"
     if force_tile:
         tag += "+ftile"
     return cfg.verifier_mode + tag
@@ -117,12 +122,14 @@ def _run_fixed_policy(policy, processor, image_pil, cfg, oracle, query_set, prom
 
     cost = CostMeter()
     gate_mode = getattr(cfg, "gate_mode", "dual")
+    use_canopy_roi = getattr(cfg, "use_canopy_roi", True)
 
     def do_pass(pass_number, tiling):
         stats = execute_pass_fn(
             processor=processor, image_pil=image_pil, graph=graph, conf=conf,
             clahe=False, tiling=tiling, pass_number=pass_number, prompt=prompt,
             cfg=cfg, oracle=oracle, query_set=query_set, gate_mode=gate_mode,
+            use_canopy_roi=use_canopy_roi,
         )
         # Meter from the pass's actual call counts (canopy + leaf map + proposal
         # in n_sam_calls; tiles; real vip oracle calls) — same scale as episodes.
@@ -167,11 +174,16 @@ def _run_agent_policy(policy, processor, image_pil, cfg, oracle, query_set,
     # Partition starts as [tree_roi] (plan 4.1): anchor the episode's regions to
     # the canopy so region queries don't waste budget on soil/sky. Needs SAM3, so
     # with no processor (offline tests / stubbed executors) fall back to the full
-    # frame. The canopy sweep is one real global SAM3 call -> metered.
+    # frame. use_canopy_roi=False (cfg.use_canopy_roi) skips the canopy sweep and
+    # anchors to the full frame instead -- for datasets with no canopy concept
+    # (CARPK, CountBench, PixMo). The canopy sweep, when it runs, is one real
+    # global SAM3 call -> metered.
     if processor is not None:
         from pipeline import initialize_canopy_roi  # lazy: pipeline imports torch
-        roi = initialize_canopy_roi(processor, np.array(image_pil), graph)
-        cost.n_sam += 1
+        use_canopy_roi = getattr(cfg, "use_canopy_roi", True)
+        if use_canopy_roi:
+            cost.n_sam += 1
+        roi = initialize_canopy_roi(processor, np.array(image_pil), graph, use_canopy=use_canopy_roi)
         partition = [tuple(int(v) for v in roi)]
     else:
         w, h = image_pil.size
@@ -412,6 +424,13 @@ def parse_args(argv=None):
     parser.add_argument("--fmt", choices=["yolo", "minneapple"], default=None,
                         help="Local split format. Required for --dataset local.")
     parser.add_argument("--split", default="val", help="--dataset local only.")
+    parser.add_argument("--canopy-roi", choices=["auto", "on", "off"], default="auto",
+                        help="Whether to run the 'tree canopy' SAM3 sweep "
+                             "(pipeline.initialize_canopy_roi) before sensing, or just anchor "
+                             "to the full frame. 'auto' (default): on for --dataset local "
+                             "(your citrus/orchard data), off for pixmo/countbench/carpk (no "
+                             "canopy concept -- the sweep would only ever return a spurious/"
+                             "empty match). 'on'/'off' force it either way regardless of dataset.")
     parser.add_argument("--policy", required=True,
                         choices=["oneshot", "cascade", "tiled", "convergence", "heuristic", "vlm"])
     parser.add_argument("--verifier", choices=["ioc", "vip", "off"], default="ioc")
@@ -524,10 +543,17 @@ def main():
     base_cfg = Config()
     conf = args.conf if args.conf is not None else base_cfg.conf
     cfg, oracle, query_set = build_verifier(args.verifier, base_cfg, args.query_file)
+    if args.canopy_roi == "auto":
+        use_canopy_roi = args.dataset == "local"
+    else:
+        use_canopy_roi = args.canopy_roi == "on"
     # Agent policies read the concept/confidence from cfg (fixed policies get them
     # as arguments); evaluate_image overrides target_prompt per-sample, so this is
-    # just the shared baseline. --overlap-mode/--gate-mode apply everywhere.
-    cfg = dataclasses.replace(cfg, conf=conf, overlap_mode=args.overlap_mode, gate_mode=args.gate_mode)
+    # just the shared baseline. --overlap-mode/--gate-mode/--canopy-roi apply everywhere.
+    cfg = dataclasses.replace(cfg, conf=conf, overlap_mode=args.overlap_mode, gate_mode=args.gate_mode,
+                              use_canopy_roi=use_canopy_roi)
+    logger.info("canopy ROI %s (--canopy-roi=%s, dataset=%s)",
+               "enabled" if use_canopy_roi else "disabled", args.canopy_roi, args.dataset)
 
     # Load SAM3 once (real run). Imported lazily so this module stays torch-free.
     import torch
