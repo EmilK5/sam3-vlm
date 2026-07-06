@@ -9,3 +9,4 @@ venv/
 .venv/
 # personal Claude Code settings stay local
 .claude/settings.local.json
+datasets/

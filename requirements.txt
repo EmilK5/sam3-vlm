@@ -12,3 +12,6 @@ gradio
 openai        # client only, for the OpenAI-compatible Qwen endpoint
 # Dev
 pytest
+requests
+torchvision
+
