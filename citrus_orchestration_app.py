@@ -492,7 +492,7 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Citrus Orchestration Sandbox") as 
             status_box = gr.Textbox(label="\U0001f4ca Result", interactive=False)
             verbose_box = gr.Textbox(
                 label="\U0001f52c Verbose orchestration log (actions · per-pass SAM3 · verifier · VLM prompts · estimates)",
-                interactive=False, lines=24, max_lines=24, show_copy_button=True,
+                interactive=False, lines=24, max_lines=24,
             )
 
         with gr.Column(scale=2):
