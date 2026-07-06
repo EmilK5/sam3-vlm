@@ -22,6 +22,10 @@ Supported formats:
                    converted with inference.yolo_to_xyxy.
     "minneapple" - per-image instance mask PNG where each object has a distinct
                    pixel value/color; one box per instance id.
+
+Also provides a second, unrelated loader family for count-only benchmark
+datasets (pixmo / countbench / carpk) that have no box-level ground truth, only
+a scalar count per image -- see get_count_sample() below.
 """
 
 import argparse
@@ -164,6 +168,152 @@ def draw_gt_overlay(image_pil, gt_boxes, output_path: str):
                                        linewidth=2, edgecolor="cyan", facecolor="none"))
     ax.axis("off")
     fig.savefig(output_path, bbox_inches="tight", dpi=150)
+
+
+# ----------------------- count-only benchmark datasets -----------------------
+#
+# pixmo / countbench / carpk have no box-level ground truth, only a scalar count
+# per image (unlike load_split's yolo/minneapple, which have real boxes). Ported
+# from orchestration_app.py's dataset access layer so the dashboard and eval CLI
+# share one implementation. get_count_sample() is the uniform accessor:
+#     get_count_sample(name, idx) -> (image_pil_or_None, raw_prompt, gt_count, error_or_None)
+# Network/optional-dependency imports (datasets, requests) stay lazy so this
+# module keeps importing cleanly without them installed.
+
+COUNT_DATASETS = ("pixmo", "countbench", "carpk")
+
+# Local CARPK devkit root (override via env var to match wherever it lives).
+CARPK_BASE_DIR = os.environ.get("CARPK_BASE_DIR", "./datasets/CARPK_devkit/data")
+CARPK_IMAGE_DIR = os.path.join(CARPK_BASE_DIR, "Images")
+CARPK_ANNO_DIR = os.path.join(CARPK_BASE_DIR, "Annotations")
+CARPK_SPLIT_FILE = os.path.join(CARPK_BASE_DIR, "ImageSets", "test.txt")
+
+# Optional label->noun-phrase maps. Absent => raw label.
+PROMPT_MAP_FILES = {
+    "pixmo": "./pixmo_count_generic_map.json",
+    "countbench": "./countbench_generic_map.json",
+    "carpk": None,
+}
+
+# CountBench remote-payload / ground-truth corrections (from the reference eval).
+PURGED_IMAGE_IDS = {"pixmo": set(), "countbench": {126, 406, 174, 281}, "carpk": set()}
+GROUND_TRUTH_OVERRIDES = {
+    "pixmo": {},
+    "countbench": {134: 9, 271: 8, 331: 1, 194: 25},
+    "carpk": {},
+}
+
+_count_dataset_cache = {}
+_prompt_maps = {}
+
+
+def _parse_carpk():
+    import logging
+    if not os.path.exists(CARPK_SPLIT_FILE):
+        logging.getLogger(__name__).error("CARPK split file missing: %s", CARPK_SPLIT_FILE)
+        return []
+    with open(CARPK_SPLIT_FILE, "r", encoding="utf-8") as f:
+        stems = [line.strip() for line in f if line.strip()]
+    parsed = []
+    for stem in stems:
+        anno_path = os.path.join(CARPK_ANNO_DIR, f"{stem}.txt")
+        gt = 0
+        if os.path.exists(anno_path):
+            with open(anno_path, "r", encoding="utf-8") as af:
+                gt = sum(1 for line in af if line.strip())
+        parsed.append({"image_path": os.path.join(CARPK_IMAGE_DIR, f"{stem}.png"), "count": gt})
+    return parsed
+
+
+def get_count_dataset(name):
+    """Load (and cache) the raw dataset object/list for a count-only dataset."""
+    if name not in _count_dataset_cache:
+        if name == "countbench":
+            from datasets import load_dataset  # lazy: optional dependency
+            _count_dataset_cache[name] = load_dataset("nielsr/countbench", split="train")
+        elif name == "pixmo":
+            from datasets import load_dataset  # lazy: optional dependency
+            _count_dataset_cache[name] = load_dataset("allenai/pixmo-count", split="test")
+        elif name == "carpk":
+            _count_dataset_cache[name] = _parse_carpk()
+        else:
+            raise ValueError(f"Unknown count dataset {name!r}; expected one of {COUNT_DATASETS}.")
+    return _count_dataset_cache[name]
+
+
+def count_dataset_size(name):
+    import logging
+    try:
+        return len(get_count_dataset(name))
+    except Exception as exc:
+        logging.getLogger(__name__).error("Failed to load dataset %s: %s", name, exc)
+        return 0
+
+
+def get_prompt_map(name):
+    if name not in _prompt_maps:
+        path = PROMPT_MAP_FILES.get(name)
+        if path and os.path.exists(path):
+            import json
+            with open(path, "r", encoding="utf-8") as f:
+                _prompt_maps[name] = json.load(f)
+        else:
+            _prompt_maps[name] = {}
+    return _prompt_maps[name]
+
+
+def default_prompt_for(name, raw_prompt):
+    if name == "carpk":
+        return "car"
+    pm = get_prompt_map(name)
+    if name == "pixmo":
+        return pm.get(raw_prompt, (raw_prompt or "").lower())
+    return pm.get(raw_prompt, raw_prompt or "")  # countbench keeps native casing
+
+
+def get_count_sample(name, idx):
+    """Uniform accessor -> (image_pil_or_None, raw_prompt, gt_count, error_or_None).
+
+    Applies the dataset's ground-truth overrides; purged ids are surfaced as errors.
+    """
+    data = get_count_dataset(name)
+    if idx in PURGED_IMAGE_IDS.get(name, set()):
+        return None, "", None, f"index {idx} is purged (dead payload) for {name}"
+
+    override = GROUND_TRUTH_OVERRIDES.get(name, {}).get(idx)
+    sample = data[idx]
+
+    if name == "countbench":
+        raw_prompt = sample["text"]
+        gt = override if override is not None else int(sample["number"])
+        if sample.get("image") is None:
+            return None, raw_prompt, gt, "image link expired/corrupted"
+        return sample["image"].convert("RGB"), raw_prompt, gt, None
+
+    if name == "pixmo":
+        import io
+        import requests  # lazy: only pixmo fetches by URL
+        raw_prompt = sample["label"]
+        gt = override if override is not None else int(sample["count"])
+        url = sample.get("image_url")
+        if not url:
+            return None, raw_prompt, gt, "missing image_url"
+        try:
+            r = requests.get(url, timeout=10)
+            if r.status_code != 200:
+                return None, raw_prompt, gt, f"HTTP status {r.status_code}"
+            return Image.open(io.BytesIO(r.content)).convert("RGB"), raw_prompt, gt, None
+        except Exception as exc:
+            return None, raw_prompt, gt, f"link timeout/unresponsive ({exc})"
+
+    if name == "carpk":
+        gt = override if override is not None else int(sample["count"])
+        path = sample["image_path"]
+        if not os.path.exists(path):
+            return None, "car", gt, f"local file path missing: '{path}'"
+        return Image.open(path).convert("RGB"), "car", gt, None
+
+    raise ValueError(f"Unknown count dataset {name!r}; expected one of {COUNT_DATASETS}.")
 
 
 # ----------------------- CLI -----------------------

@@ -140,13 +140,16 @@ def apply_nms_dualgate(boxes, scores, confidence,
     and re-tuned for small, same-color, clustered fruit.
 
     gate_mode: additive, backward-compatible. "dual" (default) keeps Gate A (IoU)
-    OR Gate B (IoM containment) exactly as before -- byte-identical to the
-    original behavior. "iou_only" disables Gate B (pure lateral-duplicate IoU
-    suppression). "iom_only" disables Gate A (pure size-guarded containment
-    suppression, no lateral-IoU check) -- useful for datasets like CARPK where
-    uniform-size objects sit in dense grids and IoU alone can over-suppress
-    adjacent-but-distinct boxes. The concentric sub-gate (opt-in) still adds to
-    whichever gate is active.
+    OR Gate B (IoM containment, size-ratio-guarded) exactly as before --
+    byte-identical to the original behavior. "iou_only" disables Gate B (pure
+    lateral-duplicate IoU suppression). "iom_only" disables Gate A AND drops
+    Gate B's size-ratio guard (pure containment suppression: iom > iom_threshold
+    alone) -- useful for datasets like CARPK where uniform-size objects sit in
+    dense grids and a box fully swallowed by another is never a distinct real
+    object regardless of relative size, so the guard (meant to protect a small
+    fruit genuinely nested in a citrus cluster box) would only hide the
+    duplicate. The concentric sub-gate (opt-in) still adds to whichever gate is
+    active.
 
     Gate A (IoU): lateral-duplicate suppression. Held at the citrus-validated 0.40
                   so swapping IoU->dual-gate is a *controlled, additive* change and
@@ -240,11 +243,15 @@ def apply_nms_dualgate(boxes, scores, confidence,
         size_ratio[m3] = min_a[m3] / max_a[m3]
 
         iou_violation = iou > iou_threshold
-        containment_violation = (iom > iom_threshold) & (size_ratio >= min_size_ratio_for_containment)
+        pure_containment_violation = iom > iom_threshold
+        containment_violation = pure_containment_violation & (size_ratio >= min_size_ratio_for_containment)
         if gate_mode == "iou_only":
             suppress = iou_violation
         elif gate_mode == "iom_only":
-            suppress = containment_violation
+            # No size-ratio guard: a fully-contained box is always a duplicate/
+            # fragment here, never a genuinely distinct smaller object (unlike
+            # the citrus dual-gate case the guard was built for).
+            suppress = pure_containment_violation
         else:
             suppress = iou_violation | containment_violation
 
