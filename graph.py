@@ -67,7 +67,9 @@ class OrchardNode:
         """
         cx, cy = self._center(box)
         rx, ry = self._center(self.box)
-        displacement = ((cx - rx) ** 2 + (cy - ry) ** 2) ** 0.5
+        # float(...) guards against a numpy box (float32) being passed in, which
+        # would make jitter a np.float32 and break json.dump on to_dict output.
+        displacement = float(((cx - rx) ** 2 + (cy - ry) ** 2) ** 0.5)
 
         self.support += 1
         if signature is not None:
