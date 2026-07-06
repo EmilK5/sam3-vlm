@@ -10,6 +10,8 @@ scipy
 gradio
 # Verifier / agent
 openai        # client only, for the OpenAI-compatible Qwen endpoint
+# Benchmark datasets (orchestration_app.py: CountBench / PixMo-Count loaders)
+datasets      # HuggingFace hub loaders for nielsr/countbench and allenai/pixmo-count
 # Dev
 pytest
 requests

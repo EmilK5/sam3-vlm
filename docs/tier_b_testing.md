@@ -221,14 +221,26 @@ fired — check `out/T2.log` for `QwenOracle: unparseable response` /
 
 ## T3 — GO/NO-GO: interpretable verifier chains  (step 1.4)
 
-**Run** with three boxes from T2's list — ideally one clear fruit, one leaf,
-one junk:
+**Run** with a few boxes from T2's list — ideally one clear fruit, one leaf,
+one junk. Each `--boxes` value is bare `x1,y1,x2,y2` — **no brackets, no
+spaces** (the parser splits on commas and `float()`s each part, so `[247` or
+`247, 136` will crash):
 
 ```bash
 python scripts/demo_verify.py --image "$IMG" \
-  --boxes FRUIT_BOX --boxes LEAF_BOX --boxes JUNK_BOX --oracle qwen \
+  --boxes 185,121,205,139 \
+  --boxes 16,603,32,620 \
+  --boxes 67,153,83,173 \
+  --oracle qwen \
   2>&1 | tee out/T3.log
 ```
+
+Sample boxes for this image (expected class in parentheses):
+`185,121,205,139` (fruit), `261,592,278,610` (fruit),
+`271,266,291,286` (fruit), `298,74,314,98` (fruit),
+`67,153,83,173` (fruit), `16,603,32,620` (leaf). These are all fruit/leaf —
+to exercise the `spurious` class, add a sky/soil/bark box (grab one from the
+T2 node dump, e.g. a low-support node over background).
 
 **Expect:** per box, a chain like
 `[Is the central object roun yes][...] -> target (0.94)` plus the three class
@@ -370,7 +382,7 @@ EOF
 **Run** on three images — sparse, dense, and empty-of-fruit:
 
 ```bash
-python -m eval.run_eval --root dataset --fmt yolo --split val --limit 3 \
+python -m eval.run_eval --root datasets/citruses_dataset --fmt yolo --split val --limit 3 \
   --policy heuristic --verifier ioc --prompt "green fruit" \
   --out out/T7.csv 2>&1 | tee out/T7.log
 grep -o '"action": "[A-Za-z]*"' out/T7.log | sort | uniq -c

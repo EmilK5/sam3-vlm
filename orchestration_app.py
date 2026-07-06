@@ -1,0 +1,610 @@
+"""
+orchestration_app.py
+
+Interactive Gradio dashboard that runs the FULL active-perception orchestration
+pipeline of this repo (agent episode: policy -> action -> belief update) on a
+chosen benchmark image, with a verbose log window exposing every action, per-pass
+SAM3 diagnostic, verifier call, and count estimate.
+
+This is a standalone driver (it does NOT touch app.py, pipeline.py, or any of the
+validated core modules). It only *uses* their public entry points:
+
+    agent.runner.run_episode            - the orchestration loop
+    agent.policy_heuristic / policy_vlm - the two policies
+    agent.actions.ActionContext         - the episode sensing state
+    agent.belief.count_estimates        - N_obs / N_supp / N_cons
+    pipeline.initialize_canopy_roi      - canopy ROI for the initial partition
+    verifier.queries.load_query_set     - FM+V-IP query set (vip mode)
+    verifier.oracle.MockOracle/QwenOracle
+    inference.load_sam3_model
+
+Datasets (self-contained access layer, keyed off a dropdown):
+    countbench  - HF nielsr/countbench (train split)      [needs `datasets`]
+    pixmo       - HF allenai/pixmo-count (test split)      [needs `datasets`, network]
+    carpk       - local CARPK_devkit (Images/Annotations)  [needs CARPK_BASE_DIR]
+
+NOTE ON DEPENDENCIES: CountBench and PixMo-Count require the HuggingFace
+`datasets` library, which is not in the repo's core allowed-deps set. It is
+imported lazily (only when one of those datasets is selected), so CARPK and the
+rest of the app work without it. Run this on the GPU box (SAM3 weights load at
+startup); it is not runnable on a CPU-only dev box.
+"""
+
+import os
+import sys
+import io
+import json
+import logging
+
+import gradio as gr
+import numpy as np
+import torch
+from PIL import Image, ImageDraw, ImageFont
+
+# ==========================================
+# 0. Paths (machine-specific; mirror app.py / sandbox.py)
+# ==========================================
+SAM3_REPO_ROOT = "/home/ekielar/sam3"
+BPE_PATH = f"{SAM3_REPO_ROOT}/assets/bpe_simple_vocab_16e6.txt.gz"
+
+if SAM3_REPO_ROOT not in sys.path:
+    sys.path.append(SAM3_REPO_ROOT)
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+# Local CARPK devkit root (adjust to wherever the devkit lives on this machine).
+CARPK_BASE_DIR = os.environ.get("CARPK_BASE_DIR", "./datasets/CARPK_devkit/data")
+CARPK_IMAGE_DIR = os.path.join(CARPK_BASE_DIR, "Images")
+CARPK_ANNO_DIR = os.path.join(CARPK_BASE_DIR, "Annotations")
+CARPK_SPLIT_FILE = os.path.join(CARPK_BASE_DIR, "ImageSets", "test.txt")
+
+# Optional label->noun-phrase maps (same files sandbox.py curates). Absent => raw label.
+PROMPT_MAP_FILES = {
+    "pixmo": "./pixmo_count_generic_map.json",
+    "countbench": "./countbench_generic_map.json",
+    "carpk": None,
+}
+
+# CountBench remote-payload / ground-truth corrections (from the reference eval).
+PURGED_IMAGE_IDS = {"pixmo": set(), "countbench": {126, 406, 174, 281}, "carpk": set()}
+GROUND_TRUTH_OVERRIDES = {
+    "pixmo": {},
+    "countbench": {134: 9, 271: 8, 331: 1, 194: 25},
+    "carpk": {},
+}
+
+# Per-dataset UI starting points (overlap "mask" is orchard-specific -> keep "box").
+DATASET_UI_DEFAULTS = {
+    "countbench": dict(overlap_mode="box", conf=0.35),
+    "pixmo": dict(overlap_mode="box", conf=0.35),
+    "carpk": dict(overlap_mode="box", conf=0.45),
+}
+
+# Local imports that pull torch/transformers/pipeline. Kept after sys.path setup.
+from config import Config
+from graph import OrchardGraph
+from agent.actions import ActionContext
+from agent.belief import DiscoveryCurve
+from agent import runner, policy_heuristic
+import inference
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+    force=True,
+)
+logger = logging.getLogger(__name__)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+logger.info("Using device: %s", device)
+
+# Load SAM3 once. If weights are unavailable (e.g. CPU dev box), keep the UI alive
+# and surface the failure at run time instead of crashing on import.
+try:
+    MODEL, PROCESSOR = inference.load_sam3_model(BPE_PATH, 0.35, device=device)
+    _LOAD_ERROR = None
+except Exception as exc:  # pragma: no cover - depends on machine weights
+    MODEL, PROCESSOR = None, None
+    _LOAD_ERROR = str(exc)
+    logger.warning("SAM3 model failed to load: %s", exc)
+
+
+# ==========================================
+# 1. Dataset access layer
+# ==========================================
+_dataset_cache = {}
+_prompt_maps = {}
+
+
+def _parse_carpk():
+    if not os.path.exists(CARPK_SPLIT_FILE):
+        logger.error("CARPK split file missing: %s", CARPK_SPLIT_FILE)
+        return []
+    with open(CARPK_SPLIT_FILE, "r", encoding="utf-8") as f:
+        stems = [line.strip() for line in f if line.strip()]
+    parsed = []
+    for stem in stems:
+        anno_path = os.path.join(CARPK_ANNO_DIR, f"{stem}.txt")
+        gt = 0
+        if os.path.exists(anno_path):
+            with open(anno_path, "r", encoding="utf-8") as af:
+                gt = sum(1 for line in af if line.strip())
+        parsed.append({"image_path": os.path.join(CARPK_IMAGE_DIR, f"{stem}.png"), "count": gt})
+    return parsed
+
+
+def get_dataset(name):
+    if name not in _dataset_cache:
+        if name == "countbench":
+            from datasets import load_dataset  # lazy: optional dependency
+            _dataset_cache[name] = load_dataset("nielsr/countbench", split="train")
+        elif name == "pixmo":
+            from datasets import load_dataset  # lazy: optional dependency
+            _dataset_cache[name] = load_dataset("allenai/pixmo-count", split="test")
+        elif name == "carpk":
+            _dataset_cache[name] = _parse_carpk()
+        else:
+            raise ValueError(f"Unknown dataset {name!r}")
+    return _dataset_cache[name]
+
+
+def total_items(name):
+    try:
+        return len(get_dataset(name))
+    except Exception as exc:
+        logger.error("Failed to load dataset %s: %s", name, exc)
+        return 0
+
+
+def get_prompt_map(name):
+    if name not in _prompt_maps:
+        path = PROMPT_MAP_FILES.get(name)
+        if path and os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                _prompt_maps[name] = json.load(f)
+        else:
+            _prompt_maps[name] = {}
+    return _prompt_maps[name]
+
+
+def default_prompt_for(name, raw_prompt):
+    if name == "carpk":
+        return "car"
+    pm = get_prompt_map(name)
+    if name == "pixmo":
+        return pm.get(raw_prompt, (raw_prompt or "").lower())
+    return pm.get(raw_prompt, raw_prompt or "")  # countbench keeps native casing
+
+
+def get_sample(name, idx):
+    """Uniform accessor -> (image_pil_or_None, raw_prompt, gt_count, error_or_None).
+
+    Applies the dataset's ground-truth overrides; purged ids are surfaced as errors.
+    """
+    data = get_dataset(name)
+    if idx in PURGED_IMAGE_IDS.get(name, set()):
+        return None, "", None, f"index {idx} is purged (dead payload) for {name}"
+
+    override = GROUND_TRUTH_OVERRIDES.get(name, {}).get(idx)
+    sample = data[idx]
+
+    if name == "countbench":
+        raw_prompt = sample["text"]
+        gt = override if override is not None else int(sample["number"])
+        if sample.get("image") is None:
+            return None, raw_prompt, gt, "image link expired/corrupted"
+        return sample["image"].convert("RGB"), raw_prompt, gt, None
+
+    if name == "pixmo":
+        import requests  # lazy: only pixmo fetches by URL
+        raw_prompt = sample["label"]
+        gt = override if override is not None else int(sample["count"])
+        url = sample.get("image_url")
+        if not url:
+            return None, raw_prompt, gt, "missing image_url"
+        try:
+            r = requests.get(url, timeout=10)
+            if r.status_code != 200:
+                return None, raw_prompt, gt, f"HTTP status {r.status_code}"
+            return Image.open(io.BytesIO(r.content)).convert("RGB"), raw_prompt, gt, None
+        except Exception as exc:
+            return None, raw_prompt, gt, f"link timeout/unresponsive ({exc})"
+
+    if name == "carpk":
+        gt = override if override is not None else int(sample["count"])
+        path = sample["image_path"]
+        if not os.path.exists(path):
+            return None, "car", gt, f"local file path missing: '{path}'"
+        return Image.open(path).convert("RGB"), "car", gt, None
+
+    raise ValueError(f"Unknown dataset {name!r}")
+
+
+# ==========================================
+# 2. Rendering
+# ==========================================
+_CLASS_COLORS = {
+    "fruit": "#39FF14",       # verified target
+    "leaf": "#FF3B3B",        # verified distractor
+    "spurious": "#9AA0A6",    # rejected
+    "unresolved": "#00E5FF",  # unverified candidate (still counted toward N_obs)
+}
+
+
+def draw_boxes(image_pil, graph, prompt_str, gt, pred):
+    """Overlay every candidate box coloured by classification, with a status banner."""
+    canvas = image_pil.copy()
+    draw = ImageDraw.Draw(canvas)
+    try:
+        font = ImageFont.load_default()
+    except Exception:
+        font = None
+
+    match = (gt is not None and pred == gt)
+    banner = (f"PROMPT: '{prompt_str}' | GT: {gt} | PRED(N_obs): {pred} | "
+              f"{'MATCH' if match else 'MISMATCH'}")
+    draw.text((8, 8), banner, fill="#2ECC71" if match else "#E74C3C", font=font)
+
+    for node in graph.nodes.values():
+        x1, y1, x2, y2 = node.box
+        color = _CLASS_COLORS.get(node.classification, "#FFFFFF")
+        draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
+        tag = f"P{node.found_in_pass} {node.classification[:1]}:{node.scores['detection_confidence']:.2f}"
+        draw.text((x1 + 2, max(0, y1 - 12)), tag, fill=color, font=font)
+    return canvas
+
+
+# ==========================================
+# 3. Offline mock client (Mock toggle for vip verifier / VLM policy)
+# ==========================================
+_MOCK_INSPECT_Z = {
+    "target_present": True, "density": "medium", "object_scale": "medium",
+    "occlusion": "medium", "recommend": "tile", "notes": "mock (offline stub)",
+}
+
+
+class _Resp:
+    """Minimal stand-in for an OpenAI chat completion response."""
+    def __init__(self, content):
+        self.choices = [type("C", (), {"message": type("M", (), {"content": content})()})()]
+
+
+class _StubChatClient:
+    """Deterministic offline stand-in for the Qwen endpoint.
+
+    Distinguishes an inspection call (returns a neutral z) from an orchestration
+    call (returns a short tile-then-stop plan), so both the inspect and VLM-policy
+    parse/validation paths are exercised without any network. Used only when the
+    Mock toggle is on and policy='vlm'.
+    """
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self._orch_calls = 0
+        self.chat = self
+        self.completions = self
+
+    def create(self, model=None, temperature=None, messages=None, **kwargs):
+        system = (messages[0]["content"] if messages else "").lower()
+        if "assess" in system:  # agent.inspect.SYSTEM_PROMPT ("You assess images...")
+            return _Resp(json.dumps(_MOCK_INSPECT_Z))
+        # agent.policy_vlm.SYSTEM_PROMPT ("You are the orchestrator...")
+        self._orch_calls += 1
+        conf = float(min(0.9, max(0.1, self.cfg.conf)))
+        if self._orch_calls >= 2:
+            action = {"action": "stop", "args": {"estimate_name": "N_obs"}}
+        else:
+            action = {"action": "tile", "args": {"conf": round(conf, 2)}}
+        return _Resp(json.dumps(action))
+
+
+# ==========================================
+# 4. Orchestration driver (mirrors eval.run_eval agent wiring)
+# ==========================================
+class _ListLogHandler(logging.Handler):
+    """Captures formatted log records emitted during one episode run."""
+    def __init__(self):
+        super().__init__()
+        self.records = []
+
+    def emit(self, record):
+        try:
+            self.records.append(self.format(record))
+        except Exception:
+            pass
+
+
+def _build_cfg(prompt, verifier, overlap_mode, conf, budget, query_file):
+    import dataclasses
+    return dataclasses.replace(
+        Config(),
+        verifier_mode=verifier,
+        overlap_mode=overlap_mode,
+        conf=float(conf),
+        target_prompt=prompt,
+        budget_max_actions=int(budget),
+        vip_query_file=query_file or Config().vip_query_file,
+    )
+
+
+def _build_oracle(cfg, verifier, use_mock, mock_true_class):
+    """Return (oracle, query_set) for the run. Both None unless verifier='vip'."""
+    if verifier != "vip":
+        return None, None
+    from verifier.queries import load_query_set
+    query_set = load_query_set(cfg.vip_query_file)
+    if use_mock:
+        from verifier.oracle import MockOracle
+        oracle = MockOracle(true_class=mock_true_class)
+    else:
+        from verifier.oracle import QwenOracle
+        oracle = QwenOracle(cfg)
+    return oracle, query_set
+
+
+def _run_episode(image_pil, cfg, policy, oracle, query_set, use_mock):
+    """Build the ActionContext, run the episode, return (result, ctx)."""
+    from agent.budget import CostMeter
+
+    graph = OrchardGraph()
+    cost = CostMeter()
+
+    if PROCESSOR is not None:
+        from pipeline import initialize_canopy_roi
+        roi = initialize_canopy_roi(PROCESSOR, np.array(image_pil), graph)
+        cost.n_sam += 1
+        partition = [tuple(int(v) for v in roi)]
+    else:
+        w, h = image_pil.size
+        partition = [(0, 0, w, h)]
+
+    ctx = ActionContext(
+        processor=PROCESSOR, image_pil=image_pil, graph=graph, cfg=cfg,
+        oracle=oracle, query_set=query_set, discovery=DiscoveryCurve(),
+        partition=partition, cost=cost,
+    )
+
+    if policy == "heuristic":
+        pol = policy_heuristic.choose
+    elif use_mock:
+        stub = _StubChatClient(cfg)
+        pol = runner.make_vlm_policy(ctx, inspect_client=stub, vlm_client=stub)
+    else:
+        pol = runner.make_vlm_policy(ctx)
+
+    result = runner.run_episode(image_pil, ctx, pol, max_actions=cfg.budget_max_actions)
+    return result, ctx
+
+
+def _classification_tally(graph):
+    tally = {}
+    for node in graph.nodes.values():
+        tally[node.classification] = tally.get(node.classification, 0) + 1
+    return tally
+
+
+def run_orchestration(dataset, idx, prompt, policy, verifier, overlap_mode, conf,
+                      budget, use_mock, query_file, mock_true_class):
+    """Full-pipeline execution on one image. Returns (image, banner_md, status, verbose)."""
+    idx = int(idx)
+    if PROCESSOR is None:
+        placeholder = Image.new("RGB", (640, 400), "#2c3e50")
+        return (placeholder, "### SAM3 unavailable",
+                "SAM3 model not loaded on this machine.",
+                f"[FATAL] SAM3 weights did not load:\n{_LOAD_ERROR}\n\n"
+                "Run this app on the GPU box with the SAM3 repo present.")
+
+    image_pil, raw_prompt, gt, err = get_sample(dataset, idx)
+    banner = f"### [{dataset}] index {idx} | Ground Truth: {gt}"
+    if err is not None:
+        return Image.new("RGB", (640, 400), "#c0392b"), banner, f"ERROR: {err}", err
+
+    target = (prompt or "").strip() or default_prompt_for(dataset, raw_prompt)
+    cfg = _build_cfg(target, verifier, overlap_mode, conf, budget, query_file)
+
+    try:
+        oracle, query_set = _build_oracle(cfg, verifier, use_mock, mock_true_class)
+    except Exception as exc:
+        return image_pil, banner, f"ERROR building verifier: {exc}", str(exc)
+
+    # Capture everything logged during the episode into the verbose window.
+    handler = _ListLogHandler()
+    handler.setFormatter(logging.Formatter("%(levelname)-7s %(name)s: %(message)s"))
+    handler.setLevel(logging.INFO)
+    root = logging.getLogger()
+    prev_level = root.level
+    root.addHandler(handler)
+    root.setLevel(logging.INFO)
+
+    header = [
+        "=" * 78,
+        f"RUN  dataset={dataset} idx={idx}  policy={policy}  verifier={verifier}"
+        f"  overlap={overlap_mode}  conf={cfg.conf:.2f}  budget={cfg.budget_max_actions}"
+        f"  mock={'on' if use_mock else 'off'}",
+        f"TARGET CONCEPT: '{target}'   (raw label: '{raw_prompt}')",
+        "=" * 78,
+    ]
+    try:
+        result, ctx = _run_episode(image_pil, cfg, policy, oracle, query_set, use_mock)
+        graph = result["graph"]
+        counts = result["counts"]
+    except Exception as exc:
+        root.removeHandler(handler)
+        root.setLevel(prev_level)
+        detail = "\n".join(header + ["", "[PIPELINE EXCEPTION]", str(exc), "",
+                                     "--- captured log ---"] + handler.records)
+        return image_pil, banner, f"Pipeline error: {exc}", detail
+    finally:
+        root.removeHandler(handler)
+        root.setLevel(prev_level)
+
+    pred = counts["N_obs"]
+
+    # Per-step action log (structured, from the episode).
+    step_lines = ["", "--- ACTION LOG (per step) ---"]
+    for e in result["log"]:
+        step_lines.append(
+            f"  t={e['t']:>2}  {e['action']:<11}  new={e['n_new']:>3}  "
+            f"U={e['U']:.3f}  cost={e['cost_so_far']:.3f}"
+        )
+
+    footer = [
+        "",
+        "--- COUNT ESTIMATES ---",
+        f"  N_obs={counts['N_obs']}   N_supp={counts['N_supp']}   N_cons={counts['N_cons']}"
+        f"   (headline = N_obs)   GT={gt}",
+        f"  classification tally: {_classification_tally(graph)}",
+        f"  actions used: {len(result['log'])}   normalized cost: {ctx.cost.total(cfg):.3f}",
+        f"  cost breakdown: {ctx.cost.as_dict()}",
+    ]
+
+    verbose = "\n".join(header + ["", "--- CAPTURED LOG (chronological) ---"]
+                        + handler.records + step_lines + footer)
+
+    canvas = draw_boxes(image_pil, graph, target, gt, pred)
+    if gt is not None and pred == gt:
+        status = f"EXACT MATCH  |  N_obs={pred} == GT={gt}"
+    else:
+        direction = "under" if (gt is not None and pred < gt) else "over"
+        status = f"MISMATCH ({direction})  |  N_obs={pred} vs GT={gt}   (N_supp={counts['N_supp']}, N_cons={counts['N_cons']})"
+    return canvas, banner, status, verbose
+
+
+# ==========================================
+# 5. Navigation
+# ==========================================
+def load_sample_view(dataset, idx):
+    """Load an image + GT without running the pipeline (pipeline is on-demand)."""
+    n = total_items(dataset)
+    if n == 0:
+        placeholder = Image.new("RGB", (640, 400), "#c0392b")
+        return (placeholder, f"### [{dataset}] empty / unavailable", "", "",
+                "Dataset unavailable (check paths / network / `datasets` install).", 0)
+    idx = max(0, min(int(idx), n - 1))
+    image_pil, raw_prompt, gt, err = get_sample(dataset, idx)
+    banner = f"### [{dataset}] index {idx} / {n - 1} | Ground Truth: {gt}"
+    default_prompt = default_prompt_for(dataset, raw_prompt)
+    if err is not None:
+        return (Image.new("RGB", (640, 400), "#c0392b"), banner, raw_prompt or "",
+                default_prompt, f"skip: {err}", idx)
+    return image_pil, banner, raw_prompt or "", default_prompt, "Loaded. Press ▶ Run Orchestration.", idx
+
+
+def nav_next(dataset, idx):
+    return load_sample_view(dataset, int(idx) + 1)
+
+
+def nav_prev(dataset, idx):
+    return load_sample_view(dataset, int(idx) - 1)
+
+
+def nav_jump(dataset, idx_text):
+    idx = int(idx_text) if str(idx_text).strip().lstrip("-").isdigit() else 0
+    return load_sample_view(dataset, idx)
+
+
+def on_dataset_change(dataset):
+    d = DATASET_UI_DEFAULTS[dataset]
+    image, banner, raw, prompt, status, idx = load_sample_view(dataset, 0)
+    return (image, banner, raw, prompt, status, idx,
+            gr.update(value=d["conf"]), gr.update(value=d["overlap_mode"]))
+
+
+# ==========================================
+# 6. Gradio interface
+# ==========================================
+_QUERY_FILES = sorted(
+    os.path.join("queries", f) for f in os.listdir("queries")
+    if f.endswith(".json")
+) if os.path.isdir("queries") else [Config().vip_query_file]
+
+with gr.Blocks(theme=gr.themes.Soft(), title="SAM3 Orchestration Dashboard") as app:
+    idx_state = gr.State(value=0)
+
+    gr.Markdown("# 🎛️ SAM3 Active-Perception Orchestration Dashboard")
+    gr.Markdown(
+        "Runs the **full agent orchestration** (policy → action → belief update) on a "
+        "benchmark image, with every action, per-pass SAM3 stat, verifier call, and "
+        "count estimate streamed to the verbose window. Navigation only loads the "
+        "image; press **Run Orchestration** to execute the pipeline."
+    )
+    if _LOAD_ERROR:
+        gr.Markdown(f"> ⚠️ **SAM3 not loaded:** `{_LOAD_ERROR}` — runs will report this.")
+
+    with gr.Row():
+        with gr.Column(scale=3):
+            image_display = gr.Image(label="Pipeline prediction view", type="pil", interactive=False)
+            verbose_box = gr.Textbox(
+                label="🔬 Verbose orchestration log (actions · per-pass SAM3 · verifier · estimates)",
+                interactive=False, lines=26, max_lines=26, show_copy_button=True,
+            )
+
+        with gr.Column(scale=2):
+            banner_md = gr.Markdown("### Initializing…")
+            status_box = gr.Textbox(label="📊 Result", interactive=False)
+
+            dataset_dropdown = gr.Dropdown(
+                choices=["countbench", "carpk", "pixmo"], value="countbench", label="📂 Dataset")
+
+            with gr.Row():
+                policy_dropdown = gr.Dropdown(
+                    choices=["heuristic", "vlm"], value="heuristic", label="🧠 Policy")
+                verifier_radio = gr.Radio(
+                    choices=["off", "ioc", "vip"], value="ioc", label="✅ Verification")
+
+            with gr.Row():
+                overlap_radio = gr.Radio(
+                    choices=["box", "mask"], value="box",
+                    label="📐 Overlap metric (NMS IoU/IoM + dedup)")
+                conf_slider = gr.Slider(
+                    minimum=0.10, maximum=0.90, value=0.35, step=0.05, label="🎚️ Detection confidence")
+
+            budget_number = gr.Number(value=12, precision=0, label="🔁 Max actions (budget)")
+
+            with gr.Accordion("FM+V-IP (vip) options", open=False):
+                query_file_dropdown = gr.Dropdown(
+                    choices=_QUERY_FILES, value=_QUERY_FILES[0], label="Query set (vip)")
+                mock_checkbox = gr.Checkbox(
+                    value=False, label="🧪 Mock backend (offline: MockOracle + stubbed VLM)")
+                mock_class_dropdown = gr.Dropdown(
+                    choices=["target", "distractor", "spurious"], value="target",
+                    label="MockOracle assumed true class (UI testing only)")
+
+            raw_prompt_display = gr.Textbox(label="Raw dataset label / caption", interactive=False, lines=2)
+            prompt_input = gr.Textbox(label="✏️ Target concept (drives SAM3 + agent)",
+                                      placeholder="e.g. green fruit, car, apple…")
+
+            run_button = gr.Button("▶ Run Orchestration", variant="primary")
+
+            gr.HTML("<hr>")
+            with gr.Row():
+                btn_prev = gr.Button("⬅️ Prev")
+                btn_next = gr.Button("Next ➡️")
+            with gr.Row():
+                jump_input = gr.Textbox(label="Jump to index", placeholder="e.g. 42", scale=2)
+                btn_jump = gr.Button("🎯 Jump", scale=1)
+
+    nav_outputs = [image_display, banner_md, raw_prompt_display, prompt_input, status_box, idx_state]
+    run_inputs = [dataset_dropdown, idx_state, prompt_input, policy_dropdown, verifier_radio,
+                  overlap_radio, conf_slider, budget_number, mock_checkbox, query_file_dropdown,
+                  mock_class_dropdown]
+    run_outputs = [image_display, banner_md, status_box, verbose_box]
+
+    app.load(fn=load_sample_view, inputs=[dataset_dropdown, idx_state], outputs=nav_outputs)
+    dataset_dropdown.change(fn=on_dataset_change, inputs=[dataset_dropdown],
+                            outputs=nav_outputs + [conf_slider, overlap_radio])
+
+    run_button.click(fn=run_orchestration, inputs=run_inputs, outputs=run_outputs)
+    prompt_input.submit(fn=run_orchestration, inputs=run_inputs, outputs=run_outputs)
+
+    btn_next.click(fn=nav_next, inputs=[dataset_dropdown, idx_state], outputs=nav_outputs)
+    btn_prev.click(fn=nav_prev, inputs=[dataset_dropdown, idx_state], outputs=nav_outputs)
+    btn_jump.click(fn=nav_jump, inputs=[dataset_dropdown, jump_input], outputs=nav_outputs)
+
+
+def main():
+    logger.info("Launching orchestration dashboard on %s", device)
+    app.launch(inbrowser=True)
+
+
+if __name__ == "__main__":
+    main()
