@@ -29,6 +29,12 @@ class Config:
     #     over-suppress adjacent-but-distinct boxes, and a fully-contained box is always a
     #     duplicate regardless of its size relative to the container. Only takes effect
     #     when nms_mode == "dualgate".
+    nms_iou_threshold: float = 0.40  # Gate A (IoU) threshold for apply_nms_dualgate.
+    #     Named with an "nms_" prefix to stay unambiguous from the unrelated cross-pass
+    #     dedup iou_threshold in pipeline.register_and_verify_candidates (still
+    #     hardcoded at 0.40, a different mechanism). Ignored when nms_mode=="iou".
+    nms_iom_threshold: float = 0.90  # Gate B (IoM containment) threshold for
+    #     apply_nms_dualgate. Ignored when nms_mode=="iou".
     use_canopy_roi: bool = True  # False skips the "tree canopy" SAM3 sweep in
     #     pipeline.initialize_canopy_roi and anchors the ROI to the full frame instead --
     #     for datasets with no canopy concept (CARPK, CountBench, PixMo), where that sweep

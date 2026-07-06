@@ -163,6 +163,42 @@ def test_verifier_label_tags_no_canopy():
     assert run_eval.verifier_label(Config()) == "ioc"  # default True -> no tag
 
 
+def test_verifier_label_tags_nms_thresholds():
+    cfg = dataclasses.replace(Config(), nms_iou_threshold=0.3, nms_iom_threshold=0.8)
+    assert run_eval.verifier_label(cfg) == "ioc+iou0.3+iom0.8"
+    assert run_eval.verifier_label(Config()) == "ioc"  # defaults (0.40/0.90) -> no tag
+
+
+def test_nms_thresholds_forwarded_to_execute_pass():
+    captured = {}
+
+    def fn(**kw):
+        captured["nms_iou_threshold"] = kw.get("nms_iou_threshold")
+        captured["nms_iom_threshold"] = kw.get("nms_iom_threshold")
+        graph, pass_number = kw["graph"], kw["pass_number"]
+        nid = graph.add_candidate([0, 0, 5, 5], 0.9, found_in_pass=pass_number)
+        graph.nodes[nid].classification = "fruit"
+        return _FakeStats(1, n_sam_calls=1)
+
+    cfg = dataclasses.replace(Config(), nms_iou_threshold=0.25, nms_iom_threshold=0.75)
+    run_eval.run_policy("oneshot", processor=None, image_pil=None, cfg=cfg,
+                        oracle=None, query_set=None, prompt="car", conf=0.45,
+                        execute_pass_fn=fn)
+    assert captured["nms_iou_threshold"] == 0.25
+    assert captured["nms_iom_threshold"] == 0.75
+
+
+def test_parse_args_iou_iom_threshold_default_none():
+    args = run_eval.parse_args(["--root", "r", "--fmt", "yolo", "--policy", "oneshot", "--out", "x.csv"])
+    assert args.iou_threshold is None and args.iom_threshold is None
+
+
+def test_parse_args_iou_iom_threshold_explicit():
+    args = run_eval.parse_args(["--root", "r", "--fmt", "yolo", "--policy", "oneshot",
+                                "--iou-threshold", "0.3", "--iom-threshold", "0.85", "--out", "x.csv"])
+    assert args.iou_threshold == 0.3 and args.iom_threshold == 0.85
+
+
 def test_use_canopy_roi_forwarded_to_execute_pass():
     captured = {}
 

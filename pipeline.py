@@ -471,7 +471,8 @@ def tiled_engine(processor, image_pil, confidence, clahe, prompt, pos_boxes=None
 
 def execute_pass(processor, image_pil, graph, conf, clahe, tiling, pass_number, prompt,
                  disable_size_filter=False, nms_mode="dualgate", use_concentric=False,
-                 gate_mode="dual", use_canopy_roi=True, cfg=None, oracle=None, query_set=None,
+                 gate_mode="dual", use_canopy_roi=True, nms_iou_threshold=0.40,
+                 nms_iom_threshold=0.90, cfg=None, oracle=None, query_set=None,
                  roi_override=None):
     """
     Runs one full pass of SAM3 pipeline
@@ -484,6 +485,13 @@ def execute_pass(processor, image_pil, graph, conf, clahe, tiling, pass_number, 
         otherwise). "dual" (default, unchanged) | "iou_only" | "iom_only" -- lets a
         caller pick a single suppression criterion per dataset (e.g. "iou_only" for
         countbench-style scenes, "iom_only" for CARPK's dense uniform-size grids).
+    nms_iou_threshold / nms_iom_threshold: forwarded to apply_nms_dualgate's own
+        iou_threshold/iom_threshold (defaults 0.40/0.90, byte-identical to the
+        prior hardcoded behavior). Named with an "nms_" prefix to keep them
+        unambiguous from register_and_verify_candidates' unrelated iou_threshold
+        (the cross-pass dedup gate, still hardcoded at 0.40 below -- a different
+        mechanism entirely). Ignored when nms_mode=="iou" (the baseline cv2 NMS
+        has its own fixed 0.40 threshold, untouched).
     use_concentric: forwarded to the dual-gate concentric sub-gate (default OFF;
         only the harness/ablation should turn it on).
     use_canopy_roi: forwarded to initialize_canopy_roi (default True, unchanged).
@@ -611,12 +619,14 @@ def execute_pass(processor, image_pil, graph, conf, clahe, tiling, pass_number, 
             # return_indices lets us keep the survivors' masks aligned.
             roi_boxes_final, roi_scores_final, keep_idx = inference.apply_nms_dualgate(
                 all_boxes, all_scores, conf, use_concentric=use_concentric,
-                masks=candidate_masks, return_indices=True, gate_mode=gate_mode
+                masks=candidate_masks, return_indices=True, gate_mode=gate_mode,
+                iou_threshold=nms_iou_threshold, iom_threshold=nms_iom_threshold,
             )
             kept_masks = [candidate_masks[int(k)] for k in keep_idx]
         else:
             roi_boxes_final, roi_scores_final = inference.apply_nms_dualgate(
-                all_boxes, all_scores, conf, use_concentric=use_concentric, gate_mode=gate_mode
+                all_boxes, all_scores, conf, use_concentric=use_concentric, gate_mode=gate_mode,
+                iou_threshold=nms_iou_threshold, iom_threshold=nms_iom_threshold,
             )
     else:
         roi_boxes_final, roi_scores_final = inference.apply_nms(all_boxes, all_scores, conf)

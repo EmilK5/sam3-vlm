@@ -19,13 +19,15 @@ The sweep is resume-safe (skips image/policy/verifier rows already in the CSV)
 and uses a fixed numpy seed per image for reproducibility.
 
 --gate-mode picks which apply_nms_dualgate suppression criterion applies (dual
-default | iou_only | iom_only); --force-tile makes the first sensing pass tiled
-regardless of policy; --canopy-roi controls whether the "tree canopy" SAM3
-sweep runs before sensing at all ('auto' default: on for --dataset local, off
-for pixmo/countbench/carpk, which have no canopy concept). All three are
-folded into the CSV "verifier" tag (via verifier_label) so different settings
-never collide on resume. Every image where N_obs != N_gt gets an annotated
-mismatch overlay saved under --mismatch-dir (default: <out dir>/mismatches/
+default | iou_only | iom_only); --iou-threshold/--iom-threshold tune the actual
+Gate A/Gate B thresholds (defaults 0.40/0.90) regardless of which gate(s) are
+active; --force-tile makes the first sensing pass tiled regardless of policy;
+--canopy-roi controls whether the "tree canopy" SAM3 sweep runs before sensing
+at all ('auto' default: on for --dataset local, off for pixmo/countbench/carpk,
+which have no canopy concept). All of these are folded into the CSV "verifier"
+tag (via verifier_label) so different settings never collide on resume. Every
+image where N_obs != N_gt gets an annotated mismatch overlay saved under
+--mismatch-dir (default: <out dir>/mismatches/
 <dataset>_<policy>_<verifier tag>/).
 """
 
@@ -80,14 +82,20 @@ def predicted_nodes(graph):
 
 def verifier_label(cfg, force_tile=False) -> str:
     """CSV 'verifier' value: the verifier mode, tagged with any non-default
-    overlap/gate/tiling/canopy setting, so different sweeps of the same policy
-    never collide on resume."""
+    overlap/gate/threshold/tiling/canopy setting, so different sweeps of the
+    same policy never collide on resume."""
     tag = ""
     if getattr(cfg, "overlap_mode", "box") == "mask":
         tag += "+mask"
     gate = getattr(cfg, "gate_mode", "dual")
     if gate != "dual":
         tag += f"+{gate}"
+    iou_t = getattr(cfg, "nms_iou_threshold", 0.40)
+    if iou_t != 0.40:
+        tag += f"+iou{iou_t:g}"
+    iom_t = getattr(cfg, "nms_iom_threshold", 0.90)
+    if iom_t != 0.90:
+        tag += f"+iom{iom_t:g}"
     if not getattr(cfg, "use_canopy_roi", True):
         tag += "+nocanopy"
     if force_tile:
@@ -123,13 +131,16 @@ def _run_fixed_policy(policy, processor, image_pil, cfg, oracle, query_set, prom
     cost = CostMeter()
     gate_mode = getattr(cfg, "gate_mode", "dual")
     use_canopy_roi = getattr(cfg, "use_canopy_roi", True)
+    nms_iou_threshold = getattr(cfg, "nms_iou_threshold", 0.40)
+    nms_iom_threshold = getattr(cfg, "nms_iom_threshold", 0.90)
 
     def do_pass(pass_number, tiling):
         stats = execute_pass_fn(
             processor=processor, image_pil=image_pil, graph=graph, conf=conf,
             clahe=False, tiling=tiling, pass_number=pass_number, prompt=prompt,
             cfg=cfg, oracle=oracle, query_set=query_set, gate_mode=gate_mode,
-            use_canopy_roi=use_canopy_roi,
+            use_canopy_roi=use_canopy_roi, nms_iou_threshold=nms_iou_threshold,
+            nms_iom_threshold=nms_iom_threshold,
         )
         # Meter from the pass's actual call counts (canopy + leaf map + proposal
         # in n_sam_calls; tiles; real vip oracle calls) — same scale as episodes.
@@ -444,6 +455,13 @@ def parse_args(argv=None):
                              "'iou_only'/'iom_only' pick a single criterion -- e.g. iou_only "
                              "for countbench-style scenes, iom_only for CARPK-style dense "
                              "grids of uniform-size objects.")
+    parser.add_argument("--iou-threshold", type=float, default=None,
+                        help="Gate A (IoU) threshold for apply_nms_dualgate (default 0.40). "
+                             "Ignored when --gate-mode=iom_only or nms_mode=='iou'.")
+    parser.add_argument("--iom-threshold", type=float, default=None,
+                        help="Gate B (IoM containment) threshold for apply_nms_dualgate "
+                             "(default 0.90). Ignored when --gate-mode=iou_only or "
+                             "nms_mode=='iou'.")
     parser.add_argument("--prompt", default=None,
                         help="Target concept. --dataset local: the fixed concept for every "
                              "image (default 'green fruit'). Count-only datasets: overrides "
@@ -550,10 +568,17 @@ def main():
     # Agent policies read the concept/confidence from cfg (fixed policies get them
     # as arguments); evaluate_image overrides target_prompt per-sample, so this is
     # just the shared baseline. --overlap-mode/--gate-mode/--canopy-roi apply everywhere.
-    cfg = dataclasses.replace(cfg, conf=conf, overlap_mode=args.overlap_mode, gate_mode=args.gate_mode,
-                              use_canopy_roi=use_canopy_roi)
+    cfg_kwargs = dict(conf=conf, overlap_mode=args.overlap_mode, gate_mode=args.gate_mode,
+                     use_canopy_roi=use_canopy_roi)
+    if args.iou_threshold is not None:
+        cfg_kwargs["nms_iou_threshold"] = args.iou_threshold
+    if args.iom_threshold is not None:
+        cfg_kwargs["nms_iom_threshold"] = args.iom_threshold
+    cfg = dataclasses.replace(cfg, **cfg_kwargs)
     logger.info("canopy ROI %s (--canopy-roi=%s, dataset=%s)",
                "enabled" if use_canopy_roi else "disabled", args.canopy_roi, args.dataset)
+    logger.info("NMS gate=%s iou_threshold=%.3f iom_threshold=%.3f",
+               cfg.gate_mode, cfg.nms_iou_threshold, cfg.nms_iom_threshold)
 
     # Load SAM3 once (real run). Imported lazily so this module stays torch-free.
     import torch

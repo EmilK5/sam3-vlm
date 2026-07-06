@@ -196,13 +196,16 @@ class _ListLogHandler(logging.Handler):
             pass
 
 
-def _build_cfg(prompt, verifier, overlap_mode, gate_mode, conf, budget, query_file):
+def _build_cfg(prompt, verifier, overlap_mode, gate_mode, iou_threshold, iom_threshold,
+               conf, budget, query_file):
     import dataclasses
     return dataclasses.replace(
         Config(),
         verifier_mode=verifier,
         overlap_mode=overlap_mode,
         gate_mode=gate_mode,
+        nms_iou_threshold=float(iou_threshold),
+        nms_iom_threshold=float(iom_threshold),
         conf=float(conf),
         target_prompt=prompt,
         budget_max_actions=int(budget),
@@ -295,8 +298,9 @@ def _classification_tally(graph):
     return tally
 
 
-def run_orchestration(dataset, idx, prompt, policy, verifier, overlap_mode, gate_mode, conf,
-                      budget, force_tile, use_mock, query_file, mock_true_class):
+def run_orchestration(dataset, idx, prompt, policy, verifier, overlap_mode, gate_mode,
+                      iou_threshold, iom_threshold, conf, budget, force_tile, use_mock,
+                      query_file, mock_true_class):
     """Full-pipeline execution on one image. Returns (image, banner_md, status, verbose)."""
     idx = int(idx)
     if PROCESSOR is None:
@@ -312,7 +316,8 @@ def run_orchestration(dataset, idx, prompt, policy, verifier, overlap_mode, gate
         return Image.new("RGB", (640, 400), "#c0392b"), banner, f"ERROR: {err}", err
 
     target = (prompt or "").strip() or default_prompt_for(dataset, raw_prompt)
-    cfg = _build_cfg(target, verifier, overlap_mode, gate_mode, conf, budget, query_file)
+    cfg = _build_cfg(target, verifier, overlap_mode, gate_mode, iou_threshold, iom_threshold,
+                     conf, budget, query_file)
 
     try:
         oracle, query_set = _build_oracle(cfg, verifier, use_mock, mock_true_class)
@@ -331,7 +336,8 @@ def run_orchestration(dataset, idx, prompt, policy, verifier, overlap_mode, gate
     header = [
         "=" * 78,
         f"RUN  dataset={dataset} idx={idx}  policy={policy}  verifier={verifier}"
-        f"  overlap={overlap_mode}  gate={gate_mode}  conf={cfg.conf:.2f}  budget={cfg.budget_max_actions}"
+        f"  overlap={overlap_mode}  gate={gate_mode} (iou_t={cfg.nms_iou_threshold:.2f} "
+        f"iom_t={cfg.nms_iom_threshold:.2f})  conf={cfg.conf:.2f}  budget={cfg.budget_max_actions}"
         f"  force_tile={'on' if force_tile else 'off'}  mock={'on' if use_mock else 'off'}",
         f"TARGET CONCEPT: '{target}'   (raw label: '{raw_prompt}')",
         "=" * 78,
@@ -476,6 +482,14 @@ with gr.Blocks(theme=gr.themes.Soft(), title="SAM3 Orchestration Dashboard") as 
                 choices=["dual", "iou_only", "iom_only"], value="iou_only",
                 label="🎯 NMS suppression gate (dual = IoU+IoM default; pick one per dataset)")
 
+            with gr.Row():
+                iou_threshold_slider = gr.Slider(
+                    minimum=0.05, maximum=0.95, value=Config().nms_iou_threshold, step=0.05,
+                    label="Gate A: IoU threshold")
+                iom_threshold_slider = gr.Slider(
+                    minimum=0.05, maximum=0.95, value=Config().nms_iom_threshold, step=0.05,
+                    label="Gate B: IoM threshold")
+
             budget_number = gr.Number(value=12, precision=0, label="🔁 Max actions (budget)")
             force_tile_checkbox = gr.Checkbox(
                 value=False,
@@ -506,8 +520,9 @@ with gr.Blocks(theme=gr.themes.Soft(), title="SAM3 Orchestration Dashboard") as 
 
     nav_outputs = [image_display, banner_md, raw_prompt_display, prompt_input, status_box, idx_state]
     run_inputs = [dataset_dropdown, idx_state, prompt_input, policy_dropdown, verifier_radio,
-                  overlap_radio, gate_mode_radio, conf_slider, budget_number, force_tile_checkbox,
-                  mock_checkbox, query_file_dropdown, mock_class_dropdown]
+                  overlap_radio, gate_mode_radio, iou_threshold_slider, iom_threshold_slider,
+                  conf_slider, budget_number, force_tile_checkbox, mock_checkbox,
+                  query_file_dropdown, mock_class_dropdown]
     run_outputs = [image_display, banner_md, status_box, verbose_box]
 
     app.load(fn=load_sample_view, inputs=[dataset_dropdown, idx_state], outputs=nav_outputs)
