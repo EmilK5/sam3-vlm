@@ -535,7 +535,7 @@ with gr.Blocks(theme=gr.themes.Soft(), title="SAM3 Orchestration Dashboard") as 
             image_display = gr.Image(label="Pipeline prediction view", type="pil", interactive=False)
             verbose_box = gr.Textbox(
                 label="🔬 Verbose orchestration log (actions · per-pass SAM3 · verifier · estimates)",
-                interactive=False, lines=26, max_lines=26, show_copy_button=True,
+                interactive=False, lines=26, max_lines=26,
             )
 
         with gr.Column(scale=2):
