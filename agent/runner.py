@@ -10,7 +10,7 @@ import json
 import logging
 
 from agent import belief
-from agent.actions import StopA
+from agent.actions import QueryA, TileQueryA, StopA
 from agent.actions import execute as default_execute
 from agent import policy_vlm
 from agent.inspect import inspect_scene, should_inspect
@@ -60,7 +60,11 @@ def run_episode(image, ctx, policy, max_actions, execute_fn=None) -> dict:
         action = policy(phi, ctx.partition, ctx.cfg)
 
         n_new = int(execute_fn(action, ctx))
-        ctx.discovery.append(n_new)
+        # Only sensing actions (Query/TileQuery) observe new candidates. Recording
+        # a non-sensing action (subdivide/verify/stop) as discovery=0 would fake
+        # saturation and can stop the episode before it has ever sensed.
+        if isinstance(action, (QueryA, TileQueryA)):
+            ctx.discovery.append(n_new)
 
         u = belief.uncertainty(ctx.graph, ctx.discovery, ctx.cfg)
         cost_so_far = ctx.cost.total(ctx.cfg) if ctx.cost is not None else 0.0

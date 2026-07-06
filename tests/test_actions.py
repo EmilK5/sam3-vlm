@@ -95,8 +95,7 @@ def test_pass_number_advances_only_with_sensing_passes(fake_pipeline):
     assert fake_pipeline.calls[-1]["pass_number"] == 1   # first sensing pass
     # Non-sensing actions must NOT advance the pass number (they used to, via
     # the discovery-curve length, skewing pass-dependent pipeline behavior).
-    execute(SubdivideA(region=(0, 0, 100, 100)), ctx)
-    ctx.discovery.append(0)                              # runner records every action
+    execute(SubdivideA(region=(0, 0, 100, 100)), ctx)   # non-sensing: runner records nothing
     execute(QueryA(region=(0, 0, 25, 25), prompt="p", conf=0.3), ctx)
     assert fake_pipeline.calls[-1]["pass_number"] == 2
 

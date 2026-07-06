@@ -90,11 +90,14 @@ def _compact_phi(phi):
 def _build_messages(phi, z, partition, graph, cfg):
     target = getattr(cfg, "target_prompt", "green fruit")
     regions = [{"region_id": i, "xyxy": list(r)} for i, r in enumerate(partition)]
+    # Angle-bracket placeholders (not bare literals): weak models copy a literal
+    # value like "0.1-0.9" straight into args, which then fails validation. The
+    # brackets signal "substitute a value here" instead.
     menu = {
-        "query": {"region_id": "int", "conf": "0.1-0.9"},
-        "tile": {"conf": "0.1-0.9"},
-        "subdivide": {"region_id": "int"},
-        "stop": {"estimate_name": "N_obs|N_supp|N_cons"},
+        "query": {"region_id": "<int>", "conf": "<float 0.1-0.9>"},
+        "tile": {"conf": "<float 0.1-0.9>"},
+        "subdivide": {"region_id": "<int>"},
+        "stop": {"estimate_name": "<N_obs|N_supp|N_cons>"},
     }
     # verify needs the FM+V-IP oracle; only offer it when the vip verifier is on.
     verify_available = getattr(cfg, "verifier_mode", "ioc") == "vip"
@@ -189,6 +192,11 @@ def _parse_and_validate(content, partition, graph, cfg):
         return VerifyA(node_ids=list(node_ids))
 
     if name == "stop":
+        # Never terminate before any candidate has been registered: a stop on an
+        # empty graph reports zero having sensed nothing. Fall back so the
+        # heuristic picks a sensing action instead.
+        if len(graph.nodes) == 0:
+            return None
         est = args.get("estimate_name", "N_cons")
         if est not in _ESTIMATORS:
             return None

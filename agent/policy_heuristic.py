@@ -61,10 +61,13 @@ def choose(phi, partition, cfg):
     conf = cfg.conf
 
     # --- stopping rule: saturated discovery AND low uncertainty ---
+    # Never stop before anything has been sensed. On an empty graph both tests
+    # are vacuously true -- D fills with non-sensing zeros and U=0 because there
+    # are no nodes -- which would end the episode having detected nothing.
     D = phi["D"]
     recent = (sum(D[-m:]) / min(len(D), m)) if D else 0.0
     saturated = len(D) >= m and recent <= cfg.delta_disc
-    if saturated and phi["U"] <= cfg.delta_U:
+    if phi["K"] > 0 and saturated and phi["U"] <= cfg.delta_U:
         return StopA(estimate_name="N_cons")
 
     K = phi["K"]

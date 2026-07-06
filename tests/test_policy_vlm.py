@@ -86,6 +86,23 @@ def test_legal_stop_maps_to_stopA():
     assert isinstance(action, StopA) and action.estimate_name == "N_supp"
 
 
+def test_stop_on_empty_graph_falls_back():
+    # Vacuous-stop guard: a stop before any candidate is registered must fall back
+    # to the heuristic (which senses) rather than terminate the episode at zero.
+    import dataclasses
+    cfg = dataclasses.replace(Config(), verifier_mode="ioc")
+    graph = OrchardGraph()  # empty: nothing sensed yet
+    phi = summarize(graph, DiscoveryCurve(), budget=12, cfg=cfg)
+    partition = [(0, 0, 128, 128)]
+    z = {"target_present": True, "density": "dense", "object_scale": "small",
+         "occlusion": "medium", "recommend": "tile", "notes": ""}
+    action = policy_vlm.choose(
+        phi, z, partition, graph, cfg,
+        client=_FakeClient('{"action": "stop", "args": {"estimate_name": "N_obs"}}'),
+    )
+    assert not isinstance(action, StopA)
+
+
 # ----------------------- illegal / malformed -> fallback -----------------------
 
 def _heuristic_action(fx):

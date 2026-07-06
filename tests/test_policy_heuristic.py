@@ -27,9 +27,22 @@ def _phi(**over):
 
 def test_choose_stops_when_saturated_and_low_uncertainty():
     cfg = Config()  # delta_disc=1.0, delta_U=0.5, window_m=3
-    phi = _phi(D=[0, 0, 0], U=0.1)
+    # A settled node (K>0) so this is a genuine stop, not the vacuous
+    # nothing-sensed-yet case guarded below.
+    phi = _phi(D=[0, 0, 0], U=0.1, K=1,
+               ids=["n1"], centers=[[50, 50]], area=[400.0], classification=["fruit"],
+               w=[1.5], s=[0.9], k=[3], delta=[0.0])
     action = choose(phi, partition=[(0, 0, 100, 100)], cfg=cfg)
     assert isinstance(action, StopA)
+
+
+def test_choose_does_not_stop_before_first_detection():
+    # Vacuous-stop guard: an empty graph (K=0) with saturated discovery (D of
+    # non-sensing zeros) and U=0 must NOT stop -- nothing has been sensed yet.
+    cfg = Config()
+    phi = _phi(D=[0, 0, 0], U=0.0, K=0)
+    action = choose(phi, [(0, 0, 100, 100)], cfg)
+    assert not isinstance(action, StopA)
 
 
 def test_choose_does_not_stop_when_still_discovering():
@@ -119,3 +132,30 @@ def test_run_episode_stops_by_step_five():
     assert len(result["log"]) <= 5
     assert result["log"][-1]["action"] == "StopA"
     assert "N_obs" in result["counts"]
+
+
+def test_run_episode_records_only_sensing_actions_in_discovery():
+    # Non-sensing actions (subdivide) must not enter the discovery curve;
+    # otherwise their zeros fake saturation and can stop the episode at zero.
+    cfg = Config()
+    ctx = ActionContext(cfg=cfg, graph=OrchardGraph(), discovery=DiscoveryCurve(),
+                        partition=[(0, 0, 100, 100)])
+    script = iter([
+        SubdivideA(region=(0, 0, 100, 100)),
+        QueryA(region=(0, 0, 100, 100), prompt="green fruit", conf=0.3),
+        StopA(estimate_name="N_obs"),
+    ])
+
+    def policy(phi, partition, c):
+        return next(script)
+
+    def stub_execute(action, c):
+        if isinstance(action, QueryA):
+            c.graph.add_candidate([0, 0, 5, 5], 0.9, 1)
+            return 1
+        return 0
+
+    runner.run_episode(image=None, ctx=ctx, policy=policy,
+                       max_actions=5, execute_fn=stub_execute)
+    # Only the single Query contributed; subdivide and stop did not.
+    assert ctx.discovery.as_list() == [1]
