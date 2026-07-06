@@ -341,7 +341,25 @@ def _build_oracle(cfg, verifier, use_mock, mock_true_class):
     return oracle, query_set
 
 
-def _run_episode(image_pil, cfg, policy, oracle, query_set, use_mock):
+def _forced_tile_pass(ctx, cfg):
+    """Unconditionally run one tiled SAM3 pass (pipeline.tiled_engine splits the
+    canopy ROI into an overlapping grid of quadrant-ish tiles) before the policy
+    loop starts, so every episode gets at least one genuine tiled/split call
+    regardless of what the heuristic/VLM would have picked on its own. Uses only
+    the public agent.actions API (same call runner.run_episode makes internally),
+    so no core file is touched."""
+    from agent.actions import TileQueryA, execute as agent_execute
+    prompt = getattr(cfg, "target_prompt", "green fruit")
+    conf = getattr(cfg, "conf", 0.3)
+    n_new = int(agent_execute(TileQueryA(prompt=prompt, conf=conf), ctx))
+    ctx.discovery.append(n_new)
+    logging.getLogger("agent.runner").info(json.dumps({
+        "t": 0, "action": "TileQueryA(forced-initial-split)", "n_new": n_new,
+        "cost_so_far": round(ctx.cost.total(cfg), 3),
+    }))
+
+
+def _run_episode(image_pil, cfg, policy, oracle, query_set, use_mock, force_tile=False):
     """Build the ActionContext, run the episode, return (result, ctx)."""
     from agent.budget import CostMeter
 
@@ -363,6 +381,9 @@ def _run_episode(image_pil, cfg, policy, oracle, query_set, use_mock):
         partition=partition, cost=cost,
     )
 
+    if force_tile:
+        _forced_tile_pass(ctx, cfg)
+
     if policy == "heuristic":
         pol = policy_heuristic.choose
     elif use_mock:
@@ -371,7 +392,8 @@ def _run_episode(image_pil, cfg, policy, oracle, query_set, use_mock):
     else:
         pol = runner.make_vlm_policy(ctx)
 
-    result = runner.run_episode(image_pil, ctx, pol, max_actions=cfg.budget_max_actions)
+    remaining_budget = max(0, cfg.budget_max_actions - (1 if force_tile else 0))
+    result = runner.run_episode(image_pil, ctx, pol, max_actions=remaining_budget)
     return result, ctx
 
 
@@ -383,7 +405,7 @@ def _classification_tally(graph):
 
 
 def run_orchestration(dataset, idx, prompt, policy, verifier, overlap_mode, conf,
-                      budget, use_mock, query_file, mock_true_class):
+                      budget, force_tile, use_mock, query_file, mock_true_class):
     """Full-pipeline execution on one image. Returns (image, banner_md, status, verbose)."""
     idx = int(idx)
     if PROCESSOR is None:
@@ -419,12 +441,12 @@ def run_orchestration(dataset, idx, prompt, policy, verifier, overlap_mode, conf
         "=" * 78,
         f"RUN  dataset={dataset} idx={idx}  policy={policy}  verifier={verifier}"
         f"  overlap={overlap_mode}  conf={cfg.conf:.2f}  budget={cfg.budget_max_actions}"
-        f"  mock={'on' if use_mock else 'off'}",
+        f"  force_tile={'on' if force_tile else 'off'}  mock={'on' if use_mock else 'off'}",
         f"TARGET CONCEPT: '{target}'   (raw label: '{raw_prompt}')",
         "=" * 78,
     ]
     try:
-        result, ctx = _run_episode(image_pil, cfg, policy, oracle, query_set, use_mock)
+        result, ctx = _run_episode(image_pil, cfg, policy, oracle, query_set, use_mock, force_tile)
         graph = result["graph"]
         counts = result["counts"]
     except Exception as exc:
@@ -535,7 +557,7 @@ with gr.Blocks(theme=gr.themes.Soft(), title="SAM3 Orchestration Dashboard") as 
             image_display = gr.Image(label="Pipeline prediction view", type="pil", interactive=False)
             verbose_box = gr.Textbox(
                 label="🔬 Verbose orchestration log (actions · per-pass SAM3 · verifier · estimates)",
-                interactive=False, lines=26, max_lines=26, show_copy_button=True,
+                interactive=False, lines=26, max_lines=26,
             )
 
         with gr.Column(scale=2):
@@ -559,6 +581,9 @@ with gr.Blocks(theme=gr.themes.Soft(), title="SAM3 Orchestration Dashboard") as 
                     minimum=0.10, maximum=0.90, value=0.35, step=0.05, label="🎚️ Detection confidence")
 
             budget_number = gr.Number(value=12, precision=0, label="🔁 Max actions (budget)")
+            force_tile_checkbox = gr.Checkbox(
+                value=False,
+                label="🔲 Force at least one tile pass (quadrant split, before the policy loop)")
 
             with gr.Accordion("FM+V-IP (vip) options", open=False):
                 query_file_dropdown = gr.Dropdown(
@@ -585,8 +610,8 @@ with gr.Blocks(theme=gr.themes.Soft(), title="SAM3 Orchestration Dashboard") as 
 
     nav_outputs = [image_display, banner_md, raw_prompt_display, prompt_input, status_box, idx_state]
     run_inputs = [dataset_dropdown, idx_state, prompt_input, policy_dropdown, verifier_radio,
-                  overlap_radio, conf_slider, budget_number, mock_checkbox, query_file_dropdown,
-                  mock_class_dropdown]
+                  overlap_radio, conf_slider, budget_number, force_tile_checkbox, mock_checkbox,
+                  query_file_dropdown, mock_class_dropdown]
     run_outputs = [image_display, banner_md, status_box, verbose_box]
 
     app.load(fn=load_sample_view, inputs=[dataset_dropdown, idx_state], outputs=nav_outputs)
