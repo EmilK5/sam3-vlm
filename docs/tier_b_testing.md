@@ -201,7 +201,7 @@ from verifier.oracle import QwenOracle
 from verifier.verify import extract_crop
 qs = load_query_set("queries/green_citrus.json")
 img = np.array(Image.open(os.environ["IMG"]).convert("RGB"))
-box = [120, 340, 175, 400]        # <-- REPLACE with a fruit box from the list
+box = [134, 163, 156, 186]        # <-- REPLACE with a fruit box from the list
 crop = extract_crop(img, box, Config().crop_scale, Config().crop_size)
 crop.save("out/T2_crop.jpg")      # so you can see what the oracle saw
 for q, a in zip(qs.queries, QwenOracle(Config()).answer_batch(crop, qs)):
