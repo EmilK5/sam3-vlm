@@ -54,24 +54,13 @@ def _choose(content, fixture):
 
 
 # ----------------------- legal responses -> correct dataclass -----------------------
-
-def test_legal_query_maps_to_queryA():
-    fx = _fixture()
-    action = _choose('{"action": "query", "args": {"region_id": 1, "conf": 0.4}}', fx)
-    assert isinstance(action, QueryA)
-    assert action.region == fx[3][1]          # partition[1]
-    assert action.prompt == TARGET and action.conf == 0.4
-
+# NOTE: query and subdivide were removed from the VLM menu in step 7.3 (replaced by
+# image-grounded "look" ROIs; see tests/test_policy_vlm_roi.py). A query/subdivide
+# response is now an unknown action and falls back (covered in the illegal cases).
 
 def test_legal_tile_maps_to_tileA():
     action = _choose('{"action": "tile", "args": {"conf": 0.3}}', _fixture())
     assert isinstance(action, TileQueryA) and action.conf == 0.3
-
-
-def test_legal_subdivide_maps_to_subdivideA():
-    fx = _fixture()
-    action = _choose('{"action": "subdivide", "args": {"region_id": 0}}', fx)
-    assert isinstance(action, SubdivideA) and action.region == fx[3][0]
 
 
 def test_legal_verify_maps_to_verifyA():
@@ -149,7 +138,7 @@ def test_verify_without_vip_verifier_falls_back():
 def test_verify_not_in_menu_without_vip_verifier():
     fx = _fixture(verifier_mode="ioc")
     cfg, graph, phi, partition, z, _, _ = fx
-    messages = policy_vlm._build_messages(phi, z, partition, graph, cfg)
+    messages = policy_vlm._build_messages(phi, z, graph, cfg)   # no image -> text content
     body = json.loads(messages[-1]["content"].split("\n")[1])
     assert "verify" not in body["action_menu"]
     assert body["verifiable_node_ids"] == []

@@ -442,3 +442,95 @@ answer is yes or fixable-by-editing-queries.
   hard-caps the episode.
 - **torch.compile + many small verify crops is slow** → crops go through Qwen,
   not SAM3, in the default config; Sam3Oracle is opt-in.
+
+---
+
+# Phase 7 — Guided-ROI policy rework
+
+Motivation: in the t9 VLM episode the policy wasted 9/12 actions on no-op
+`subdivide`s and never stopped. Root cause was policy design, not model
+strength (qwen3-vl-thinking is capable). This phase replaces id-based quadrant
+subdivision with image-grounded region-of-interest proposals, seeds exemplars
+with a mandatory global pass, and makes the runner terminate on its own.
+
+Design decisions locked in with the user (do not relitigate):
+- **One model only: qwen3-vl-thinking.** Never swap models. Disable thinking
+  *per-call* via the endpoint's API arg for the structured policy-loop
+  decisions; keep thinking on for `inspect` (z) and the `verify` oracle.
+- **VLM sees the image** in the policy call and may emit region boxes as
+  **sensing targets only**. A VLM box parameterizes a SAM3 query and is
+  code-guaranteed never to become a graph node. Candidates stay SAM3-only.
+  This amends hard-constraint #3 (done in 7.4).
+- **Mandatory global (non-tiled) pass first**, seeding candidates + exemplars.
+- **One ROI proposal = one real tiled sense** (+10% margin), so no action is a
+  no-op. Refinement bounded to 2 nesting levels / a min ROI size (the user's
+  "max 2 splits / 16 quadrants" rule). `subdivide` is removed.
+- **Heuristic policy stays as the validated fallback.**
+
+### Step 7.1 — LookROIA action + grounding enforcement
+**Files:** `agent/actions.py`, `tests/test_look_roi.py`.
+**Prompt:**
+> Add `LookROIA(region)` where region is a VLM-proposed xyxy box (a sensing
+> target, never a candidate). In `execute()`: expand region by `cfg.roi_margin`
+> (default 0.10) about its center, clamp to image bounds, then call
+> `pipeline.execute_pass` with `roi_override=<expanded box>` and tiling on, using
+> the graph's current exemplars; return n_new. HARD GUARANTEE: no code path adds
+> the ROI box itself to the graph — candidates come only from SAM3 inside the
+> ROI. Track sensed ROIs on ctx; return 0 (log, no model call) when the ROI is
+> below `cfg.roi_min_size`, nested past `cfg.roi_max_depth` (=2) levels, or
+> overlaps an already-sensed ROI above an IoU threshold. Pytest with a stub
+> pipeline + MockOracle: margin/clamp math is correct; a LookROIA never creates a
+> node from its own coordinates; a too-small / duplicate ROI is a no-op.
+**You verify:** REPL: `LookROIA` on a hand-picked dense corner of a real image;
+the overlay shows SAM3 detections only inside the 10%-expanded box, and the ROI
+box itself is not a node in the graph JSON.
+
+### Step 7.2 — Bootstrap global pass + runner auto-stop
+**Files:** `agent/runner.py`, `tests/test_runner_bootstrap.py`.
+**Prompt:**
+> Add an opt-in `bootstrap_global_pass` to `run_episode` (default off so the
+> heuristic-baseline tests are unaffected): when set, execute one global
+> non-tiled `QueryA` over the full tree_roi at `cfg.conf` before the policy loop,
+> seeding candidates + exemplars, logged as its own step. Add runner-level
+> auto-stop backstops that end the episode regardless of the policy's action:
+> discovery saturation (a full sensing pass adds < `cfg.delta_disc` new) OR all
+> proposed ROIs sensed OR budget exhausted. Keep one JSON log line per step.
+> Pytest with a stub executor: with bootstrap on, the first executed action is
+> the global query; a saturating discovery script auto-stops even when the
+> policy never returns StopA.
+**You verify:** run a VLM episode; the first log line is the global pass; a
+saturating run terminates without the model emitting `stop`.
+
+### Step 7.3 — Guided-ROI VLM policy
+**Files:** `agent/policy_vlm.py`, `tests/test_policy_vlm_roi.py`.
+**Prompt:**
+> Rework `policy_vlm.choose` to send the image (base64 data URL, same encoding
+> `inspect_scene` uses) alongside phi/z. New menu: `look{region:[x1,y1,x2,y2]}`
+> (sensing ROI only), `tile{conf}`, `verify{node_ids}` (vip only), `stop`.
+> Remove `subdivide`. Hard-validate `look`: region is four numbers, in-bounds
+> after clamp, passes the 7.1 depth/min-size/overlap guards -> `LookROIA`; any
+> parse/validation failure -> heuristic fallback (unchanged path). The grounding
+> guarantee holds: the look box is a sensing target, never a candidate. Pytest
+> with a fake client + stub: a legal `look` maps to `LookROIA` with the proposed
+> box; out-of-bounds / too-small / duplicate `look` falls back; the request
+> includes the image; `subdivide` is absent from the emitted menu.
+**You verify:** `run_eval --policy vlm --limit 1`; read the trace — after the
+bootstrap global pass, every `look`/`tile`/`verify` senses (n_new changes or
+exemplars grow), there are no no-op spins, and it stops on saturation/budget.
+
+### Step 7.4 — Config, thinking toggle, and constraint reword
+**Files:** `config.py`, `CLAUDE.md`.
+**Prompt:**
+> config.py: add `roi_margin=0.10`, `roi_min_size` (px), `roi_max_depth=2`, and a
+> per-callsite thinking toggle — a helper that appends the endpoint's
+> disable-thinking argument to a `chat.completions` call (verify the exact param
+> against the live Ollama qwen3-vl endpoint: likely
+> `extra_body={"chat_template_kwargs": {"enable_thinking": false}}` or a `think`
+> field). Default: thinking ON for `inspect` + the `verify` oracle, OFF for
+> policy-loop decisions. Keep a single model id; never switch models. CLAUDE.md:
+> reword hard-constraint #3 to "candidates originate only from SAM3; no VLM box
+> may become a candidate/node; VLM boxes are allowed solely as sensing ROIs that
+> parameterize a SAM3 query."
+**You verify:** grep a policy-loop request log — the disable-thinking arg is
+present and the response carries no thinking trace; `inspect`/`verify` requests
+still think. `pytest -q` green.

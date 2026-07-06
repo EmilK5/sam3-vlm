@@ -38,8 +38,11 @@ Use `/next-step` to begin work and `/verify-step` to prepare handoff.
    `return_indices=False`, `return_masks=False`).
 2. New behavior goes behind a config flag; the old path stays the default
    (e.g. `verifier="ioc"` default, `"vip"` opt-in).
-3. The VLM must never inject detections. No code path may accept box
-   coordinates from a VLM response. Candidates originate from SAM3 only.
+3. The VLM must never inject detections. Candidates originate from SAM3 only,
+   and no VLM-supplied box may ever become a candidate/node. VLM boxes are
+   allowed solely as sensing ROIs that parameterize a SAM3 query (agent
+   `LookROIA`): such an ROI only steers where SAM3 looks and is never added to
+   the graph.
 4. Model objects (SAM3 processor, oracles) are passed as arguments, never
    imported and called globally. Everything must run with `MockOracle` and a
    stubbed processor.

@@ -28,7 +28,9 @@ def _toy_query_set():
     return QuerySet(concept="toy", classes=classes, epsilon=0.15, queries=queries)
 
 
-# (a) clean template answers for class k -> posterior(k) > 0.95 within max_q
+# (a) clean template answers for class k -> confident, correct verdict within max_q.
+# Threshold is 0.90 (not 0.95): the green_citrus set was trimmed to 6 general
+# queries, whose clean posterior peaks lower than the original 22-query set.
 def test_posterior_recovers_true_class():
     qs = load_query_set(GREEN_CITRUS)
     table = vip.likelihood_table(qs)
@@ -36,7 +38,7 @@ def test_posterior_recovers_true_class():
         answers = _clean_answers(qs, cls)
         result = vip.run_ip(answers, table, prior=None, stop_eps=0.05, max_q=10)
         assert result["verdict_idx"] == k, f"class {cls} misclassified"
-        assert result["posterior"][k] > 0.95
+        assert result["posterior"][k] > 0.90
 
 
 # (b) a query with template 0 for all classes is never selected

@@ -1,19 +1,24 @@
 """
 agent/policy_vlm.py
 
-VLM orchestration policy. choose() asks the VLM (one text call, no image) to pick
-the next sensing action from a menu of legal, id-referenced actions, then HARD-
-VALIDATES the response. Any parse failure or validation violation falls back to
-the non-visual heuristic policy, so the VLM can never drive an illegal action.
+VLM orchestration policy (guided-ROI). choose() shows the VLM the image and asks
+it to pick the next sensing action from a menu, then HARD-VALIDATES the response.
+Any parse failure or validation violation falls back to the non-visual heuristic
+policy, so the VLM can never drive an illegal action.
 
-Grounding guarantee: the VLM selects regions by id and nodes by id -- it never
-supplies box coordinates. No action here accepts coordinates from the model.
+Grounding guarantee: the VLM only steers the sensor. For "look" it proposes an ROI
+box [x1,y1,x2,y2] that says WHERE to run SAM3; that box is a sensing target only
+and is never added to the graph as a candidate (enforced in actions.LookROIA /
+execute). For "verify" it names existing node ids. No VLM box ever becomes a
+detection; candidates originate only from SAM3.
 """
 
+import base64
+import io
 import json
 import logging
 
-from agent.actions import QueryA, TileQueryA, SubdivideA, VerifyA, StopA
+from agent.actions import TileQueryA, LookROIA, VerifyA, StopA
 from agent.belief import support_score
 from agent import policy_heuristic
 
@@ -22,20 +27,28 @@ logger = logging.getLogger(__name__)
 _ESTIMATORS = {"N_obs", "N_supp", "N_cons"}
 
 SYSTEM_PROMPT = (
-    "You are the orchestrator of a zero-shot object-counting system. Choose the "
-    "single best next sensing action from the provided menu. You select regions and "
-    "candidate nodes by id only; you never provide pixel coordinates. Reply with "
-    "ONLY a JSON object {\"action\": <name>, \"args\": {...}} and nothing else."
+    "You are the orchestrator of a zero-shot object-counting system. You SEE the "
+    "image. Choose the single best next sensing action from the provided menu. For "
+    "\"look\" you give an ROI box [x1,y1,x2,y2] in image pixels around an area with "
+    "many target objects -- this only tells the sensor WHERE to look and never adds "
+    "objects to the count. For \"verify\" you name candidate node ids. You never "
+    "label or add objects yourself. Reply with ONLY a JSON object "
+    "{\"action\": <name>, \"args\": {...}} and nothing else."
 )
 
 
-def choose(phi, z, partition, graph, cfg, client=None):
-    """Return the VLM-chosen action if it validates, else the heuristic action."""
+def choose(phi, z, partition, graph, cfg, client=None, image=None):
+    """Return the VLM-chosen action if it validates, else the heuristic action.
+
+    image: the current PIL frame, shown to the VLM so it can place ROI boxes. When
+    None (offline / no image), "look" is not offered and any look response falls
+    back to the heuristic.
+    """
     if client is None:
         client = _build_client(cfg)
 
-    messages = _build_messages(phi, z, partition, graph, cfg)
-    logger.info("policy_vlm prompt: %s", messages[-1]["content"])
+    messages = _build_messages(phi, z, graph, cfg, image)
+    logger.info("policy_vlm prompt: %s", _log_text(messages))
 
     try:
         content = _request(client, cfg, messages)
@@ -44,7 +57,7 @@ def choose(phi, z, partition, graph, cfg, client=None):
         logger.warning("policy_vlm: request failed (%s); fallback to heuristic.", exc)
         return policy_heuristic.choose(phi, partition, cfg)
 
-    action = _parse_and_validate(content, partition, graph, cfg)
+    action = _parse_and_validate(content, graph, cfg, image)
     if action is None:
         logger.warning("policy_vlm: invalid/illegal response; fallback to heuristic.")
         return policy_heuristic.choose(phi, partition, cfg)
@@ -60,10 +73,23 @@ def _build_client(cfg):
 
 
 def _request(client, cfg, messages) -> str:
+    # Disable qwen3-vl "thinking" for the (structured) policy-loop decision by
+    # default -- same model, per-call toggle (config.thinking_call_kwargs).
+    from config import thinking_call_kwargs
+    extra = thinking_call_kwargs(getattr(cfg, "policy_enable_thinking", False))
     response = client.chat.completions.create(
-        model=cfg.oracle_model_name, temperature=cfg.oracle_temperature, messages=messages,
+        model=cfg.oracle_model_name, temperature=cfg.oracle_temperature,
+        messages=messages, **extra,
     )
     return response.choices[0].message.content
+
+
+def _log_text(messages) -> str:
+    """The user message's text part (skip the base64 image) for readable logs."""
+    content = messages[-1]["content"]
+    if isinstance(content, list):
+        return next((p.get("text") for p in content if p.get("type") == "text"), "")
+    return content
 
 
 def _verifiable_ids(phi):
@@ -87,43 +113,55 @@ def _compact_phi(phi):
     }
 
 
-def _build_messages(phi, z, partition, graph, cfg):
+def _build_body(phi, z, graph, cfg, image):
+    """The JSON state + action menu shown to the VLM (image sent separately)."""
     target = getattr(cfg, "target_prompt", "green fruit")
-    regions = [{"region_id": i, "xyxy": list(r)} for i, r in enumerate(partition)]
-    # Angle-bracket placeholders (not bare literals): weak models copy a literal
-    # value like "0.1-0.9" straight into args, which then fails validation. The
-    # brackets signal "substitute a value here" instead.
+    verify_available = getattr(cfg, "verifier_mode", "ioc") == "vip"
+
+    # Menu. "look" is only offered when the image is present (the VLM needs to see
+    # the frame to place a box). Angle-bracket placeholders signal "substitute a
+    # value" so a weak model doesn't echo a literal like "0.1-0.9".
     menu = {
-        "query": {"region_id": "<int>", "conf": "<float 0.1-0.9>"},
         "tile": {"conf": "<float 0.1-0.9>"},
-        "subdivide": {"region_id": "<int>"},
         "stop": {"estimate_name": "<N_obs|N_supp|N_cons>"},
     }
-    # verify needs the FM+V-IP oracle; only offer it when the vip verifier is on.
-    verify_available = getattr(cfg, "verifier_mode", "ioc") == "vip"
+    if image is not None:
+        menu = {"look": {"region": "[x1,y1,x2,y2]"}, **menu}
     if verify_available:
         menu["verify"] = {"node_ids": ["<verifiable id>"]}
-    body = {
+
+    return {
         "target_concept": target,
+        "image_size": list(image.size) if image is not None else None,  # [w, h] px
         "phi": _compact_phi(phi),
         "z": z,
-        "regions": regions,
         "verifiable_node_ids": _verifiable_ids(phi) if verify_available else [],
         "remaining_budget": phi.get("remaining_budget"),
         "action_menu": menu,
     }
-    text = "Choose the next action.\n" + json.dumps(body) + "\nReply with ONLY {\"action\":..., \"args\":...}."
+
+
+def _build_messages(phi, z, graph, cfg, image=None):
+    body = _build_body(phi, z, graph, cfg, image)
+    text = ("Choose the next action.\n" + json.dumps(body)
+            + "\nReply with ONLY {\"action\":..., \"args\":...}.")
+    if image is not None:
+        buf = io.BytesIO()
+        image.save(buf, format="PNG")
+        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        content = [
+            {"type": "text", "text": text},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+        ]
+    else:
+        content = text
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": text},
+        {"role": "user", "content": content},
     ]
 
 
 # ----------------------- strict validation -----------------------
-
-def _valid_region_id(rid, partition):
-    return isinstance(rid, int) and not isinstance(rid, bool) and 0 <= rid < len(partition)
-
 
 def _valid_conf(c):
     return isinstance(c, (int, float)) and not isinstance(c, bool) and 0.1 <= c <= 0.9
@@ -147,7 +185,25 @@ def _valid_node_ids(ids, graph, cfg):
     return True
 
 
-def _parse_and_validate(content, partition, graph, cfg):
+def _validate_look(region, image):
+    """A "look" ROI is legal iff we have an image and region is an in-bounds xyxy
+    box (four numbers, x1<x2<=W, y1<y2<=H). Returns a LookROIA (sensing target
+    only) or None. The 10% margin / min-size / depth / dedup guards live in
+    actions.execute; here we only reject out-of-frame or malformed boxes."""
+    if image is None:
+        return None
+    if not isinstance(region, (list, tuple)) or len(region) != 4:
+        return None
+    if not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in region):
+        return None
+    x1, y1, x2, y2 = (float(v) for v in region)
+    w, h = image.size
+    if not (0 <= x1 < x2 <= w and 0 <= y1 < y2 <= h):
+        return None
+    return LookROIA(region=(x1, y1, x2, y2))
+
+
+def _parse_and_validate(content, graph, cfg, image):
     """Return a validated action dataclass, or None on any parse/validation failure."""
     try:
         data = json.loads(content)
@@ -160,15 +216,8 @@ def _parse_and_validate(content, partition, graph, cfg):
 
     target = getattr(cfg, "target_prompt", "green fruit")
 
-    if name == "query":
-        rid = args.get("region_id")
-        if not _valid_region_id(rid, partition):
-            return None
-        if not _valid_conf(args.get("conf")):
-            return None
-        if not _valid_prompt(args.get("prompt"), target):
-            return None
-        return QueryA(region=tuple(partition[rid]), prompt=target, conf=float(args["conf"]))
+    if name == "look":
+        return _validate_look(args.get("region"), image)
 
     if name == "tile":
         if not _valid_conf(args.get("conf")):
@@ -176,12 +225,6 @@ def _parse_and_validate(content, partition, graph, cfg):
         if not _valid_prompt(args.get("prompt"), target):
             return None
         return TileQueryA(prompt=target, conf=float(args["conf"]))
-
-    if name == "subdivide":
-        rid = args.get("region_id")
-        if not _valid_region_id(rid, partition):
-            return None
-        return SubdivideA(region=tuple(partition[rid]))
 
     if name == "verify":
         if getattr(cfg, "verifier_mode", "ioc") != "vip":

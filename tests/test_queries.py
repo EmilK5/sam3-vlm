@@ -16,7 +16,7 @@ def test_load_checked_in_green_citrus():
     assert qs.classes == ["target", "distractor", "spurious"]
     assert qs.class_names["target"] == "fruit"
     assert 0.0 < qs.epsilon < 0.5
-    assert len(qs.queries) >= 20
+    assert len(qs.queries) >= 5   # trimmed to a small, general set for green citrus
     # every query covers all classes with values in {-1, 0, 1}
     for q in qs.queries:
         assert set(q.templates) == set(qs.classes)

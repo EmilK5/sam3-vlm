@@ -152,8 +152,13 @@ def _run_agent_policy(policy, processor, image_pil, cfg, oracle, query_set,
         partition=partition, cost=cost,
     )
     pol = policy_heuristic.choose if policy == "heuristic" else runner.make_vlm_policy(ctx)
+    # The guided-ROI VLM episode opens with a mandatory global bootstrap pass
+    # (seeds candidates + exemplars) and auto-stops on discovery saturation; the
+    # heuristic baseline keeps its original loop (flags default off).
+    is_vlm = policy == "vlm"
     result = runner.run_episode(image_pil, ctx, pol, max_actions=cfg.budget_max_actions,
-                                execute_fn=episode_execute_fn)
+                                execute_fn=episode_execute_fn,
+                                bootstrap_global_pass=is_vlm, auto_stop=is_vlm)
     return ctx.cost, len(result["log"])
 
 

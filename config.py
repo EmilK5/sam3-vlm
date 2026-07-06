@@ -72,6 +72,20 @@ class Config:
     area_min: float = 0.0      # plausible candidate area bounds (px^2) for the
     area_max: float = float("inf")  # lambda_A term of support_score; defaults are inert
 
+    # --- guided-ROI policy (phase 7) ---
+    roi_margin: float = 0.10      # fraction of a proposed ROI's size added on each
+                                  # side before sensing (agent LookROIA)
+    roi_min_size: float = 32.0    # min ROI side (px) worth sensing; smaller -> no-op
+    roi_max_depth: int = 2        # max quadrant-equiv zoom levels; the ROI area floor
+                                  # is frame_area / 4**roi_max_depth (16-quadrant cap)
+    roi_dup_iou: float = 0.7      # a proposed ROI overlapping a sensed one above this
+                                  # IoU is a no-op (avoids re-sensing)
+    policy_enable_thinking: bool = False  # qwen3-vl "thinking" on the policy-loop
+                                  # (look/tile/verify/stop) call; OFF by default since
+                                  # those decisions are structured. inspect + the verify
+                                  # oracle keep thinking on (their default call). One
+                                  # model id throughout -- never switch models.
+
     # --- costs (normalized relative to one global SAM3 call) ---
     c_sam: float = 1.0
     c_tile: float = 0.25
@@ -85,3 +99,20 @@ class Config:
         with open(path, "r") as f:
             overrides = json.load(f)
         return dataclasses.replace(cls(), **overrides)
+
+
+def thinking_call_kwargs(enable_thinking: bool) -> dict:
+    """Extra kwargs for an OpenAI-compatible chat.completions.create() call that
+    toggle qwen3-vl "thinking" WITHOUT switching models.
+
+        enable_thinking=True  -> {} (the model's default; thinking on)
+        enable_thinking=False -> the disable-thinking argument
+
+    NOTE: the exact key is serving-stack specific. This uses the vLLM/Qwen
+    chat-template convention (extra_body.chat_template_kwargs.enable_thinking).
+    VERIFY it against the live Ollama qwen3-vl endpoint -- Ollama may instead want
+    a top-level {"think": false}. If so, change only this function.
+    """
+    if enable_thinking:
+        return {}
+    return {"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}

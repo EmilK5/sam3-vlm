@@ -39,8 +39,61 @@ follow the "Suggested order of the first week" in the plan.
 - [x] 6.2 Sweep runner (eval/run_eval.py) [REDUCED: oneshot/cascade/tiled/convergence only] — check: `--limit 5` on citrus for {oneshot,cascade}x{ioc,vip}; open CSV — pool_recall(cascade) >= pool_recall(oneshot); vip-vs-ioc precision delta shows if the verifier earns its cost.
 - [x] 6.3 Results table & accuracy-vs-cost plot (eval/report.py) — check: run report on your sweep CSV(s); the accuracy-vs-cost plot is the paper figure — confirm the policy story (one-shot → cascade → tiled → convergence → heuristic → VLM) is readable.
 
+## Phase 7 — Guided-ROI policy rework
+- [x] 7.1 LookROIA action + grounding enforcement (agent/actions.py, tests/test_look_roi.py) — implemented; tests/test_look_roi.py green (8). Check: REPL LookROIA on a dense corner of a real image; overlay shows SAM3 detections only inside the 10%-expanded box; the ROI box itself is not a node.
+- [x] 7.2 Bootstrap global pass + runner auto-stop (agent/runner.py, tests/test_runner_bootstrap.py) — implemented; test green (4). Check: VLM episode's first log line is the global pass; a saturating run terminates without the model emitting stop.
+- [x] 7.3 Guided-ROI VLM policy (agent/policy_vlm.py, agent/runner.py, eval/run_eval.py, tests/test_policy_vlm_roi.py; + tests/test_policy_vlm.py migration) — implemented; suite green (228). Check: run_eval --policy vlm --limit 1; after the bootstrap pass every look/tile/verify senses, no no-op spins, stops on saturation/budget.
+- [x] 7.4 Config, thinking toggle, CLAUDE.md #3 reword (config.py, CLAUDE.md, agent/policy_vlm.py, tests/test_thinking_toggle.py) — implemented; suite green (232). Check: grep a policy-loop request log — disable-thinking arg present, no thinking trace; inspect/verify still think; pytest green. CAVEAT: verify the exact Ollama qwen3-vl disable-thinking key (see config.thinking_call_kwargs).
+
 ## Notes / decisions log
 <!-- Append dated one-liners here when a step deviates from the plan. -->
+- 2026-07-06 (7.1): roi_margin/roi_min_size/roi_max_depth/roi_dup_iou read via
+  getattr with defaults (0.10 / 32px / 2 / 0.7); promoted to config.py in 7.4
+  (matches policy_heuristic's "not yet in config" precedent). "Max 2 splits"
+  encoded statelessly as an area floor = frame/4^depth (= frame/16). LookROIA is
+  region-only; concept prompt + conf come from cfg (VLM chose only WHERE to look).
+  A LookROIA reuses the QueryA executor with tiling=True, so it is exemplar-primed
+  and counts as a sensing pass. FLAG (not from 7.1): running the full suite (now
+  possible via a scratch venv) surfaced 2 pre-existing failures caused by the
+  earlier user-requested green_citrus.json trim (22->6 queries) —
+  test_queries.py::test_load_checked_in_green_citrus (asserts len>=20) and
+  test_vip.py::test_posterior_recovers_true_class (asserts posterior>0.95, now
+  0.941; verdict still correct). Both need a small out-of-scope test update.
+- 2026-07-06 (query-trim test fixup, user-authorized): updated the two tests
+  broken by the green_citrus.json 22->6 trim — test_queries.py len assertion
+  20->5, test_vip.py clean-posterior threshold 0.95->0.90 (verdicts unchanged).
+  Full suite green (215). Marked 7.1 [x] on the user's explicit instruction
+  (automated tests only; the GPU-REPL "You verify" was not run here).
+- 2026-07-06 (7.2): run_episode gained bootstrap_global_pass + auto_stop, BOTH
+  default-off (old episodes unchanged per the "new behavior behind a flag" rule).
+  Bootstrap = one non-tiled QueryA over partition[0] (canopy tree_roi / full frame),
+  counted against budget. auto_stop ends on DiscoveryCurve.saturated over a non-empty
+  graph; budget is the loop cap; "all ROIs sensed" is subsumed by saturation.
+  LookROIA added to the sensing set that feeds the discovery curve. FLAG for 7.3:
+  enabling these flags for the actual VLM episode is a one-line change in
+  eval/run_eval.py::_run_agent_policy (out of 7.2/7.3's named files) — 7.3 will need
+  its scope widened to include run_eval.py, or a follow-up. Marked [x] on user
+  instruction (automated tests only; GPU "You verify" not run here).
+- 2026-07-06 (7.3, scope widened w/ user approval): the guided-ROI VLM policy needs
+  the image + the 7.2 flags wired through non-policy files, so 7.3 touched, beyond
+  its named files: agent/runner.py (make_vlm_policy passes image=ctx.image_pil),
+  eval/run_eval.py (_run_agent_policy enables bootstrap_global_pass + auto_stop only
+  for policy=="vlm"; heuristic unchanged), and tests/test_policy_vlm.py (removed the
+  now-obsolete query/subdivide legal-mapping tests; fixed _build_messages call to the
+  new no-partition signature). policy_vlm reworked: choose() gains an image param;
+  menu is look/tile/verify/stop (query + subdivide removed); "look" -> LookROIA is
+  validated in-bounds against image_size and is a sensing target only (grounding
+  invariant preserved). Suite green (228).
+- 2026-07-06 (7.4, scope widened w/ user approval): added roi_margin/roi_min_size/
+  roi_max_depth/roi_dup_iou to config.py (were getattr defaults in 7.1; values match)
+  + policy_enable_thinking (default False) + module helper thinking_call_kwargs().
+  Widened beyond config.py/CLAUDE.md to agent/policy_vlm.py so the toggle actually
+  applies: _request now passes the disable-thinking extra_body for the policy loop
+  (inspect + verify oracle untouched -> keep thinking on). CLAUDE.md #3 reworded to
+  the ROI-as-sensing-target wording. CAVEAT: thinking_call_kwargs uses the vLLM/Qwen
+  convention (extra_body.chat_template_kwargs.enable_thinking); the live Ollama
+  qwen3-vl endpoint may want top-level {"think": false} instead -- change only that
+  one helper if so. Suite green (232). Phase 7 code complete (all 4 steps [~]/[x]).
 - 2026-07-05 (functional-review fixes, user request): (1) VerifyA now raises a
   clear ValueError without oracle/query_set, and BOTH policies only propose/accept
   "verify" when cfg.verifier_mode=="vip" (run_eval only wires an oracle for vip;

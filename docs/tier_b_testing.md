@@ -426,7 +426,11 @@ server it should be rare; report if it's persistent.
 
 ---
 
-## T9 — VLM policy episode with validation  (step 5.2)
+## T9 — Guided-ROI VLM policy episode  (step 5.2 + phase 7)
+
+Reworked in phase 7: the VLM now SEES the image and proposes ROI sensing-targets
+(`look`) instead of picking region ids / subdividing. The episode opens with a
+mandatory global bootstrap pass and auto-stops on saturation.
 
 **Run:**
 
@@ -434,22 +438,38 @@ server it should be rare; report if it's persistent.
 python -m eval.run_eval --root dataset --fmt yolo --split val --limit 1 \
   --policy vlm --verifier vip --prompt "green fruit" \
   --out out/T9.csv 2>&1 | tee out/T9.log
-grep -c "policy_vlm prompt"   out/T9.log     # prompts sent
-grep -c "policy_vlm response" out/T9.log     # responses received
-grep -c "fallback"            out/T9.log     # heuristic fallbacks
+grep -c "policy_vlm prompt"    out/T9.log     # policy-loop prompts sent
+grep -c "policy_vlm response"  out/T9.log     # responses received
+grep -c "fallback"             out/T9.log     # heuristic fallbacks
+grep -c '"action": "look"'     out/T9.log     # image-grounded ROI proposals
+grep -c "SubdivideA"           out/T9.log     # expect 0 (subdivide removed from the menu)
+grep -m1 '{"t": 1,'            out/T9.log     # first executed step = bootstrap global pass
 ```
 
-**Expect:**
-- At least one full prompt+response pair in the log — read one: the prompt
-  contains compact φ, z, the region table, and the action menu; the response is
-  bare JSON `{"action": ..., "args": ...}`.
-- Every executed action is either a validated VLM choice or an explicitly
-  logged fallback — there is no third path. A few fallbacks are the safety net
-  working; **near-100% fallback** means the model can't hold the JSON contract
-  (try a bigger tag or raise the context length, see Part 1).
-- With `--verifier vip`, the menu includes `verify`; re-run with
-  `--verifier ioc` and confirm the logged prompts contain **no** `"verify"` in
-  `action_menu` and the run still completes (this used to be crashable).
+**Expect (guided-ROI rework):**
+- **Bootstrap first:** the first step line is the mandatory global pass, e.g.
+  `{"t": 1, "action": "QueryA", "n_new": <N>, ...}`, logged BEFORE any
+  `policy_vlm prompt`. It seeds candidates + pseudo-exemplars, so the graph is
+  never empty when the model first acts.
+- **Image-grounded menu:** read one `policy_vlm prompt` — it carries the image
+  (a `data:image/png;base64,...` part), `image_size`, compact φ, z, and a menu of
+  **`look` / `tile` / `verify` / `stop`** (no `query`, no `subdivide`). A `look`
+  reply is `{"action":"look","args":{"region":[x1,y1,x2,y2]}}`.
+- **Every action senses; no no-op spins.** `SubdivideA` count is ~0; each `look`
+  runs a tiled SAM3 pass inside the (10%-expanded) ROI and its `n_new` moves or
+  exemplars grow. Contrast the pre-phase-7 run, which burned most actions on
+  no-op subdivides.
+- **Auto-stop:** the episode ends on discovery saturation or budget — it need not
+  emit an explicit `stop`. `N_obs` should land near GT (± a few).
+- **Grounding:** no node in `out/<stem>_graph.json` has a box equal to a proposed
+  `look` ROI — ROIs only steer the sensor (enforced in code; isolated in T13).
+- **Thinking toggle:** policy-loop responses carry no `<think>` trace and are far
+  faster than the pre-7.4 run; `inspect` (z) and `verify` calls still think (T13).
+- Every executed action is a validated VLM choice or an explicitly logged
+  fallback — no third path. A few fallbacks are fine; **near-100% fallback** means
+  the model can't hold the contract (bigger tag / more context, see Part 1).
+- **ioc variant:** re-run with `--verifier ioc`; the logged menu must contain
+  **no** `verify`, and the run still completes.
 
 **Artifacts:** `out/T9.log`, `out/T9.csv`.
 
@@ -584,6 +604,67 @@ EOF
 
 ---
 
+## T13 — Guided-ROI grounding + thinking toggle  (phase 7: steps 7.1, 7.4)
+
+First, the CPU suite grew with phase 7 — run it once before the GPU checks:
+
+```bash
+pytest -q      # expect green; new files: test_look_roi, test_runner_bootstrap,
+               # test_policy_vlm_roi, test_thinking_toggle
+```
+
+**(a) LookROIA grounding — a VLM box never becomes a candidate.** A `look` ROI
+only tells SAM3 where to look; it must never appear as a node. REPL demo (after
+loading the SAM3 processor once):
+
+```python
+from PIL import Image
+from config import Config
+from graph import OrchardGraph
+from agent.belief import DiscoveryCurve
+from agent.actions import LookROIA, ActionContext, execute
+
+cfg = Config()
+img = Image.open(IMG).convert("RGB")
+ctx = ActionContext(processor=processor, image_pil=img, graph=OrchardGraph(),
+                    cfg=cfg, discovery=DiscoveryCurve(),
+                    partition=[(0, 0, *img.size)])
+roi = (x1, y1, x2, y2)                        # a dense fruit corner you pick
+n = execute(LookROIA(region=roi), ctx)
+print("n_new:", n, " sensed_rois:", ctx.sensed_rois)
+boxes = [tuple(nd.box) for nd in ctx.graph.nodes.values()]
+assert roi not in boxes                        # the ROI itself is NOT a node
+```
+
+**Expect:** detections land INSIDE the 10%-expanded ROI only; `ctx.sensed_rois`
+holds the expanded box; the assert holds (ROI never injected). A too-small ROI
+(side < `cfg.roi_min_size`=32px), one finer than `cfg.roi_max_depth`=2 levels
+(area < frame/16), or one overlapping an already-sensed ROI returns `n_new == 0`
+with no SAM3 call — try a tiny box and confirm it's a silent no-op.
+
+**(b) Thinking toggle — policy loop fast, inspect/verify still reason.** The
+policy-loop decision runs qwen3-vl with thinking OFF (same model, per-call). There
+is no explicit request-body log, so use observable proxies on `out/T9.log`:
+
+```bash
+grep -A2 "policy_vlm response" out/T9.log | grep -ci "think"   # ~0: no reasoning trace
+```
+
+**Expect:**
+- Policy responses are bare JSON with **no** `<think>...</think>` block, and each
+  `policy_vlm prompt → response` round-trip is much quicker than the pre-7.4 run
+  (seconds, not tens of seconds).
+- The `inspect` scene call (T8) and the `verify` calls STILL show reasoning — they
+  keep thinking on by design.
+- **If policy responses still contain a `<think>` trace,** your Ollama tag wants a
+  different disable key than the vLLM/Qwen default. Fix ONLY
+  `config.thinking_call_kwargs` (e.g. return `{"extra_body": {"think": False}}`)
+  and re-run — nothing else changes.
+
+**Artifacts:** the REPL transcript, `out/T9.log`.
+
+---
+
 ## Stopping
 
 - Terminal B: nothing to stop.
@@ -601,6 +682,8 @@ EOF
 | Every oracle answer is `0` (T2) | Model returned unparseable JSON every attempt. Check `out/T2.log` for `unparseable response` warnings; try a larger tag. `request failed` warnings instead → server/network issue (the run continues on the all-zeros fallback by design). |
 | Answers ignore the image | The tag isn't vision-capable. Use `qwen3-vl:*` / `qwen2.5vl:*`. |
 | VLM policy: constant `fallback` (T9) | JSON contract too hard for the model or prompt truncated. Raise context (Part 1 step 2) and/or use a bigger tag. Occasional fallbacks are fine — that's the validation layer doing its job. |
+| Policy responses still show `<think>` (T13) | Ollama wants a different disable key than the vLLM/Qwen default. Change ONLY `config.thinking_call_kwargs` (try top-level `{"extra_body": {"think": False}}`). Inspect/verify keep thinking on regardless. |
+| VLM proposes out-of-frame / tiny `look` boxes | Harmless: an out-of-bounds box fails validation → heuristic fallback; a too-small / too-deep / duplicate ROI is a no-op (`n_new==0`). If it's *frequent*, send `image_size` more prominently or use a bigger tag. |
 | GPU OOM on the Ollama side | Use a smaller tag (`:4b`, `:3b`); don't run SAM3 and a large VLM on the same small GPU. |
 | SAM3 first pass extremely slow | Expected: weight download + `torch.compile` warm-up. Subsequent passes are fast. |
 | `No module named 'config'` from scripts | Run from the project root, or use the module form (`python -m eval.run_eval ...`). |
