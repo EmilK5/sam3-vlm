@@ -21,6 +21,12 @@ class Config:
     # --- detection ---
     conf: float = 0.35
     nms_mode: str = "dualgate"
+    gate_mode: str = "dual"  # "dual" (default, unchanged) | "iou_only" | "iom_only": which
+    #     apply_nms_dualgate suppression gate(s) apply. "iou_only" is pure lateral-duplicate
+    #     IoU suppression (no containment check) -- e.g. countbench-style scenes. "iom_only"
+    #     is pure size-guarded containment suppression (no lateral-IoU check) -- e.g. CARPK's
+    #     dense grids of uniform-size objects, where IoU can over-suppress adjacent-but-distinct
+    #     boxes. Only takes effect when nms_mode == "dualgate".
     target_prompt: str = "green fruit"  # concept string for agent Query/TileQuery actions
     overlap_mode: str = "box"  # "box" (default) | "mask": NMS IoU/IoM + cross-pass dedup
     #     measured on instance masks instead of boxes (global passes only; tiled

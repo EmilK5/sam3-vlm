@@ -74,9 +74,14 @@ GROUND_TRUTH_OVERRIDES = {
 
 # Per-dataset UI starting points (overlap "mask" is orchard-specific -> keep "box").
 DATASET_UI_DEFAULTS = {
-    "countbench": dict(overlap_mode="box", conf=0.35),
-    "pixmo": dict(overlap_mode="box", conf=0.35),
-    "carpk": dict(overlap_mode="box", conf=0.45),
+    # gate_mode: countbench/pixmo are varied everyday-object scenes (no dense
+    # uniform-size grids), so IoU-only lateral-duplicate suppression is enough.
+    # CARPK is dense grids of near-identical-size cars, where a lower-scoring but
+    # non-identical box can still be a nested duplicate IoU alone would miss --
+    # IoM containment is the more useful gate there.
+    "countbench": dict(overlap_mode="box", conf=0.35, gate_mode="iou_only"),
+    "pixmo": dict(overlap_mode="box", conf=0.35, gate_mode="iou_only"),
+    "carpk": dict(overlap_mode="box", conf=0.45, gate_mode="iom_only"),
 }
 
 # Local imports that pull torch/transformers/pipeline. Kept after sys.path setup.
@@ -313,12 +318,13 @@ class _ListLogHandler(logging.Handler):
             pass
 
 
-def _build_cfg(prompt, verifier, overlap_mode, conf, budget, query_file):
+def _build_cfg(prompt, verifier, overlap_mode, gate_mode, conf, budget, query_file):
     import dataclasses
     return dataclasses.replace(
         Config(),
         verifier_mode=verifier,
         overlap_mode=overlap_mode,
+        gate_mode=gate_mode,
         conf=float(conf),
         target_prompt=prompt,
         budget_max_actions=int(budget),
@@ -404,7 +410,7 @@ def _classification_tally(graph):
     return tally
 
 
-def run_orchestration(dataset, idx, prompt, policy, verifier, overlap_mode, conf,
+def run_orchestration(dataset, idx, prompt, policy, verifier, overlap_mode, gate_mode, conf,
                       budget, force_tile, use_mock, query_file, mock_true_class):
     """Full-pipeline execution on one image. Returns (image, banner_md, status, verbose)."""
     idx = int(idx)
@@ -421,7 +427,7 @@ def run_orchestration(dataset, idx, prompt, policy, verifier, overlap_mode, conf
         return Image.new("RGB", (640, 400), "#c0392b"), banner, f"ERROR: {err}", err
 
     target = (prompt or "").strip() or default_prompt_for(dataset, raw_prompt)
-    cfg = _build_cfg(target, verifier, overlap_mode, conf, budget, query_file)
+    cfg = _build_cfg(target, verifier, overlap_mode, gate_mode, conf, budget, query_file)
 
     try:
         oracle, query_set = _build_oracle(cfg, verifier, use_mock, mock_true_class)
@@ -440,7 +446,7 @@ def run_orchestration(dataset, idx, prompt, policy, verifier, overlap_mode, conf
     header = [
         "=" * 78,
         f"RUN  dataset={dataset} idx={idx}  policy={policy}  verifier={verifier}"
-        f"  overlap={overlap_mode}  conf={cfg.conf:.2f}  budget={cfg.budget_max_actions}"
+        f"  overlap={overlap_mode}  gate={gate_mode}  conf={cfg.conf:.2f}  budget={cfg.budget_max_actions}"
         f"  force_tile={'on' if force_tile else 'off'}  mock={'on' if use_mock else 'off'}",
         f"TARGET CONCEPT: '{target}'   (raw label: '{raw_prompt}')",
         "=" * 78,
@@ -528,7 +534,8 @@ def on_dataset_change(dataset):
     d = DATASET_UI_DEFAULTS[dataset]
     image, banner, raw, prompt, status, idx = load_sample_view(dataset, 0)
     return (image, banner, raw, prompt, status, idx,
-            gr.update(value=d["conf"]), gr.update(value=d["overlap_mode"]))
+            gr.update(value=d["conf"]), gr.update(value=d["overlap_mode"]),
+            gr.update(value=d["gate_mode"]))
 
 
 # ==========================================
@@ -576,9 +583,13 @@ with gr.Blocks(theme=gr.themes.Soft(), title="SAM3 Orchestration Dashboard") as 
             with gr.Row():
                 overlap_radio = gr.Radio(
                     choices=["box", "mask"], value="box",
-                    label="📐 Overlap metric (NMS IoU/IoM + dedup)")
+                    label="📐 Overlap metric (geometry: boxes vs instance masks)")
                 conf_slider = gr.Slider(
                     minimum=0.10, maximum=0.90, value=0.35, step=0.05, label="🎚️ Detection confidence")
+
+            gate_mode_radio = gr.Radio(
+                choices=["dual", "iou_only", "iom_only"], value="iou_only",
+                label="🎯 NMS suppression gate (dual = IoU+IoM default; pick one per dataset)")
 
             budget_number = gr.Number(value=12, precision=0, label="🔁 Max actions (budget)")
             force_tile_checkbox = gr.Checkbox(
@@ -610,13 +621,13 @@ with gr.Blocks(theme=gr.themes.Soft(), title="SAM3 Orchestration Dashboard") as 
 
     nav_outputs = [image_display, banner_md, raw_prompt_display, prompt_input, status_box, idx_state]
     run_inputs = [dataset_dropdown, idx_state, prompt_input, policy_dropdown, verifier_radio,
-                  overlap_radio, conf_slider, budget_number, force_tile_checkbox, mock_checkbox,
-                  query_file_dropdown, mock_class_dropdown]
+                  overlap_radio, gate_mode_radio, conf_slider, budget_number, force_tile_checkbox,
+                  mock_checkbox, query_file_dropdown, mock_class_dropdown]
     run_outputs = [image_display, banner_md, status_box, verbose_box]
 
     app.load(fn=load_sample_view, inputs=[dataset_dropdown, idx_state], outputs=nav_outputs)
     dataset_dropdown.change(fn=on_dataset_change, inputs=[dataset_dropdown],
-                            outputs=nav_outputs + [conf_slider, overlap_radio])
+                            outputs=nav_outputs + [conf_slider, overlap_radio, gate_mode_radio])
 
     run_button.click(fn=run_orchestration, inputs=run_inputs, outputs=run_outputs)
     prompt_input.submit(fn=run_orchestration, inputs=run_inputs, outputs=run_outputs)

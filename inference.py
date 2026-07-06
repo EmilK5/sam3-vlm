@@ -133,10 +133,20 @@ def apply_nms_dualgate(boxes, scores, confidence,
                        max_concentric_offset_ratio=0.43,
                        use_concentric=False,
                        return_indices=False,
-                       masks=None):
+                       masks=None,
+                       gate_mode="dual"):
     """
     Dual-Gate NMS for the citrus pipeline. Ported from the PixMo/CountBench engine
     and re-tuned for small, same-color, clustered fruit.
+
+    gate_mode: additive, backward-compatible. "dual" (default) keeps Gate A (IoU)
+    OR Gate B (IoM containment) exactly as before -- byte-identical to the
+    original behavior. "iou_only" disables Gate B (pure lateral-duplicate IoU
+    suppression). "iom_only" disables Gate A (pure size-guarded containment
+    suppression, no lateral-IoU check) -- useful for datasets like CARPK where
+    uniform-size objects sit in dense grids and IoU alone can over-suppress
+    adjacent-but-distinct boxes. The concentric sub-gate (opt-in) still adds to
+    whichever gate is active.
 
     Gate A (IoU): lateral-duplicate suppression. Held at the citrus-validated 0.40
                   so swapping IoU->dual-gate is a *controlled, additive* change and
@@ -231,7 +241,12 @@ def apply_nms_dualgate(boxes, scores, confidence,
 
         iou_violation = iou > iou_threshold
         containment_violation = (iom > iom_threshold) & (size_ratio >= min_size_ratio_for_containment)
-        suppress = iou_violation | containment_violation
+        if gate_mode == "iou_only":
+            suppress = iou_violation
+        elif gate_mode == "iom_only":
+            suppress = containment_violation
+        else:
+            suppress = iou_violation | containment_violation
 
         # --- OPT-IN concentric sub-gate (recall-risky on small clustered fruit) ---
         if use_concentric:

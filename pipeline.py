@@ -459,7 +459,7 @@ def tiled_engine(processor, image_pil, confidence, clahe, prompt, pos_boxes=None
 
 def execute_pass(processor, image_pil, graph, conf, clahe, tiling, pass_number, prompt,
                  disable_size_filter=False, nms_mode="dualgate", use_concentric=False,
-                 cfg=None, oracle=None, query_set=None, roi_override=None):
+                 gate_mode="dual", cfg=None, oracle=None, query_set=None, roi_override=None):
     """
     Runs one full pass of SAM3 pipeline
     Propose -> Register -> Verify -> Feedback
@@ -467,6 +467,10 @@ def execute_pass(processor, image_pil, graph, conf, clahe, tiling, pass_number, 
     nms_mode:
         "iou"      -> baseline cv2 IoU NMS (the validated 0.74/0.75 reference)
         "dualgate" -> IoU + size-guarded IoM containment NMS (default)
+    gate_mode: forwarded to apply_nms_dualgate when nms_mode=="dualgate" (ignored
+        otherwise). "dual" (default, unchanged) | "iou_only" | "iom_only" -- lets a
+        caller pick a single suppression criterion per dataset (e.g. "iou_only" for
+        countbench-style scenes, "iom_only" for CARPK's dense uniform-size grids).
     use_concentric: forwarded to the dual-gate concentric sub-gate (default OFF;
         only the harness/ablation should turn it on).
 
@@ -589,12 +593,12 @@ def execute_pass(processor, image_pil, graph, conf, clahe, tiling, pass_number, 
             # return_indices lets us keep the survivors' masks aligned.
             roi_boxes_final, roi_scores_final, keep_idx = inference.apply_nms_dualgate(
                 all_boxes, all_scores, conf, use_concentric=use_concentric,
-                masks=candidate_masks, return_indices=True
+                masks=candidate_masks, return_indices=True, gate_mode=gate_mode
             )
             kept_masks = [candidate_masks[int(k)] for k in keep_idx]
         else:
             roi_boxes_final, roi_scores_final = inference.apply_nms_dualgate(
-                all_boxes, all_scores, conf, use_concentric=use_concentric
+                all_boxes, all_scores, conf, use_concentric=use_concentric, gate_mode=gate_mode
             )
     else:
         roi_boxes_final, roi_scores_final = inference.apply_nms(all_boxes, all_scores, conf)

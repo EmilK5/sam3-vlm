@@ -253,11 +253,12 @@ class _ListLogHandler(logging.Handler):
             pass
 
 
-def _build_cfg(prompt, verifier, overlap_mode, conf, budget, query_file, enable_thinking):
+def _build_cfg(prompt, verifier, overlap_mode, gate_mode, conf, budget, query_file, enable_thinking):
     return dataclasses.replace(
         Config(),
         verifier_mode=verifier,
         overlap_mode=overlap_mode,
+        gate_mode=gate_mode,
         conf=float(conf),
         target_prompt=prompt,
         budget_max_actions=int(budget),
@@ -328,7 +329,7 @@ def _classification_tally(graph):
     return tally
 
 
-def run_orchestration(split, idx, prompt, policy, verifier, overlap_mode, conf,
+def run_orchestration(split, idx, prompt, policy, verifier, overlap_mode, gate_mode, conf,
                       budget, enable_thinking, use_mock, query_file, mock_true_class):
     """Full-pipeline episode on one dataset image. Returns (sam3_view, gt_view, status, verbose)."""
     idx = int(idx)
@@ -351,7 +352,7 @@ def run_orchestration(split, idx, prompt, policy, verifier, overlap_mode, conf,
                 "Run this app on the GPU box with the SAM3 repo present.")
 
     target = (prompt or "").strip() or DEFAULT_PROMPT
-    cfg = _build_cfg(target, verifier, overlap_mode, conf, budget, query_file, enable_thinking)
+    cfg = _build_cfg(target, verifier, overlap_mode, gate_mode, conf, budget, query_file, enable_thinking)
 
     try:
         oracle, query_set = _build_oracle(cfg, verifier, use_mock, mock_true_class)
@@ -371,7 +372,7 @@ def run_orchestration(split, idx, prompt, policy, verifier, overlap_mode, conf,
     header = [
         "=" * 78,
         f"RUN  dataset=citrus split={split} idx={idx}  policy={policy}  verifier={verifier}"
-        f"  overlap={overlap_mode}  conf={cfg.conf:.2f}  budget={cfg.budget_max_actions}"
+        f"  overlap={overlap_mode}  gate={gate_mode}  conf={cfg.conf:.2f}  budget={cfg.budget_max_actions}"
         f"  thinking={'on' if enable_thinking else 'off'}  mock={'on' if use_mock else 'off'}",
         f"TARGET CONCEPT: '{target}'   IMAGE: {os.path.basename(sample['image_path'])}",
         "=" * 78,
@@ -508,10 +509,14 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Citrus Orchestration Sandbox") as 
             with gr.Row():
                 overlap_radio = gr.Radio(
                     choices=["box", "mask"], value="box",
-                    label="\U0001f4d0 Overlap metric (NMS IoU/IoM + dedup)")
+                    label="\U0001f4d0 Overlap metric (geometry: boxes vs instance masks)")
                 conf_slider = gr.Slider(
                     minimum=0.10, maximum=0.90, value=Config().conf, step=0.05,
                     label="\U0001f39a️ Detection confidence")
+
+            gate_mode_radio = gr.Radio(
+                choices=["dual", "iou_only", "iom_only"], value=Config().gate_mode,
+                label="\U0001f3af NMS suppression gate (dual = IoU+IoM default; pick one per dataset)")
 
             budget_number = gr.Number(value=Config().budget_max_actions, precision=0,
                                       label="\U0001f501 Max actions (budget)")
@@ -542,8 +547,8 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Citrus Orchestration Sandbox") as 
 
     nav_outputs = [sam3_display, gt_display, banner_md, status_box, idx_state]
     run_inputs = [split_dropdown, idx_state, prompt_input, policy_dropdown, verifier_radio,
-                  overlap_radio, conf_slider, budget_number, thinking_checkbox, mock_checkbox,
-                  query_file_dropdown, mock_class_dropdown]
+                  overlap_radio, gate_mode_radio, conf_slider, budget_number, thinking_checkbox,
+                  mock_checkbox, query_file_dropdown, mock_class_dropdown]
     run_outputs = [sam3_display, gt_display, status_box, verbose_box]
 
     app.load(fn=load_sample_view, inputs=[split_dropdown, idx_state], outputs=nav_outputs)
