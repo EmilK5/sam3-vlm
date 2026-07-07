@@ -127,10 +127,23 @@ def test_tile_still_maps_to_tileA():
     assert isinstance(action, TileQueryA) and action.conf == 0.3
 
 
+def test_tile_conf_as_json_string_still_maps_to_tileA():
+    action = _choose('{"action": "tile", "args": {"conf": "0.3"}}', _fixture())
+    assert isinstance(action, TileQueryA) and action.conf == 0.3
+
+
 def test_verify_still_maps_to_verifyA():
     fx = _fixture()
     unresolved_id = fx[4]
     action = _choose(json.dumps({"action": "verify", "args": {"node_ids": [unresolved_id]}}), fx)
+    assert isinstance(action, VerifyA) and action.node_ids == [unresolved_id]
+
+
+def test_verify_node_ids_as_json_string_still_maps_to_verifyA():
+    fx = _fixture()
+    unresolved_id = fx[4]
+    content = json.dumps({"action": "verify", "args": {"node_ids": json.dumps([unresolved_id])}})
+    action = _choose(content, fx)
     assert isinstance(action, VerifyA) and action.node_ids == [unresolved_id]
 
 

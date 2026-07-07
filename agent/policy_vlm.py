@@ -163,7 +163,22 @@ def _build_messages(phi, z, graph, cfg, image=None):
 
 # ----------------------- strict validation -----------------------
 
+def _coerce_json_string(value):
+    """Some local VLMs (observed with Qwen3-VL via Ollama) stringify nested JSON
+    values, e.g. "conf": "0.3" or "region": "[x1,y1,x2,y2]" instead of emitting a
+    real number/array. If `value` is a string, try to parse it as JSON and return
+    the parsed value; otherwise (or on parse failure) return `value` unchanged so
+    downstream type checks still fail closed."""
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return value
+
+
 def _valid_conf(c):
+    c = _coerce_json_string(c)
     return isinstance(c, (int, float)) and not isinstance(c, bool) and 0.1 <= c <= 0.9
 
 
@@ -172,6 +187,7 @@ def _valid_prompt(p, target):
 
 
 def _valid_node_ids(ids, graph, cfg):
+    ids = _coerce_json_string(ids)
     if not isinstance(ids, list) or not ids:
         return False
     tau_w = getattr(cfg, "tau_w", 0.5)
@@ -192,13 +208,7 @@ def _validate_look(region, image):
     actions.execute; here we only reject out-of-frame or malformed boxes."""
     if image is None:
         return None
-    if isinstance(region, str):
-        # Some local VLMs (observed with Qwen3-VL via Ollama) stringify nested
-        # JSON values, e.g. "region": "[x1,y1,x2,y2]" instead of a real array.
-        try:
-            region = json.loads(region)
-        except json.JSONDecodeError:
-            return None
+    region = _coerce_json_string(region)
     if not isinstance(region, (list, tuple)) or len(region) != 4:
         return None
     if not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in region):
@@ -236,7 +246,7 @@ def _parse_and_validate(content, graph, cfg, image):
     if name == "verify":
         if getattr(cfg, "verifier_mode", "ioc") != "vip":
             return None  # verify is only legal with the FM+V-IP oracle configured
-        node_ids = args.get("node_ids")
+        node_ids = _coerce_json_string(args.get("node_ids"))
         if not _valid_node_ids(node_ids, graph, cfg):
             return None
         return VerifyA(node_ids=list(node_ids))
