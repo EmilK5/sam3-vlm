@@ -188,6 +188,54 @@ def test_nms_thresholds_forwarded_to_execute_pass():
     assert captured["nms_iom_threshold"] == 0.75
 
 
+def test_verifier_label_tags_cross_pass_dedup():
+    cfg = dataclasses.replace(Config(), cross_pass_dedup_metric="iom",
+                             cross_pass_dedup_threshold=0.85)
+    assert run_eval.verifier_label(cfg) == "ioc+dedup-iom0.85"
+    assert run_eval.verifier_label(Config()) == "ioc"  # defaults (iou/0.40) -> no tag
+
+
+def test_cross_pass_dedup_forwarded_to_execute_pass():
+    captured = {}
+
+    def fn(**kw):
+        captured["cross_pass_dedup_metric"] = kw.get("cross_pass_dedup_metric")
+        captured["cross_pass_dedup_threshold"] = kw.get("cross_pass_dedup_threshold")
+        graph, pass_number = kw["graph"], kw["pass_number"]
+        nid = graph.add_candidate([0, 0, 5, 5], 0.9, found_in_pass=pass_number)
+        graph.nodes[nid].classification = "fruit"
+        return _FakeStats(1, n_sam_calls=1)
+
+    cfg = dataclasses.replace(Config(), cross_pass_dedup_metric="iom",
+                             cross_pass_dedup_threshold=0.85)
+    run_eval.run_policy("oneshot", processor=None, image_pil=None, cfg=cfg,
+                        oracle=None, query_set=None, prompt="car", conf=0.45,
+                        execute_pass_fn=fn)
+    assert captured["cross_pass_dedup_metric"] == "iom"
+    assert captured["cross_pass_dedup_threshold"] == 0.85
+
+
+def test_dedup_defaults_match_validated_reference_values():
+    """Sanity-lock DEDUP_DEFAULTS against the validated reference sandbox.py's
+    DATASET_UI_DEFAULTS (dedup_iou/use_iom per dataset) -- a typo here silently
+    changes what --dedup-metric=auto resolves to."""
+    assert run_eval.DEDUP_DEFAULTS["local"] == {"metric": "iou", "threshold": 0.40}
+    assert run_eval.DEDUP_DEFAULTS["pixmo"] == {"metric": "iou", "threshold": 0.65}
+    assert run_eval.DEDUP_DEFAULTS["countbench"] == {"metric": "iou", "threshold": 0.60}
+    assert run_eval.DEDUP_DEFAULTS["carpk"] == {"metric": "iom", "threshold": 0.85}
+
+
+def test_parse_args_dedup_flags_default_auto_and_none():
+    args = run_eval.parse_args(["--root", "r", "--fmt", "yolo", "--policy", "oneshot", "--out", "x.csv"])
+    assert args.dedup_metric == "auto" and args.dedup_threshold is None
+
+
+def test_parse_args_dedup_flags_explicit():
+    args = run_eval.parse_args(["--dataset", "carpk", "--policy", "oneshot",
+                                "--dedup-metric", "iom", "--dedup-threshold", "0.85", "--out", "x.csv"])
+    assert args.dedup_metric == "iom" and args.dedup_threshold == 0.85
+
+
 def test_parse_args_iou_iom_threshold_default_none():
     args = run_eval.parse_args(["--root", "r", "--fmt", "yolo", "--policy", "oneshot", "--out", "x.csv"])
     assert args.iou_threshold is None and args.iom_threshold is None

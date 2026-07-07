@@ -73,3 +73,39 @@ def test_execute_pass_forwards_nms_thresholds_to_apply_nms_dualgate(pipeline_mod
     assert captured["iou_threshold"] == 0.22
     assert captured["iom_threshold"] == 0.77
     assert captured["gate_mode"] == "iom_only"
+
+
+def test_execute_pass_forwards_cross_pass_dedup_settings(pipeline_module, monkeypatch):
+    """execute_pass's cross_pass_dedup_metric/_threshold must reach
+    register_and_verify_candidates as dedup_metric/iou_threshold -- a
+    DIFFERENT mechanism from the intra-pass nms_iou_threshold/nms_iom_threshold
+    covered above (inter-pass dedup vs. intra-pass NMS)."""
+    from graph import OrchardGraph
+    from PIL import Image
+    from config import Config
+
+    captured = {}
+
+    def _fake_global_engine(processor, img, conf, prompt, pos_boxes=None, neg_boxes=None,
+                           disable_size_filter=False, return_masks=False):
+        return np.array([[0.0, 0.0, 10.0, 10.0]]), np.array([0.9])
+
+    def _fake_register(candidate_boxes, candidate_scores, leaf_boxes, graph, pass_number,
+                       iou_threshold=0.40, dedup_metric="iou", **kw):
+        captured["iou_threshold"] = iou_threshold
+        captured["dedup_metric"] = dedup_metric
+        return 1, 0
+
+    monkeypatch.setattr(pipeline_module, "global_engine", _fake_global_engine)
+    monkeypatch.setattr(pipeline_module, "register_and_verify_candidates", _fake_register)
+
+    graph = OrchardGraph()
+    img = Image.new("RGB", (64, 64))
+    pipeline_module.execute_pass(
+        processor=None, image_pil=img, graph=graph, conf=0.35, clahe=False,
+        tiling=False, pass_number=1, prompt="car", cfg=Config(), use_canopy_roi=False,
+        cross_pass_dedup_metric="iom", cross_pass_dedup_threshold=0.85,
+    )
+
+    assert captured["iou_threshold"] == 0.85
+    assert captured["dedup_metric"] == "iom"

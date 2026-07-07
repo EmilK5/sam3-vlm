@@ -254,7 +254,7 @@ class _ListLogHandler(logging.Handler):
 
 
 def _build_cfg(prompt, verifier, overlap_mode, gate_mode, iou_threshold, iom_threshold,
-               conf, budget, query_file, enable_thinking):
+               dedup_metric, dedup_threshold, conf, budget, query_file, enable_thinking):
     return dataclasses.replace(
         Config(),
         verifier_mode=verifier,
@@ -262,6 +262,8 @@ def _build_cfg(prompt, verifier, overlap_mode, gate_mode, iou_threshold, iom_thr
         gate_mode=gate_mode,
         nms_iou_threshold=float(iou_threshold),
         nms_iom_threshold=float(iom_threshold),
+        cross_pass_dedup_metric=dedup_metric,
+        cross_pass_dedup_threshold=float(dedup_threshold),
         conf=float(conf),
         target_prompt=prompt,
         budget_max_actions=int(budget),
@@ -333,8 +335,8 @@ def _classification_tally(graph):
 
 
 def run_orchestration(split, idx, prompt, policy, verifier, overlap_mode, gate_mode,
-                      iou_threshold, iom_threshold, conf, budget, enable_thinking, use_mock,
-                      query_file, mock_true_class):
+                      iou_threshold, iom_threshold, dedup_metric, dedup_threshold, conf,
+                      budget, enable_thinking, use_mock, query_file, mock_true_class):
     """Full-pipeline episode on one dataset image. Returns (sam3_view, gt_view, status, verbose)."""
     idx = int(idx)
     samples = get_samples(split)
@@ -357,7 +359,7 @@ def run_orchestration(split, idx, prompt, policy, verifier, overlap_mode, gate_m
 
     target = (prompt or "").strip() or DEFAULT_PROMPT
     cfg = _build_cfg(target, verifier, overlap_mode, gate_mode, iou_threshold, iom_threshold,
-                     conf, budget, query_file, enable_thinking)
+                     dedup_metric, dedup_threshold, conf, budget, query_file, enable_thinking)
 
     try:
         oracle, query_set = _build_oracle(cfg, verifier, use_mock, mock_true_class)
@@ -377,8 +379,9 @@ def run_orchestration(split, idx, prompt, policy, verifier, overlap_mode, gate_m
     header = [
         "=" * 78,
         f"RUN  dataset=citrus split={split} idx={idx}  policy={policy}  verifier={verifier}"
-        f"  overlap={overlap_mode}  gate={gate_mode} (iou_t={cfg.nms_iou_threshold:.2f} "
-        f"iom_t={cfg.nms_iom_threshold:.2f})  conf={cfg.conf:.2f}  budget={cfg.budget_max_actions}"
+        f"  overlap={overlap_mode}  nms_gate={gate_mode} (iou_t={cfg.nms_iou_threshold:.2f} "
+        f"iom_t={cfg.nms_iom_threshold:.2f})  dedup={cfg.cross_pass_dedup_metric}@"
+        f"{cfg.cross_pass_dedup_threshold:.2f}  conf={cfg.conf:.2f}  budget={cfg.budget_max_actions}"
         f"  thinking={'on' if enable_thinking else 'off'}  mock={'on' if use_mock else 'off'}",
         f"TARGET CONCEPT: '{target}'   IMAGE: {os.path.basename(sample['image_path'])}",
         "=" * 78,
@@ -532,6 +535,17 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Citrus Orchestration Sandbox") as 
                     minimum=0.05, maximum=0.95, value=Config().nms_iom_threshold, step=0.05,
                     label="Gate B: IoM threshold")
 
+            gr.Markdown("**Cross-pass dedup** (is this box the same object as one already "
+                       "registered from an earlier pass/tile? distinct from, and more "
+                       "consequential than, the NMS gate above)")
+            with gr.Row():
+                dedup_metric_radio = gr.Radio(
+                    choices=["iou", "iom"], value=Config().cross_pass_dedup_metric,
+                    label="Metric")
+                dedup_threshold_slider = gr.Slider(
+                    minimum=0.10, maximum=0.95, value=Config().cross_pass_dedup_threshold, step=0.05,
+                    label="Threshold")
+
             budget_number = gr.Number(value=Config().budget_max_actions, precision=0,
                                       label="\U0001f501 Max actions (budget)")
             thinking_checkbox = gr.Checkbox(
@@ -562,8 +576,8 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Citrus Orchestration Sandbox") as 
     nav_outputs = [sam3_display, gt_display, banner_md, status_box, idx_state]
     run_inputs = [split_dropdown, idx_state, prompt_input, policy_dropdown, verifier_radio,
                   overlap_radio, gate_mode_radio, iou_threshold_slider, iom_threshold_slider,
-                  conf_slider, budget_number, thinking_checkbox, mock_checkbox,
-                  query_file_dropdown, mock_class_dropdown]
+                  dedup_metric_radio, dedup_threshold_slider, conf_slider, budget_number,
+                  thinking_checkbox, mock_checkbox, query_file_dropdown, mock_class_dropdown]
     run_outputs = [sam3_display, gt_display, status_box, verbose_box]
 
     app.load(fn=load_sample_view, inputs=[split_dropdown, idx_state], outputs=nav_outputs)

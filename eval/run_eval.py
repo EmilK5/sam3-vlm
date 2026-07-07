@@ -18,10 +18,19 @@ episodes are metered on the same scale.
 The sweep is resume-safe (skips image/policy/verifier rows already in the CSV)
 and uses a fixed numpy seed per image for reproducibility.
 
---gate-mode picks which apply_nms_dualgate suppression criterion applies (dual
-default | iou_only | iom_only); --iou-threshold/--iom-threshold tune the actual
-Gate A/Gate B thresholds (defaults 0.40/0.90) regardless of which gate(s) are
-active; --force-tile makes the first sensing pass tiled regardless of policy;
+Two SEPARATE IoU/IoM axes, easy to conflate:
+  - --gate-mode/--iou-threshold/--iom-threshold: INTRA-pass NMS
+    (apply_nms_dualgate) -- deduping multiple detections from the SAME SAM3
+    call. 'dual' (default) ORs Gate A (IoU, default 0.40) and Gate B (IoM
+    containment, default 0.90).
+  - --dedup-metric/--dedup-threshold: INTER-pass dedup
+    (register_and_verify_candidates) -- deciding whether a box just detected is
+    the same object as one already registered from an earlier pass/tile. This
+    is the more consequential knob; 'auto' (default) resolves validated
+    per-dataset starting points (see DEDUP_DEFAULTS): iou@0.40 for local
+    (citrus baseline), iou@0.65 for pixmo, iou@0.60 for countbench, iom@0.85
+    for carpk's dense uniform-size grids.
+--force-tile makes the first sensing pass tiled regardless of policy;
 --canopy-roi controls whether the "tree canopy" SAM3 sweep runs before sensing
 at all ('auto' default: on for --dataset local, off for pixmo/countbench/carpk,
 which have no canopy concept). All of these are folded into the CSV "verifier"
@@ -58,6 +67,20 @@ logger = logging.getLogger(__name__)
 FIXED_PASS_POLICIES = {"cascade": 4, "tiled": 4}
 AGENT_POLICIES = {"heuristic", "vlm"}
 CONVERGENCE_MAX_PASSES = 8
+
+# --dedup-metric/--dedup-threshold "auto" resolution: validated starting points
+# for pipeline.execute_pass's cross_pass_dedup_metric/_threshold (the inter-pass
+# dedup gate -- NOT the intra-pass NMS gate_mode/nms_iou_threshold/nms_iom_threshold
+# above). pixmo/countbench are sparse/varied scenes (plain IoU suffices); carpk is
+# dense uniform-size grids where a tight vs. loose detection of the same car can
+# have very different areas, so IoM (Intersection over Minimum) merges them
+# correctly where IoU would under-merge. "local" keeps the citrus baseline.
+DEDUP_DEFAULTS = {
+    "local": {"metric": "iou", "threshold": 0.40},
+    "pixmo": {"metric": "iou", "threshold": 0.65},
+    "countbench": {"metric": "iou", "threshold": 0.60},
+    "carpk": {"metric": "iom", "threshold": 0.85},
+}
 
 CSV_FIELDS = [
     "image", "dataset", "policy", "verifier", "prompt", "N_gt", "N_obs", "N_supp", "N_cons",
@@ -96,6 +119,10 @@ def verifier_label(cfg, force_tile=False) -> str:
     iom_t = getattr(cfg, "nms_iom_threshold", 0.90)
     if iom_t != 0.90:
         tag += f"+iom{iom_t:g}"
+    dedup_metric = getattr(cfg, "cross_pass_dedup_metric", "iou")
+    dedup_t = getattr(cfg, "cross_pass_dedup_threshold", 0.40)
+    if dedup_metric != "iou" or dedup_t != 0.40:
+        tag += f"+dedup-{dedup_metric}{dedup_t:g}"
     if not getattr(cfg, "use_canopy_roi", True):
         tag += "+nocanopy"
     if force_tile:
@@ -133,6 +160,8 @@ def _run_fixed_policy(policy, processor, image_pil, cfg, oracle, query_set, prom
     use_canopy_roi = getattr(cfg, "use_canopy_roi", True)
     nms_iou_threshold = getattr(cfg, "nms_iou_threshold", 0.40)
     nms_iom_threshold = getattr(cfg, "nms_iom_threshold", 0.90)
+    cross_pass_dedup_metric = getattr(cfg, "cross_pass_dedup_metric", "iou")
+    cross_pass_dedup_threshold = getattr(cfg, "cross_pass_dedup_threshold", 0.40)
 
     def do_pass(pass_number, tiling):
         stats = execute_pass_fn(
@@ -141,6 +170,8 @@ def _run_fixed_policy(policy, processor, image_pil, cfg, oracle, query_set, prom
             cfg=cfg, oracle=oracle, query_set=query_set, gate_mode=gate_mode,
             use_canopy_roi=use_canopy_roi, nms_iou_threshold=nms_iou_threshold,
             nms_iom_threshold=nms_iom_threshold,
+            cross_pass_dedup_metric=cross_pass_dedup_metric,
+            cross_pass_dedup_threshold=cross_pass_dedup_threshold,
         )
         # Meter from the pass's actual call counts (canopy + leaf map + proposal
         # in n_sam_calls; tiles; real vip oracle calls) — same scale as episodes.
@@ -462,6 +493,19 @@ def parse_args(argv=None):
                         help="Gate B (IoM containment) threshold for apply_nms_dualgate "
                              "(default 0.90). Ignored when --gate-mode=iou_only or "
                              "nms_mode=='iou'.")
+    parser.add_argument("--dedup-metric", choices=["auto", "iou", "iom"], default="auto",
+                        help="Cross-pass dedup metric (pipeline.register_and_verify_candidates): "
+                             "decides whether a box just detected is the same object as one "
+                             "already registered from an earlier pass/tile. This is the more "
+                             "consequential IoU/IoM knob -- distinct from --gate-mode/"
+                             "--iou-threshold/--iom-threshold above, which only govern intra-pass "
+                             "NMS on a single SAM3 call's candidates. 'auto' (default): iou for "
+                             "--dataset local/pixmo/countbench, iom for carpk (validated). "
+                             "'iou'/'iom' force it regardless of dataset.")
+    parser.add_argument("--dedup-threshold", type=float, default=None,
+                        help="Threshold for --dedup-metric. Default (None): auto-resolved per "
+                             "dataset -- 0.40 for local, 0.65 for pixmo, 0.60 for countbench, "
+                             "0.85 for carpk (validated starting points).")
     parser.add_argument("--prompt", default=None,
                         help="Target concept. --dataset local: the fixed concept for every "
                              "image (default 'green fruit'). Count-only datasets: overrides "
@@ -565,11 +609,19 @@ def main():
         use_canopy_roi = args.dataset == "local"
     else:
         use_canopy_roi = args.canopy_roi == "on"
+
+    dataset_defaults = DEDUP_DEFAULTS[args.dataset]
+    dedup_metric = dataset_defaults["metric"] if args.dedup_metric == "auto" else args.dedup_metric
+    dedup_threshold = (dataset_defaults["threshold"] if args.dedup_threshold is None
+                       else args.dedup_threshold)
+
     # Agent policies read the concept/confidence from cfg (fixed policies get them
     # as arguments); evaluate_image overrides target_prompt per-sample, so this is
-    # just the shared baseline. --overlap-mode/--gate-mode/--canopy-roi apply everywhere.
+    # just the shared baseline. --overlap-mode/--gate-mode/--canopy-roi/--dedup-*
+    # apply everywhere.
     cfg_kwargs = dict(conf=conf, overlap_mode=args.overlap_mode, gate_mode=args.gate_mode,
-                     use_canopy_roi=use_canopy_roi)
+                     use_canopy_roi=use_canopy_roi, cross_pass_dedup_metric=dedup_metric,
+                     cross_pass_dedup_threshold=dedup_threshold)
     if args.iou_threshold is not None:
         cfg_kwargs["nms_iou_threshold"] = args.iou_threshold
     if args.iom_threshold is not None:
@@ -577,8 +629,11 @@ def main():
     cfg = dataclasses.replace(cfg, **cfg_kwargs)
     logger.info("canopy ROI %s (--canopy-roi=%s, dataset=%s)",
                "enabled" if use_canopy_roi else "disabled", args.canopy_roi, args.dataset)
-    logger.info("NMS gate=%s iou_threshold=%.3f iom_threshold=%.3f",
+    logger.info("intra-pass NMS gate=%s iou_threshold=%.3f iom_threshold=%.3f",
                cfg.gate_mode, cfg.nms_iou_threshold, cfg.nms_iom_threshold)
+    logger.info("cross-pass dedup metric=%s threshold=%.3f (--dedup-metric=%s --dedup-threshold=%s)",
+               cfg.cross_pass_dedup_metric, cfg.cross_pass_dedup_threshold,
+               args.dedup_metric, args.dedup_threshold)
 
     # Load SAM3 once (real run). Imported lazily so this module stays torch-free.
     import torch

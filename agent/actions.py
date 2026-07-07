@@ -157,6 +157,8 @@ def _execute_query(action, ctx, tiling, roi_override) -> int:
     use_canopy_roi = getattr(ctx.cfg, "use_canopy_roi", True)
     nms_iou_threshold = getattr(ctx.cfg, "nms_iou_threshold", 0.40)
     nms_iom_threshold = getattr(ctx.cfg, "nms_iom_threshold", 0.90)
+    cross_pass_dedup_metric = getattr(ctx.cfg, "cross_pass_dedup_metric", "iou")
+    cross_pass_dedup_threshold = getattr(ctx.cfg, "cross_pass_dedup_threshold", 0.40)
     stats = execute_pass(
         processor=ctx.processor, image_pil=ctx.image_pil, graph=ctx.graph,
         conf=action.conf, clahe=False, tiling=tiling,
@@ -165,6 +167,8 @@ def _execute_query(action, ctx, tiling, roi_override) -> int:
         roi_override=roi_override, nms_mode=nms_mode, gate_mode=gate_mode,
         use_canopy_roi=use_canopy_roi, nms_iou_threshold=nms_iou_threshold,
         nms_iom_threshold=nms_iom_threshold,
+        cross_pass_dedup_metric=cross_pass_dedup_metric,
+        cross_pass_dedup_threshold=cross_pass_dedup_threshold,
     )
     ctx.n_passes = pass_number
     _meter_query(ctx, stats)

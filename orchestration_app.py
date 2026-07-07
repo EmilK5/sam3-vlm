@@ -52,15 +52,31 @@ if SAM3_REPO_ROOT not in sys.path:
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 # Per-dataset UI starting points (overlap "mask" is orchard-specific -> keep "box").
+#
+# Two SEPARATE IoU/IoM axes -- easy to conflate:
+#   - gate_mode/nms_iou_threshold/nms_iom_threshold: INTRA-pass NMS, deduping
+#     multiple detections from the SAME SAM3 call. The validated reference
+#     (sandbox.py's inference.apply_nms) always ORs both gates at high, barely-
+#     engaging thresholds (0.95/0.95) -- so this stays "dual" here, not
+#     iou_only/iom_only, matching that reference exactly.
+#   - cross_pass_dedup_metric/cross_pass_dedup_threshold: INTER-pass dedup,
+#     deciding whether a box just found is the same object as one already
+#     registered from an earlier pass/tile. This is the knob that actually
+#     mattered in the validated reference: sparse/varied scenes (pixmo/
+#     countbench) use plain IoU at a moderate threshold; CARPK's dense
+#     uniform-size grids use IoM (Intersection over Minimum), which correctly
+#     merges a tight vs. loose detection of the same car where IoU alone
+#     would under-merge.
 DATASET_UI_DEFAULTS = {
-    # gate_mode: countbench/pixmo are varied everyday-object scenes (no dense
-    # uniform-size grids), so IoU-only lateral-duplicate suppression is enough.
-    # CARPK is dense grids of near-identical-size cars, where a lower-scoring but
-    # non-identical box can still be a nested duplicate IoU alone would miss --
-    # IoM containment is the more useful gate there.
-    "countbench": dict(overlap_mode="box", conf=0.35, gate_mode="iou_only"),
-    "pixmo": dict(overlap_mode="box", conf=0.35, gate_mode="iou_only"),
-    "carpk": dict(overlap_mode="box", conf=0.45, gate_mode="iom_only"),
+    "countbench": dict(overlap_mode="box", conf=0.35, gate_mode="dual",
+                       nms_iou_threshold=0.95, nms_iom_threshold=0.95,
+                       cross_pass_dedup_metric="iou", cross_pass_dedup_threshold=0.60),
+    "pixmo": dict(overlap_mode="box", conf=0.35, gate_mode="dual",
+                 nms_iou_threshold=0.95, nms_iom_threshold=0.95,
+                 cross_pass_dedup_metric="iou", cross_pass_dedup_threshold=0.65),
+    "carpk": dict(overlap_mode="box", conf=0.45, gate_mode="dual",
+                 nms_iou_threshold=0.95, nms_iom_threshold=0.95,
+                 cross_pass_dedup_metric="iom", cross_pass_dedup_threshold=0.85),
 }
 
 # Local imports that pull torch/transformers/pipeline. Kept after sys.path setup.
@@ -197,7 +213,7 @@ class _ListLogHandler(logging.Handler):
 
 
 def _build_cfg(prompt, verifier, overlap_mode, gate_mode, iou_threshold, iom_threshold,
-               conf, budget, query_file):
+               dedup_metric, dedup_threshold, conf, budget, query_file):
     import dataclasses
     return dataclasses.replace(
         Config(),
@@ -206,6 +222,8 @@ def _build_cfg(prompt, verifier, overlap_mode, gate_mode, iou_threshold, iom_thr
         gate_mode=gate_mode,
         nms_iou_threshold=float(iou_threshold),
         nms_iom_threshold=float(iom_threshold),
+        cross_pass_dedup_metric=dedup_metric,
+        cross_pass_dedup_threshold=float(dedup_threshold),
         conf=float(conf),
         target_prompt=prompt,
         budget_max_actions=int(budget),
@@ -299,8 +317,8 @@ def _classification_tally(graph):
 
 
 def run_orchestration(dataset, idx, prompt, policy, verifier, overlap_mode, gate_mode,
-                      iou_threshold, iom_threshold, conf, budget, force_tile, use_mock,
-                      query_file, mock_true_class):
+                      iou_threshold, iom_threshold, dedup_metric, dedup_threshold, conf,
+                      budget, force_tile, use_mock, query_file, mock_true_class):
     """Full-pipeline execution on one image. Returns (image, banner_md, status, verbose)."""
     idx = int(idx)
     if PROCESSOR is None:
@@ -317,7 +335,7 @@ def run_orchestration(dataset, idx, prompt, policy, verifier, overlap_mode, gate
 
     target = (prompt or "").strip() or default_prompt_for(dataset, raw_prompt)
     cfg = _build_cfg(target, verifier, overlap_mode, gate_mode, iou_threshold, iom_threshold,
-                     conf, budget, query_file)
+                     dedup_metric, dedup_threshold, conf, budget, query_file)
 
     try:
         oracle, query_set = _build_oracle(cfg, verifier, use_mock, mock_true_class)
@@ -336,8 +354,9 @@ def run_orchestration(dataset, idx, prompt, policy, verifier, overlap_mode, gate
     header = [
         "=" * 78,
         f"RUN  dataset={dataset} idx={idx}  policy={policy}  verifier={verifier}"
-        f"  overlap={overlap_mode}  gate={gate_mode} (iou_t={cfg.nms_iou_threshold:.2f} "
-        f"iom_t={cfg.nms_iom_threshold:.2f})  conf={cfg.conf:.2f}  budget={cfg.budget_max_actions}"
+        f"  overlap={overlap_mode}  nms_gate={gate_mode} (iou_t={cfg.nms_iou_threshold:.2f} "
+        f"iom_t={cfg.nms_iom_threshold:.2f})  dedup={cfg.cross_pass_dedup_metric}@"
+        f"{cfg.cross_pass_dedup_threshold:.2f}  conf={cfg.conf:.2f}  budget={cfg.budget_max_actions}"
         f"  force_tile={'on' if force_tile else 'off'}  mock={'on' if use_mock else 'off'}",
         f"TARGET CONCEPT: '{target}'   (raw label: '{raw_prompt}')",
         "=" * 78,
@@ -426,7 +445,9 @@ def on_dataset_change(dataset):
     image, banner, raw, prompt, status, idx = load_sample_view(dataset, 0)
     return (image, banner, raw, prompt, status, idx,
             gr.update(value=d["conf"]), gr.update(value=d["overlap_mode"]),
-            gr.update(value=d["gate_mode"]))
+            gr.update(value=d["gate_mode"]), gr.update(value=d["nms_iou_threshold"]),
+            gr.update(value=d["nms_iom_threshold"]), gr.update(value=d["cross_pass_dedup_metric"]),
+            gr.update(value=d["cross_pass_dedup_threshold"]))
 
 
 # ==========================================
@@ -478,17 +499,28 @@ with gr.Blocks(theme=gr.themes.Soft(), title="SAM3 Orchestration Dashboard") as 
                 conf_slider = gr.Slider(
                     minimum=0.10, maximum=0.90, value=0.35, step=0.05, label="🎚️ Detection confidence")
 
+            gr.Markdown("**Intra-pass NMS** (dedupes multiple detections from *one* SAM3 call)")
             gate_mode_radio = gr.Radio(
-                choices=["dual", "iou_only", "iom_only"], value="iou_only",
-                label="🎯 NMS suppression gate (dual = IoU+IoM default; pick one per dataset)")
+                choices=["dual", "iou_only", "iom_only"], value="dual",
+                label="🎯 NMS suppression gate (dual = IoU+IoM, matches the validated reference)")
 
             with gr.Row():
                 iou_threshold_slider = gr.Slider(
-                    minimum=0.05, maximum=0.95, value=Config().nms_iou_threshold, step=0.05,
+                    minimum=0.05, maximum=0.95, value=0.95, step=0.05,
                     label="Gate A: IoU threshold")
                 iom_threshold_slider = gr.Slider(
-                    minimum=0.05, maximum=0.95, value=Config().nms_iom_threshold, step=0.05,
+                    minimum=0.05, maximum=0.95, value=0.95, step=0.05,
                     label="Gate B: IoM threshold")
+
+            gr.Markdown("**Cross-pass dedup** (is this box the same object as one already "
+                       "registered from an earlier pass/tile? the more consequential knob)")
+            with gr.Row():
+                dedup_metric_radio = gr.Radio(
+                    choices=["iou", "iom"], value="iou",
+                    label="Metric (iom = validated CARPK choice for dense uniform-size grids)")
+                dedup_threshold_slider = gr.Slider(
+                    minimum=0.10, maximum=0.95, value=0.60, step=0.05,
+                    label="Threshold")
 
             budget_number = gr.Number(value=12, precision=0, label="🔁 Max actions (budget)")
             force_tile_checkbox = gr.Checkbox(
@@ -521,13 +553,15 @@ with gr.Blocks(theme=gr.themes.Soft(), title="SAM3 Orchestration Dashboard") as 
     nav_outputs = [image_display, banner_md, raw_prompt_display, prompt_input, status_box, idx_state]
     run_inputs = [dataset_dropdown, idx_state, prompt_input, policy_dropdown, verifier_radio,
                   overlap_radio, gate_mode_radio, iou_threshold_slider, iom_threshold_slider,
-                  conf_slider, budget_number, force_tile_checkbox, mock_checkbox,
-                  query_file_dropdown, mock_class_dropdown]
+                  dedup_metric_radio, dedup_threshold_slider, conf_slider, budget_number,
+                  force_tile_checkbox, mock_checkbox, query_file_dropdown, mock_class_dropdown]
     run_outputs = [image_display, banner_md, status_box, verbose_box]
 
     app.load(fn=load_sample_view, inputs=[dataset_dropdown, idx_state], outputs=nav_outputs)
     dataset_dropdown.change(fn=on_dataset_change, inputs=[dataset_dropdown],
-                            outputs=nav_outputs + [conf_slider, overlap_radio, gate_mode_radio])
+                            outputs=nav_outputs + [conf_slider, overlap_radio, gate_mode_radio,
+                                                   iou_threshold_slider, iom_threshold_slider,
+                                                   dedup_metric_radio, dedup_threshold_slider])
 
     run_button.click(fn=run_orchestration, inputs=run_inputs, outputs=run_outputs)
     prompt_input.submit(fn=run_orchestration, inputs=run_inputs, outputs=run_outputs)

@@ -30,11 +30,22 @@ class Config:
     #     duplicate regardless of its size relative to the container. Only takes effect
     #     when nms_mode == "dualgate".
     nms_iou_threshold: float = 0.40  # Gate A (IoU) threshold for apply_nms_dualgate.
-    #     Named with an "nms_" prefix to stay unambiguous from the unrelated cross-pass
-    #     dedup iou_threshold in pipeline.register_and_verify_candidates (still
-    #     hardcoded at 0.40, a different mechanism). Ignored when nms_mode=="iou".
+    #     Named with an "nms_" prefix to stay unambiguous from cross_pass_dedup_metric/
+    #     _threshold below (a different mechanism: intra-pass NMS on ONE SAM3 call's
+    #     candidates, vs inter-pass dedup against already-registered nodes). Ignored
+    #     when nms_mode=="iou".
     nms_iom_threshold: float = 0.90  # Gate B (IoM containment) threshold for
     #     apply_nms_dualgate. Ignored when nms_mode=="iou".
+    cross_pass_dedup_metric: str = "iou"  # "iou" (default, unchanged) | "iom": the plain-box
+    #     metric pipeline.register_and_verify_candidates uses to decide whether a newly
+    #     detected box is the same object as one already registered from an earlier
+    #     pass/tile. This is the more consequential IoU/IoM knob -- validated defaults:
+    #     "iou" for sparse/varied scenes (PixMo/CountBench), "iom" for CARPK-style dense
+    #     grids of uniform-size objects (a tight vs. loose detection of the same object
+    #     can have very different areas; IoU alone under-merges those).
+    cross_pass_dedup_threshold: float = 0.40  # threshold for whichever cross_pass_dedup_metric
+    #     is active. Validated starting points: ~0.60-0.65 for PixMo/CountBench (iou),
+    #     ~0.85 for CARPK (iom). The citrus baseline keeps this default (0.40, iou).
     use_canopy_roi: bool = True  # False skips the "tree canopy" SAM3 sweep in
     #     pipeline.initialize_canopy_roi and anchors the ROI to the full frame instead --
     #     for datasets with no canopy concept (CARPK, CountBench, PixMo), where that sweep

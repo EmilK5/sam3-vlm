@@ -80,6 +80,21 @@ def compute_iou(boxA, boxB):
 
     return interArea / float(boxAArea + boxBArea - interArea)
 
+def compute_iom(boxA, boxB):
+    """Intersection over Minimum -- the validated CARPK-style cross-pass dedup
+    metric for dense scenes with heavy tile/pass overlap. Plain box math, no
+    masks needed (distinct from compute_mask_iou, which needs SAM3 instance
+    masks under overlap_mode='mask')."""
+    xA, yA = max(boxA[0], boxB[0]), max(boxA[1], boxB[1])
+    xB, yB = min(boxA[2], boxB[2]), min(boxA[3], boxB[3])
+    interArea = max(0, xB - xA) * max(0, yB - yA)
+    boxAArea = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
+    boxBArea = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
+    minArea = min(boxAArea, boxBArea)
+    if minArea == 0:
+        return 0
+    return interArea / float(minArea)
+
 def compute_ioc(candidate_box, leaf_box):
     """
     Computes Intersection over Candidate (IoC).
@@ -126,10 +141,19 @@ def compute_mask_iou(box_a, mask_a, box_b, mask_b):
 
 def register_and_verify_candidates(candidate_boxes, candidate_scores, leaf_boxes, graph, pass_number, iou_threshold=0.40,
                                    cfg=None, oracle=None, query_set=None, image_np=None, signature=None,
-                                   candidate_masks=None, call_counter=None):
+                                   candidate_masks=None, call_counter=None, dedup_metric="iou"):
     """
     Dedicated registration function. Cross-references fruit candidates against
     globally detected leaf maps to apply semantic verdicts without cropping.
+
+    dedup_metric: additive, backward-compatible. "iou" (default, unchanged) uses
+    plain box IoU for the cross-pass duplicate check below. "iom" (Intersection
+    over Minimum) is the validated CARPK-style choice for dense scenes with heavy
+    tile/pass overlap, where two boxes of very different size can legitimately be
+    the same object (a tight detection vs. a looser one) -- IoU alone under-merges
+    those. `iou_threshold` is the threshold for whichever metric is active. Only
+    applies to the plain-box path; when both sides carry masks (overlap_mode=
+    "mask"), compute_mask_iou is used regardless of dedup_metric (a separate axis).
 
     Verifier selection (backward compatible):
         cfg is None or cfg.verifier_mode == "ioc" (default)
@@ -182,11 +206,14 @@ def register_and_verify_candidates(candidate_boxes, candidate_scores, leaf_boxes
                 if existing_box is None:
                     continue
 
-                # Mask IoU when both sides carry masks (overlap_mode="mask"),
-                # else the original box IoU.
+                # Mask IoU when both sides carry masks (overlap_mode="mask"), else
+                # the plain-box metric selected by dedup_metric (IoU default, IoM
+                # for CARPK-style dense scenes).
                 existing_mask = getattr(existing_node, "mask", None)
                 if cand_mask is not None and existing_mask is not None:
                     overlap = compute_mask_iou(box, cand_mask, existing_box, existing_mask)
+                elif dedup_metric == "iom":
+                    overlap = compute_iom(box, existing_box)
                 else:
                     overlap = compute_iou(box, existing_box)
 
@@ -472,7 +499,8 @@ def tiled_engine(processor, image_pil, confidence, clahe, prompt, pos_boxes=None
 def execute_pass(processor, image_pil, graph, conf, clahe, tiling, pass_number, prompt,
                  disable_size_filter=False, nms_mode="dualgate", use_concentric=False,
                  gate_mode="dual", use_canopy_roi=True, nms_iou_threshold=0.40,
-                 nms_iom_threshold=0.90, cfg=None, oracle=None, query_set=None,
+                 nms_iom_threshold=0.90, cross_pass_dedup_metric="iou",
+                 cross_pass_dedup_threshold=0.40, cfg=None, oracle=None, query_set=None,
                  roi_override=None):
     """
     Runs one full pass of SAM3 pipeline
@@ -487,11 +515,19 @@ def execute_pass(processor, image_pil, graph, conf, clahe, tiling, pass_number, 
         countbench-style scenes, "iom_only" for CARPK's dense uniform-size grids).
     nms_iou_threshold / nms_iom_threshold: forwarded to apply_nms_dualgate's own
         iou_threshold/iom_threshold (defaults 0.40/0.90, byte-identical to the
-        prior hardcoded behavior). Named with an "nms_" prefix to keep them
-        unambiguous from register_and_verify_candidates' unrelated iou_threshold
-        (the cross-pass dedup gate, still hardcoded at 0.40 below -- a different
-        mechanism entirely). Ignored when nms_mode=="iou" (the baseline cv2 NMS
-        has its own fixed 0.40 threshold, untouched).
+        prior hardcoded behavior). This governs INTRA-pass NMS -- deduping
+        multiple detections from the SAME SAM3 call. Ignored when nms_mode=="iou"
+        (the baseline cv2 NMS has its own fixed 0.40 threshold, untouched).
+    cross_pass_dedup_metric / cross_pass_dedup_threshold: forwarded to
+        register_and_verify_candidates' dedup_metric/iou_threshold (defaults
+        "iou"/0.40, byte-identical to the prior hardcoded behavior). This governs
+        INTER-pass dedup -- deciding whether a box just detected is the same
+        object as one already registered from an earlier pass/tile. This is the
+        knob validated on PixMo/CountBench/CARPK (iou@0.60-0.65 for sparse scenes,
+        iom@0.85 for CARPK's dense uniform-size grids) -- a different, more
+        consequential mechanism than the intra-pass nms_iou_threshold/
+        nms_iom_threshold above, which only cleans up near-duplicate detections
+        within one SAM3 call.
     use_concentric: forwarded to the dual-gate concentric sub-gate (default OFF;
         only the harness/ablation should turn it on).
     use_canopy_roi: forwarded to initialize_canopy_roi (default True, unchanged).
@@ -657,7 +693,8 @@ def execute_pass(processor, image_pil, graph, conf, clahe, tiling, pass_number, 
         leaf_boxes=global_leaf_boxes,
         graph=graph,
         pass_number=pass_number,
-        iou_threshold=0.40,
+        iou_threshold=cross_pass_dedup_threshold,
+        dedup_metric=cross_pass_dedup_metric,
         cfg=cfg,
         oracle=oracle,
         query_set=query_set,

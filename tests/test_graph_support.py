@@ -102,3 +102,38 @@ def test_duplicate_detection_reinforces_matched_track(pipeline_module):
     assert (added, dup) == (0, 1)
     assert node.support == 3
     assert node.jitter > 0.0    # center moved by 2px on pass 3
+
+
+# ----------------------- cross-pass dedup_metric: iou vs iom -----------------------
+#
+# A tight detection (small box) and a loose detection (bigger box) of the SAME
+# real object have low IoU (small overlap relative to the big union) but high
+# IoM (the smaller box sits almost entirely inside the bigger one) -- the
+# validated CARPK fix for IoU under-merging tight-vs-loose detections of one
+# dense-scene object.
+
+def test_dedup_metric_iom_merges_tight_and_loose_detection_of_same_object(pipeline_module):
+    graph = OrchardGraph()
+    _register(pipeline_module, graph, [0, 0, 40, 40], 1, "s1")  # loose, area 1600
+
+    # tight box mostly inside the loose one: IoU=100/1600=0.0625, IoM=100/100=1.0
+    added, dup = pipeline_module.register_and_verify_candidates(
+        np.array([[5, 5, 15, 15]], dtype=float), np.array([0.9]),
+        leaf_boxes=np.empty((0, 4)), graph=graph, pass_number=2,
+        signature="s2", iou_threshold=0.40, dedup_metric="iom",
+    )
+    assert (added, dup) == (0, 1)
+    assert len(graph.nodes) == 1  # merged, not a new node
+
+
+def test_dedup_metric_iou_default_does_not_merge_same_scenario(pipeline_module):
+    graph = OrchardGraph()
+    _register(pipeline_module, graph, [0, 0, 40, 40], 1, "s1")
+
+    added, dup = pipeline_module.register_and_verify_candidates(
+        np.array([[5, 5, 15, 15]], dtype=float), np.array([0.9]),
+        leaf_boxes=np.empty((0, 4)), graph=graph, pass_number=2,
+        signature="s2", iou_threshold=0.40,  # dedup_metric defaults to "iou"
+    )
+    assert (added, dup) == (1, 0)
+    assert len(graph.nodes) == 2  # NOT merged -- demonstrates IoU under-merging
