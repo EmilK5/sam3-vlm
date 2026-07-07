@@ -192,6 +192,13 @@ def _validate_look(region, image):
     actions.execute; here we only reject out-of-frame or malformed boxes."""
     if image is None:
         return None
+    if isinstance(region, str):
+        # Some local VLMs (observed with Qwen3-VL via Ollama) stringify nested
+        # JSON values, e.g. "region": "[x1,y1,x2,y2]" instead of a real array.
+        try:
+            region = json.loads(region)
+        except json.JSONDecodeError:
+            return None
     if not isinstance(region, (list, tuple)) or len(region) != 4:
         return None
     if not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in region):

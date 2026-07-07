@@ -75,6 +75,19 @@ def test_look_degenerate_box_falls_back():
     assert not isinstance(action, LookROIA)   # x2 < x1
 
 
+def test_look_region_as_json_string_still_maps_to_lookroia():
+    # Some local VLMs (observed with Qwen3-VL via Ollama) stringify nested JSON
+    # values instead of emitting a real array; we should still parse it.
+    action = _choose('{"action": "look", "args": {"region": "[40, 40, 120, 120]"}}', _fixture())
+    assert isinstance(action, LookROIA)
+    assert action.region == (40, 40, 120, 120)
+
+
+def test_look_region_as_malformed_string_falls_back():
+    action = _choose('{"action": "look", "args": {"region": "not json"}}', _fixture())
+    assert not isinstance(action, LookROIA)
+
+
 def test_look_without_image_falls_back():
     action = _choose('{"action": "look", "args": {"region": [40, 40, 120, 120]}}',
                      _fixture(), image=None)
