@@ -12,11 +12,7 @@ answer to each of the M queries for one candidate crop; vip.run_ip consumes it.
 Three implementations:
   - MockOracle  : deterministic template-based answers with optional noise (tests).
   - QwenOracle  : one structured VQA call to an OpenAI-compatible endpoint (primary).
-  - Sam3Oracle  : optional SAM3-presence channel for segmentable noun-phrase queries.
-
-Model clients (`openai`, `torch`) are imported lazily inside the methods that
-need them, so this module imports cleanly on a CPU-only box with neither
-installed, and MockOracle/QwenOracle-parsing stay fully testable offline.
+  - Sam3Oracle  : optional SAM3-presence channel for segmentable noun-phrase queries
 """
 
 import base64
@@ -33,11 +29,9 @@ _ANSWER_MAP = {"yes": 1, "no": -1, "unsure": 0}
 
 
 class MockOracle:
-    """Answers each query with its template value for `true_class`, with optional
+    """
+    Answers each query with its template value for `true_class`, with optional
     seeded flips. Deterministic given (true_class, noise, seed). For tests only.
-
-    A "flip" (probability `noise` per query) replaces the clean template answer
-    with a uniformly-chosen one of the other two answer values.
     """
 
     def __init__(self, true_class: str, noise: float = 0.0, seed: int = 0):
@@ -57,12 +51,12 @@ class MockOracle:
 
 
 class QwenOracle:
-    """Answers the whole query set for a crop in one structured VQA call to an
+    """
+    Answers the whole query set for a crop in one structured VQA call to an
     OpenAI-compatible chat endpoint (e.g. Qwen-3-VL). temperature=0, strict JSON.
 
     On parse failure it retries up to `cfg.oracle_max_retries` times, then logs a
-    warning and returns all-zeros (which makes V-IP fall back to the prior, i.e.
-    "unresolved" — never a wrong confident verdict).
+    warning and returns all-zeros
 
     `client` may be injected for offline testing; otherwise an `openai` client is
     built lazily from cfg.oracle_base_url. QWEN_API_KEY is optional: it defaults
@@ -82,7 +76,6 @@ class QwenOracle:
         self._injected_client = client
 
     # --- public API ---
-
     def answer_batch(self, crop_pil, query_set) -> np.ndarray:
         M = len(query_set.queries)
         client = self._client()
@@ -109,7 +102,7 @@ class QwenOracle:
         if self._injected_client is not None:
             return self._injected_client
         import os
-        from openai import OpenAI  # lazy: not needed for tests / other oracles
+        from openai import OpenAI
         return OpenAI(
             base_url=self.cfg.oracle_base_url,
             api_key=os.environ.get("QWEN_API_KEY", "EMPTY"),

@@ -81,10 +81,7 @@ def compute_iou(boxA, boxB):
     return interArea / float(boxAArea + boxBArea - interArea)
 
 def compute_iom(boxA, boxB):
-    """Intersection over Minimum -- the validated CARPK-style cross-pass dedup
-    metric for dense scenes with heavy tile/pass overlap. Plain box math, no
-    masks needed (distinct from compute_mask_iou, which needs SAM3 instance
-    masks under overlap_mode='mask')."""
+    """Computes Intersection over Minimum (IoM) between two bounding boxes.""" 
     xA, yA = max(boxA[0], boxB[0]), max(boxA[1], boxB[1])
     xB, yB = min(boxA[2], boxB[2]), min(boxA[3], boxB[3])
     interArea = max(0, xB - xA) * max(0, yB - yA)
@@ -116,13 +113,7 @@ def compute_ioc(candidate_box, leaf_box):
     return inter_area / float(candidate_area) if candidate_area > 0 else 0.0
 
 def compute_mask_iou(box_a, mask_a, box_b, mask_b):
-    """IoU of two instance masks stored as box-cropped boolean arrays.
-
-    box_a/box_b are global-frame xyxy pixels; mask_a/mask_b are boolean arrays
-    whose row 0 / col 0 correspond to their box's y1 / x1 (frame-independent, so
-    masks recorded under different ROIs remain comparable). Returns 0.0 when the
-    boxes don't intersect.
-    """
+    """IoU of two instance masks stored as box-cropped boolean arrays."""
     ax1, ay1 = int(round(box_a[0])), int(round(box_a[1]))
     bx1, by1 = int(round(box_b[0])), int(round(box_b[1]))
 
@@ -135,6 +126,7 @@ def compute_mask_iou(box_a, mask_a, box_b, mask_b):
 
     sub_a = mask_a[iy1 - ay1:iy2 - ay1, ix1 - ax1:ix2 - ax1]
     sub_b = mask_b[iy1 - by1:iy2 - by1, ix1 - bx1:ix2 - bx1]
+
     inter = float(np.count_nonzero(np.logical_and(sub_a, sub_b)))
     union = float(np.count_nonzero(mask_a)) + float(np.count_nonzero(mask_b)) - inter
     return inter / union if union > 0 else 0.0
@@ -143,52 +135,20 @@ def register_and_verify_candidates(candidate_boxes, candidate_scores, leaf_boxes
                                    cfg=None, oracle=None, query_set=None, image_np=None, signature=None,
                                    candidate_masks=None, call_counter=None, dedup_metric="iou"):
     """
-    Dedicated registration function. Cross-references fruit candidates against
-    globally detected leaf maps to apply semantic verdicts without cropping.
-
-    dedup_metric: additive, backward-compatible. "iou" (default, unchanged) uses
-    plain box IoU for the cross-pass duplicate check below. "iom" (Intersection
-    over Minimum) is the validated CARPK-style choice for dense scenes with heavy
-    tile/pass overlap, where two boxes of very different size can legitimately be
-    the same object (a tight detection vs. a looser one) -- IoU alone under-merges
-    those. `iou_threshold` is the threshold for whichever metric is active. Only
-    applies to the plain-box path; when both sides carry masks (overlap_mode=
-    "mask"), compute_mask_iou is used regardless of dedup_metric (a separate axis).
-
-    Verifier selection (backward compatible):
-        cfg is None or cfg.verifier_mode == "ioc" (default)
-            -> the occlusion-aware IoC logic gate below, UNCHANGED.
-        cfg.verifier_mode == "vip"
-            -> FM+V-IP verification via verify.verify_candidate on a crop; the
-               IoC gate is not run. Requires oracle, query_set, and image_np.
-               Candidates smaller than 12px on a side are left "unresolved".
-        cfg.verifier_mode == "off"
-            -> verification disabled: candidates are registered but not
-               classified, so every node stays "unresolved". Useful as a
-               no-verifier baseline / ablation.
-
-    candidate_masks: optional list of box-cropped boolean masks aligned with
-    candidate_boxes (overlap_mode="mask"). When a candidate and an existing node
-    both carry masks, cross-pass dedup uses mask IoU instead of box IoU; the mask
-    is stored on newly registered nodes.
-
-    call_counter: optional dict; when given, 'n_oracle_calls' is incremented by
-    the oracle calls actually made on the VIP path (for cost metering).
-
-    Returns (added_nodes, duplicates_rejected). The inter-pass duplicate counter
-    was added for diagnostics.
-    """
+    Register candidates and deduplicate against existing nodes via box/mask overlap.
+    Verify via IoC (default), VIP, or disabled.
+    dedup_metric: "iou" (default) or "iom"; masks use mask IoU regardless.
+    Returns (added_nodes, duplicates_rejected).
+    """ 
+ 
     mode = getattr(cfg, "verifier_mode", "ioc") if cfg is not None else "ioc"
     use_vip = mode == "vip"
     verify_off = mode == "off"
     if use_vip and (oracle is None or query_set is None or image_np is None):
         raise ValueError("verifier_mode='vip' requires oracle, query_set, and image_np.")
 
-    # Dedup match set. The validated IoC gate only ever deduplicates against
-    # confirmed "fruit" (unchanged). vip/off also match "unresolved" tracks:
-    # under those modes candidates can legitimately stay unresolved (vip <12px
-    # skips; all of "off"), and without this every pass would re-register the
-    # same objects as new nodes, inflating N_obs and breaking convergence.
+    # IoC deduplicates against "fruit" only; VIP/off also against "unresolved"
+    # (since those modes legitimately leave candidates unresolved). 
     dedup_classes = ("fruit",) if mode == "ioc" else ("fruit", "unresolved")
 
     added_nodes = 0
@@ -201,7 +161,6 @@ def register_and_verify_candidates(candidate_boxes, candidate_scores, leaf_boxes
         matched_node = None
         for existing_node in graph.nodes.values():
             if existing_node.classification in dedup_classes:
-                # Defensive check: safely grab coordinate array whether named .bbox or .box
                 existing_box = getattr(existing_node, 'bbox', getattr(existing_node, 'box', None))
                 if existing_box is None:
                     continue
@@ -308,12 +267,6 @@ def initialize_canopy_roi(processor, img_np, graph, use_canopy=True):
     """
     [PASS 0] Locates the main tree canopy bounding box globally.
     Gates subsequent micro discovery loops to strip out soil and sky noise.
-
-    use_canopy: additive, backward-compatible (default True = unchanged behavior).
-    False skips the "tree canopy" SAM3 sweep entirely and anchors the ROI to the
-    full frame instead -- for datasets with no canopy concept (e.g. CARPK
-    parking lots, CountBench/PixMo generic photos), where that sweep can only
-    ever return a spurious/empty match and wastes a SAM3 call.
     """
     if hasattr(graph, "tree_roi") and graph.tree_roi is not None:
         return graph.tree_roi
@@ -412,10 +365,6 @@ def global_engine(processor, image_np, conf, prompt, pos_boxes=None, neg_boxes=N
 def tiled_engine(processor, image_pil, confidence, clahe, prompt, pos_boxes=None, neg_boxes=None, global_leaf_boxes=None, disable_size_filter=False, return_tile_count=False):
     """
     Run tiled inference
-
-    return_tile_count: additive, backward-compatible. When True, also returns the
-    number of tiles actually run (len(x_offsets) * len(y_offsets)); the boxes/scores
-    outputs are unchanged.
     """
     master_w, master_h = image_pil.size
     tile_size = min(master_w, master_h) // 2
@@ -505,38 +454,6 @@ def execute_pass(processor, image_pil, graph, conf, clahe, tiling, pass_number, 
     """
     Runs one full pass of SAM3 pipeline
     Propose -> Register -> Verify -> Feedback
-
-    nms_mode:
-        "iou"      -> baseline cv2 IoU NMS (the validated 0.74/0.75 reference)
-        "dualgate" -> IoU + size-guarded IoM containment NMS (default)
-    gate_mode: forwarded to apply_nms_dualgate when nms_mode=="dualgate" (ignored
-        otherwise). "dual" (default, unchanged) | "iou_only" | "iom_only" -- lets a
-        caller pick a single suppression criterion per dataset (e.g. "iou_only" for
-        countbench-style scenes, "iom_only" for CARPK's dense uniform-size grids).
-    nms_iou_threshold / nms_iom_threshold: forwarded to apply_nms_dualgate's own
-        iou_threshold/iom_threshold (defaults 0.40/0.90, byte-identical to the
-        prior hardcoded behavior). This governs INTRA-pass NMS -- deduping
-        multiple detections from the SAME SAM3 call. Ignored when nms_mode=="iou"
-        (the baseline cv2 NMS has its own fixed 0.40 threshold, untouched).
-    cross_pass_dedup_metric / cross_pass_dedup_threshold: forwarded to
-        register_and_verify_candidates' dedup_metric/iou_threshold (defaults
-        "iou"/0.40, byte-identical to the prior hardcoded behavior). This governs
-        INTER-pass dedup -- deciding whether a box just detected is the same
-        object as one already registered from an earlier pass/tile. This is the
-        knob validated on PixMo/CountBench/CARPK (iou@0.60-0.65 for sparse scenes,
-        iom@0.85 for CARPK's dense uniform-size grids) -- a different, more
-        consequential mechanism than the intra-pass nms_iou_threshold/
-        nms_iom_threshold above, which only cleans up near-duplicate detections
-        within one SAM3 call.
-    use_concentric: forwarded to the dual-gate concentric sub-gate (default OFF;
-        only the harness/ablation should turn it on).
-    use_canopy_roi: forwarded to initialize_canopy_roi (default True, unchanged).
-        False anchors the ROI to the full frame instead of running a "tree canopy"
-        SAM3 sweep -- for datasets with no canopy concept (CARPK, CountBench,
-        PixMo). Ignored when roi_override is given (that already skips canopy
-        detection).
-
-    Returns a PassStats (an int subclass) so existing callers in app.py are unaffected.
     """
     img_np = np.array(image_pil)
     img_h, img_w = img_np.shape[:2]
@@ -560,8 +477,6 @@ def execute_pass(processor, image_pil, graph, conf, clahe, tiling, pass_number, 
     # --- GENERATE GLOBAL LEAF MAP (Pass 1 Cache Optimization) ---
     # The cached leaf boxes are ROI-relative, so the cache is keyed by the ROI it
     # was generated under (graph.cached_leaf_roi) and regenerated whenever the
-    # ROI differs (region-restricted queries change the frame between passes;
-    # reusing across frames would misplace every leaf box).
     cache_roi = getattr(graph, "cached_leaf_roi", None)
     if (not hasattr(graph, "cached_leaf_boxes") or graph.cached_leaf_boxes is None
             or pass_number == 1 or cache_roi != list(roi)):
@@ -581,9 +496,7 @@ def execute_pass(processor, image_pil, graph, conf, clahe, tiling, pass_number, 
     master_scores = []
     candidate_masks = None  # per-instance boolean masks (roi frame), mask mode only
 
-    # Mask-based overlap (IoU/IoM via instance masks) is opt-in and currently
-    # limited to global (non-tiled) passes: tile masks would need per-tile
-    # global-frame stitching. Tiled passes fall back to box overlap.
+    # OPTIONAL: Mask-based overlap (IoU/IoM via instance masks)
     use_masks = getattr(cfg, "overlap_mode", "box") == "mask" if cfg is not None else False
     if use_masks and tiling:
         logging.warning("overlap_mode='mask' is not supported with tiling; using box overlap for this pass.")
@@ -714,3 +627,4 @@ def execute_pass(processor, image_pil, graph, conf, clahe, tiling, pass_number, 
         n_sam_calls=n_sam_calls,
         n_verify_calls=call_counter["n_oracle_calls"],
     )
+    

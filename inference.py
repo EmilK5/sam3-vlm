@@ -1,7 +1,7 @@
 """
 inference.py
 
-Executes SAM3, CLAHE, MNS filters
+Executes SAM3, CLAHE, NMS filters
 and plotting
 """
 import torch
@@ -92,14 +92,6 @@ def apply_nms(boxes, scores, confidence, iou_threshold=0.40, return_indices=Fals
     """
     Deduplicate overlapping predictions
     across passes using NMS
-
-    [BASELINE] Pure-IoU NMS via cv2.dnn.NMSBoxes. This is the currently validated
-    citrus default (Recall 0.74 / Precision 0.75). Kept intact so the harness can
-    A/B it against apply_nms_dualgate without changing the reference behavior.
-
-    return_indices: if True, also return the indices into the INPUT arrays that
-                    survived, so a caller can subselect a parallel list (e.g.
-                    masks). Default False keeps the legacy 2-tuple return.
     """
     if len(boxes) == 0:
         empty_idx = np.array([], dtype=int)
@@ -136,47 +128,10 @@ def apply_nms_dualgate(boxes, scores, confidence,
                        masks=None,
                        gate_mode="dual"):
     """
-    Dual-Gate NMS for the citrus pipeline. Ported from the PixMo/CountBench engine
-    and re-tuned for small, same-color, clustered fruit.
-
-    gate_mode: additive, backward-compatible. "dual" (default) keeps Gate A (IoU)
-    OR Gate B (IoM containment, size-ratio-guarded) exactly as before --
-    byte-identical to the original behavior. "iou_only" disables Gate B (pure
-    lateral-duplicate IoU suppression). "iom_only" disables Gate A AND drops
-    Gate B's size-ratio guard (pure containment suppression: iom > iom_threshold
-    alone) -- useful for datasets like CARPK where uniform-size objects sit in
-    dense grids and a box fully swallowed by another is never a distinct real
-    object regardless of relative size, so the guard (meant to protect a small
-    fruit genuinely nested in a citrus cluster box) would only hide the
-    duplicate. The concentric sub-gate (opt-in) still adds to whichever gate is
-    active.
-
-    Gate A (IoU): lateral-duplicate suppression. Held at the citrus-validated 0.40
-                  so swapping IoU->dual-gate is a *controlled, additive* change and
-                  not a hidden relaxation of the IoU threshold (the source engine ran
-                  IoU at 0.95, which would have kept far more overlapping boxes).
-
-    Gate B (IoM = intersection / min-area): removes a box largely *contained* by a
-                  bigger one (an individual fruit swallowed by a cluster proposal),
-                  but only when guarded:
-                    - containment sub-gate: size_ratio >= min_size_ratio_for_containment
-                      -> the two boxes are comparably sized, so this is a real nested
-                      duplicate, not a small fruit sitting inside a big cluster box.
-                    - concentric sub-gate (OPT-IN, default OFF): suppresses a smaller
-                      box centered inside a larger one. On CARPK-style scenes this kills
-                      nested junk; on THIS dataset it can delete a real fruit that
-                      happens to sit dead-center in a cluster box. Leave off unless the
-                      overlays show concentric false positives the size guard misses.
-
-    A box removed here is therefore always either an IoU duplicate (identical to the
-    baseline's intent) or a size-guarded nested duplicate.
-
-    masks: additive, backward-compatible. None (default) keeps the box-based gates
-    byte-for-byte. When given (a list of per-instance boolean arrays in this image's
-    frame, index-aligned with boxes), Gate A IoU and Gate B IoM/size-ratio are
-    measured on the masks instead of the boxes; the boxes still bound which pairs
-    can overlap and the concentric sub-gate stays box-geometry-based. Combine with
-    return_indices=True to subselect the surviving masks.
+    Dual-gate NMS: suppress boxes via IoU (Gate A) OR size-guarded containment (Gate B).
+    gate_mode: "dual" (default, byte-identical to baseline), "iou_only", or "iom_only".
+    use_concentric: opt-in concentric suppression (risky on clustered fruit).
+    masks: optional per-instance boolean arrays; overlap measured on masks if given.
     """
     empty_idx = np.array([], dtype=int)
     if len(boxes) == 0:
@@ -216,7 +171,7 @@ def apply_nms_dualgate(boxes, scores, confidence,
         if masks is not None:
             # Mask-mode overlap: recompute intersection and areas from the masks.
             # A pair whose boxes don't touch can't have mask overlap, so the
-            # box intersection bounds which pairs need the (expensive) mask AND.
+            # box intersection bounds which pairs need the (expensive) mask
             mask_inter = np.zeros_like(inter)
             for jj, j in enumerate(rest):
                 if inter[jj] > 0:
@@ -308,17 +263,7 @@ def plot_graph_scene(image_pil, graph, output_path="output.jpg"):
 def run_raw_inference(processor, image_np, confidence, prompt, pos_boxes=None, neg_boxes=None,
                       disable_size_filter=False, return_masks=False):
     """
-    Executes a single forward pass through SAM3 supporting exemplars.
-
-    return_masks:
-        False (default) -> returns (boxes, scores). Backward-compatible: every
-                           existing caller (pipeline.py engines, legacy main.py)
-                           keeps getting a 2-tuple and is unaffected.
-        True            -> returns (boxes, scores, masks), where masks is a list
-                           of per-instance boolean numpy arrays (H×W in this
-                           image's frame), aligned index-for-index with boxes.
-                           Used by the agent so association can run on mask-IoU
-                           / mask-IoM rather than box overlap.
+    Executes a single forward pass through SAM3 supporting (pseudo)exemplars
     """
     # --- Load in the image ---
     img_pil = Image.fromarray(image_np)
@@ -327,7 +272,7 @@ def run_raw_inference(processor, image_np, confidence, prompt, pos_boxes=None, n
 
     model = processor.model
 
-    # --- Positive & Negative exemplars Inference ---
+    # --- Positive & Negative (pseudo)exemplars Inference ---
     input_boxes_list = []
     input_labels_list = []
 
@@ -421,19 +366,6 @@ def verify_box_semantics(processor, image_np, box, scale_factor=1.1,
     """
     Verify whether the bounding box is a fruit or a leaf
     using bicubic upsampling and macro prompt tuning.
-
-    fruit_prompt / leaf_prompt: short noun-phrase text prompts, matching the
-    style used everywhere else SAM3 is queried in this file (e.g. the "apple",
-    "tree canopy", "green leaf" prompts elsewhere). SAM3 mean-pools all text
-    tokens into one query vector (design doc §5.2), so a long descriptive
-    sentence like "a close-up macro photo of a round green fruit" dilutes the
-    query across unrelated words and tends to produce near-zero scores on
-    BOTH channels — observed directly in a real MinneApple run: 9/9 verified
-    candidates had s_fruit and s_leaf both under 0.011, i.e. essentially
-    noise-floor, on the old prompt wording. Pass the SAME concept word used
-    for detection (e.g. fruit_prompt="apple") for maximum consistency; the
-    generic "fruit"/"green leaf" defaults here are a safe fallback when the
-    caller doesn't have a specific concept to hand.
     """
     # --- Unpack original coordinates and compute dimensions ---
     xmin_orig, ymin_orig, xmax_orig, ymax_orig = box

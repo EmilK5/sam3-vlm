@@ -122,7 +122,7 @@ def _expand_and_clamp(region, margin, img_w, img_h) -> tuple:
 
 
 def _roi_iou(a, b) -> float:
-    """Plain xyxy IoU (used only to de-duplicate sensed ROIs; not on any SAM3 path)."""
+    """Plain IoU for ROIs"""
     ax1, ay1, ax2, ay2 = a
     bx1, by1, bx2, by2 = b
     iw = max(0.0, min(ax2, bx2) - max(ax1, bx1))

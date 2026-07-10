@@ -8,7 +8,7 @@ and, for each query, the expected per-class answer template tau_{k,m} in
 {-1, 0, +1} (no / uninformative / yes). These templates and a fixed answer
 noise rate epsilon fully determine the closed-form V-IP posterior in vip.py.
 The set is generated once by an LLM (scripts/gen_queries.py), hand-reviewed,
-and checked into queries/ as JSON. Runtime never calls an LLM to make queries.
+and checked into queries/ as JSON 
 """
 
 import dataclasses
@@ -134,10 +134,7 @@ def _validate(data: dict) -> QuerySet:
 
 
 def load_query_set(path: str) -> QuerySet:
-    """Load a query set from a JSON file, validating it strictly.
-
-    Raises ValueError (with a helpful message) if the schema is malformed.
-    """
+    """Load a query set from a JSON file, validating it strictly."""
     with open(path, "r") as f:
         data = json.load(f)
     query_set = _validate(data)

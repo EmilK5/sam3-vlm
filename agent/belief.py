@@ -42,7 +42,8 @@ def support_score(node, cfg) -> float:
 
 
 def uncertainty(graph, discovery, cfg) -> float:
-    """U(b~) = lambda_D * mean_recent(m) + lambda_S * sum_{non-spurious}(
+    """
+    U(b~) = lambda_D * mean_recent(m) + lambda_S * sum_{non-spurious}(
         1/(1+k) + alpha_Delta*Delta + alpha_s*(1 - s_bar) ).
     """
     lam = cfg.lambdas

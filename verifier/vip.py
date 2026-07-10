@@ -6,16 +6,6 @@ no model calls. Given a query set's per-class answer templates tau_{k,m} and a
 fixed noise rate epsilon, this builds a factorized naive-Bayes likelihood and
 computes the closed-form posterior, greedy conditional-mutual-information query
 selection, and the standard IP stopping rule.
-
-Conventions
------------
-- Classes are indexed 0..K-1 in `query_set.classes` order.
-- Queries are indexed 0..M-1 in `query_set.queries` order.
-- Answers take values in {-1, 0, +1} = (no, unsure/undecidable, yes).
-- The likelihood table axis of length 3 is indexed by answer value via
-  idx = answer + 1, i.e. -1->0, 0->1, +1->2 (see ANSWER_VALUES).
-- All entropies are in nats (natural log); the choice is internally consistent
-  and does not affect argmax selection.
 """
 
 import numpy as np

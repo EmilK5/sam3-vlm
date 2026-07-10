@@ -33,8 +33,8 @@ class OrchardNode:
 
         # Classification tag
         self.classification = "unresolved"          # 'unresolved' | 'fruit' | 'leaf'
-        self.tree_roi = None
-        self.cached_leaf_boxes = None
+        self.tree_roi = None                        # Bounding box for the tree ROI
+        self.cached_leaf_boxes = None               # Bounding boxes for the leaves 
 
         # FM+V-IP verifier trace (populated only when verifier="vip"); left None
         # under the default IoC verifier so to_dict output is unchanged.
@@ -48,8 +48,7 @@ class OrchardNode:
         self.area = self._box_area()                 # A_i: representative box area (px^2)
 
         # Optional instance mask (overlap_mode="mask"): a boolean numpy array
-        # cropped to this node's box (row 0 / col 0 = box's y1 / x1). Not
-        # serialized in to_dict. None under the default box-overlap mode.
+        # cropped to this node's box (row 0 / col 0 = box's y1 / x1). Not 
         self.mask = None
 
     def _box_area(self) -> float:
@@ -143,7 +142,7 @@ class OrchardGraph:
     def get_exemplars(self) -> tuple:
         """
         Groups verified boxes to serve as prompt
-        for the next passes
+        for the next passes (pseudoexemplars)
         """
         pos_boxes = []
         neg_boxes = []

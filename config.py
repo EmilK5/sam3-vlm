@@ -21,44 +21,19 @@ class Config:
     # --- detection ---
     conf: float = 0.35
     nms_mode: str = "dualgate"
-    gate_mode: str = "dual"  # "dual" (default, unchanged) | "iou_only" | "iom_only": which
-    #     apply_nms_dualgate suppression gate(s) apply. "iou_only" is pure lateral-duplicate
-    #     IoU suppression (no containment check) -- e.g. countbench-style scenes. "iom_only"
-    #     is pure containment suppression with NO size-ratio guard (no lateral-IoU check
-    #     either) -- e.g. CARPK's dense grids of uniform-size objects, where IoU can
-    #     over-suppress adjacent-but-distinct boxes, and a fully-contained box is always a
-    #     duplicate regardless of its size relative to the container. Only takes effect
-    #     when nms_mode == "dualgate".
-    nms_iou_threshold: float = 0.40  # Gate A (IoU) threshold for apply_nms_dualgate.
-    #     Named with an "nms_" prefix to stay unambiguous from cross_pass_dedup_metric/
-    #     _threshold below (a different mechanism: intra-pass NMS on ONE SAM3 call's
-    #     candidates, vs inter-pass dedup against already-registered nodes). Ignored
-    #     when nms_mode=="iou".
-    nms_iom_threshold: float = 0.90  # Gate B (IoM containment) threshold for
-    #     apply_nms_dualgate. Ignored when nms_mode=="iou".
-    cross_pass_dedup_metric: str = "iou"  # "iou" (default, unchanged) | "iom": the plain-box
-    #     metric pipeline.register_and_verify_candidates uses to decide whether a newly
-    #     detected box is the same object as one already registered from an earlier
-    #     pass/tile. This is the more consequential IoU/IoM knob -- validated defaults:
-    #     "iou" for sparse/varied scenes (PixMo/CountBench), "iom" for CARPK-style dense
-    #     grids of uniform-size objects (a tight vs. loose detection of the same object
-    #     can have very different areas; IoU alone under-merges those).
-    cross_pass_dedup_threshold: float = 0.40  # threshold for whichever cross_pass_dedup_metric
-    #     is active. Validated starting points: ~0.60-0.65 for PixMo/CountBench (iou),
-    #     ~0.85 for CARPK (iom). The citrus baseline keeps this default (0.40, iou).
-    use_canopy_roi: bool = True  # False skips the "tree canopy" SAM3 sweep in
-    #     pipeline.initialize_canopy_roi and anchors the ROI to the full frame instead --
-    #     for datasets with no canopy concept (CARPK, CountBench, PixMo), where that sweep
-    #     wastes a SAM3 call on a prompt that can never legitimately match.
-    target_prompt: str = "green fruit"  # concept string for agent Query/TileQuery actions
-    overlap_mode: str = "box"  # "box" (default) | "mask": NMS IoU/IoM + cross-pass dedup
-    #     measured on instance masks instead of boxes (global passes only; tiled
-    #     passes fall back to box overlap with a warning).
+    gate_mode: str = "dual"  # "dual" (default) | "iou_only" | "iom_only"
+    nms_iou_threshold: float = 0.40  
+    nms_iom_threshold: float = 0.90  
+    cross_pass_dedup_metric: str = "iou"  # "iou" (default) | "iom"
+    cross_pass_dedup_threshold: float = 0.40 
+    use_canopy_roi: bool = True
+    target_prompt: str = "green fruit"
+    overlap_mode: str = "box"
 
     # --- verifier ---
-    verifier_mode: str = "ioc"  # "ioc" (default, unchanged) | "vip" (opt-in) | "off" (disabled)
+    verifier_mode: str = "ioc"  # "ioc" (default) | "vip" | "off" (disabled)
     vip_query_file: str = "queries/green_citrus.json"
-    vip_epsilon: float = None  # None -> use the query set's epsilon; a float overrides it
+    vip_epsilon: float = None 
     vip_stop: float = 0.10
     vip_max_queries: int = 10
     crop_scale: float = 1.4
@@ -102,18 +77,11 @@ class Config:
     area_max: float = float("inf")  # lambda_A term of support_score; defaults are inert
 
     # --- guided-ROI policy (phase 7) ---
-    roi_margin: float = 0.10      # fraction of a proposed ROI's size added on each
-                                  # side before sensing (agent LookROIA)
+    roi_margin: float = 0.10      # fraction of a proposed ROI's size added on each side before sensing (agent LookROIA)
     roi_min_size: float = 32.0    # min ROI side (px) worth sensing; smaller -> no-op
-    roi_max_depth: int = 2        # max quadrant-equiv zoom levels; the ROI area floor
-                                  # is frame_area / 4**roi_max_depth (16-quadrant cap)
-    roi_dup_iou: float = 0.7      # a proposed ROI overlapping a sensed one above this
-                                  # IoU is a no-op (avoids re-sensing)
-    policy_enable_thinking: bool = False  # qwen3-vl "thinking" on the policy-loop
-                                  # (look/tile/verify/stop) call; OFF by default since
-                                  # those decisions are structured. inspect + the verify
-                                  # oracle keep thinking on (their default call). One
-                                  # model id throughout -- never switch models.
+    roi_max_depth: int = 2        # max quadrant-equiv zoom levels;
+    roi_dup_iou: float = 0.7      # a proposed ROI overlapping a sensed one above this IoU is a no-op (avoids re-sensing)
+    policy_enable_thinking: bool = False  # qwen3-vl "thinking" on/off
 
     # --- costs (normalized relative to one global SAM3 call) ---
     c_sam: float = 1.0
@@ -131,16 +99,9 @@ class Config:
 
 
 def thinking_call_kwargs(enable_thinking: bool) -> dict:
-    """Extra kwargs for an OpenAI-compatible chat.completions.create() call that
-    toggle qwen3-vl "thinking" WITHOUT switching models.
-
-        enable_thinking=True  -> {} (the model's default; thinking on)
-        enable_thinking=False -> the disable-thinking argument
-
-    NOTE: the exact key is serving-stack specific. This uses the vLLM/Qwen
-    chat-template convention (extra_body.chat_template_kwargs.enable_thinking).
-    VERIFY it against the live Ollama qwen3-vl endpoint -- Ollama may instead want
-    a top-level {"think": false}. If so, change only this function.
+    """
+    Extra kwargs for an OpenAI-compatible chat.completions.create() call that
+    toggle qwen3-vl "thinking" without switching models.
     """
     if enable_thinking:
         return {}
