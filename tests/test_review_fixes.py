@@ -1,8 +1,9 @@
 """
-Regression tests for the functional-review fixes (2026-07-04):
+Regression tests for the functional-review fixes (2026-07-04).
 
-  1. VerifyA without an oracle/query_set raises loudly instead of crashing with
-     AttributeError, and neither policy proposes verify unless verifier_mode="vip".
+(Item 1, VerifyA availability, was removed in v2 step 8.1 along with the
+VerifyA action itself: verification now happens only inside execute_pass.)
+
   2. The cached leaf map is keyed by the ROI it was generated under and is
      regenerated when a region-restricted pass changes the frame.
   3. Cross-pass dedup under verifier "vip"/"off" also matches "unresolved"
@@ -10,8 +11,9 @@ Regression tests for the functional-review fixes (2026-07-04):
      unchanged: fruit only).
   4. PassStats carries the pass's actual call counts (n_sam_calls/n_verify_calls).
   5. cfg.vip_epsilon=None defers to the query set; a float overrides it.
-  6. QwenOracle / inspect_scene survive request (network) exceptions via the
-     same retry-then-fallback path as parse failures.
+  6. QwenOracle survives request (network) exceptions via the same
+     retry-then-fallback path as parse failures. (The companion inspect_scene
+     check was removed in v2 step 8.3, which deleted agent/inspect.py.)
   7. sam3_phrase survives query-set loading, so Sam3Oracle can answer.
 """
 
@@ -30,9 +32,6 @@ from graph import OrchardGraph
 from verifier.queries import load_query_set
 from verifier.oracle import MockOracle, QwenOracle, Sam3Oracle
 from verifier.verify import verify_candidate
-from agent.actions import ActionContext, QueryA, TileQueryA, SubdivideA, VerifyA, StopA, execute
-from agent.belief import DiscoveryCurve
-from agent import policy_heuristic
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GREEN_CITRUS = os.path.join(REPO_ROOT, "queries", "green_citrus.json")
@@ -93,40 +92,6 @@ def pipeline_module():
                 sys.modules.pop(name, None)
             else:
                 sys.modules[name] = mod
-
-
-# ----------------------- 1. VerifyA availability -----------------------
-
-def test_verify_without_oracle_raises_value_error():
-    graph = OrchardGraph()
-    nid = graph.add_candidate([10, 10, 50, 50], 0.9, 1)
-    ctx = ActionContext(image_pil=Image.new("RGB", (100, 100)), graph=graph,
-                        cfg=Config(), oracle=None, query_set=None,
-                        discovery=DiscoveryCurve(), partition=[(0, 0, 100, 100)])
-    with pytest.raises(ValueError, match="oracle"):
-        execute(VerifyA(node_ids=[nid]), ctx)
-
-
-def _verify_favoring_phi():
-    """One stable-but-unresolved node in a large region: VerifyA has the best
-    VoI-per-cost ratio (no fresh discovery, no small-object tile boost)."""
-    return dict(
-        K=1, n_t=0, D=[2, 0, 0], U=10.0,
-        ids=["n1"], centers=[[25, 25]], area=[2500.0], classification=["unresolved"],
-        w=[1.6], s=[0.5], k=[2], delta=[0.0],
-        tiling_status=False, remaining_budget=9,
-    )
-
-
-def test_heuristic_proposes_verify_only_under_vip():
-    partition = [(0, 0, 50, 50)]
-    vip_cfg = dataclasses.replace(Config(), verifier_mode="vip")
-    assert isinstance(policy_heuristic.choose(_verify_favoring_phi(), partition, vip_cfg), VerifyA)
-
-    for mode in ("ioc", "off"):
-        cfg = dataclasses.replace(Config(), verifier_mode=mode)
-        action = policy_heuristic.choose(_verify_favoring_phi(), partition, cfg)
-        assert not isinstance(action, VerifyA)
 
 
 # ----------------------- 2. leaf cache keyed by ROI -----------------------
@@ -263,13 +228,6 @@ def test_qwen_oracle_survives_request_exceptions():
     oracle = QwenOracle(Config(), client=_ExplodingClient())
     answers = oracle.answer_batch(Image.new("RGB", (32, 32)), qs)
     assert answers.tolist() == [0] * len(qs.queries)    # all-zeros fallback, no raise
-
-
-def test_inspect_scene_survives_request_exceptions():
-    from agent.inspect import inspect_scene
-    z = inspect_scene(Image.new("RGB", (32, 32)), {"K": 0}, Config(),
-                      client=_ExplodingClient())
-    assert z["recommend"] == "query" and z["notes"] == "fallback"
 
 
 # ----------------------- 7. sam3_phrase round-trip -----------------------

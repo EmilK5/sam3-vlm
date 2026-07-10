@@ -1,15 +1,14 @@
 """
 Tests for agent/budget.py (CostMeter) and its wiring into agent.actions.execute.
 
-Query/TileQuery are exercised through a stubbed `pipeline.execute_pass`; the stub
-returns an int-like carrying n_tiles so tile cost can be metered on CPU.
+Query/Look are exercised through a stubbed `pipeline.execute_pass`; the stub
+returns an int-like carrying the PassStats call-count fields so cost can be
+metered on CPU.
 """
 
-import os
 import sys
 import types
 
-import numpy as np
 import pytest
 from PIL import Image
 
@@ -17,9 +16,7 @@ from config import Config
 from graph import OrchardGraph
 from agent.belief import DiscoveryCurve
 from agent.budget import CostMeter
-from agent.actions import (
-    QueryA, TileQueryA, SubdivideA, VerifyA, StopA, ActionContext, execute,
-)
+from agent.actions import QueryA, LookROIA, StopA, ActionContext, execute
 
 
 # ----------------------- CostMeter.total -----------------------
@@ -101,35 +98,19 @@ def test_query_later_pass_counts_one_sam(fake_pipeline):
     assert ctx.cost.n_orch == 1
 
 
-def test_tilequery_counts_tiles(fake_pipeline):
+def test_look_later_pass_counts_one_sam(fake_pipeline):
     ctx = _ctx()
     ctx.n_passes = 1             # pass 2 so no leaf-map term
-    execute(TileQueryA(prompt="p", conf=0.3), ctx)
-    assert ctx.cost.n_tile == 4  # from the stub's n_tiles
-    assert ctx.cost.n_sam == 0
+    execute(LookROIA(region=(0, 0, 60, 60)), ctx)  # untiled ROI query (v2)
+    assert ctx.cost.n_sam == 1
+    assert ctx.cost.n_tile == 0
     assert ctx.cost.n_orch == 1
 
 
-def test_verify_counts_oracle_calls_batched():
-    from verifier.queries import load_query_set
-    from verifier.oracle import MockOracle
-    qs = load_query_set(os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "queries", "green_citrus.json"))
-    graph = OrchardGraph()
-    ids = [graph.add_candidate([10, 10, 50, 50], 0.9, 1),
-           graph.add_candidate([60, 60, 90, 90], 0.9, 1)]
-    ctx = _ctx(graph=graph, oracle=MockOracle("target"), query_set=qs)  # batched default
-
-    execute(VerifyA(node_ids=ids), ctx)
-    assert ctx.cost.n_verify == 2   # one oracle call per node (batched)
-    assert ctx.cost.n_orch == 1
-
-
-def test_subdivide_and_stop_only_count_orchestration():
+def test_stop_only_counts_orchestration():
     ctx = _ctx()
-    execute(SubdivideA(region=(0, 0, 100, 100)), ctx)
     execute(StopA(estimate_name="N_obs"), ctx)
-    assert ctx.cost.n_orch == 2
+    assert ctx.cost.n_orch == 1
     assert (ctx.cost.n_sam, ctx.cost.n_tile, ctx.cost.n_verify) == (0, 0, 0)
 
 
@@ -140,10 +121,9 @@ def test_scripted_sequence_matches_hand_computed_total(fake_pipeline):
     ctx = _ctx(cfg=cfg)
 
     execute(QueryA(region=(0, 0, 50, 50), prompt="p", conf=0.3), ctx)   # pass1: n_sam += 2, orch=1
-    execute(TileQueryA(prompt="p", conf=0.3), ctx)                      # pass2: n_tile += 4, orch=2
-    execute(SubdivideA(region=(0, 0, 100, 100)), ctx)                   # orch=3
-    execute(StopA(estimate_name="N_obs"), ctx)                          # orch=4
+    execute(LookROIA(region=(40, 40, 100, 100)), ctx)                   # pass2: n_sam += 1, orch=2
+    execute(StopA(estimate_name="N_obs"), ctx)                          # orch=3
 
-    assert (ctx.cost.n_sam, ctx.cost.n_tile, ctx.cost.n_verify, ctx.cost.n_orch) == (2, 4, 0, 4)
-    # total = 2 + 0.25*4 + 0.5*0 + 0.05*4 = 2 + 1 + 0.2 = 3.2
-    assert ctx.cost.total(cfg) == pytest.approx(3.2)
+    assert (ctx.cost.n_sam, ctx.cost.n_tile, ctx.cost.n_verify, ctx.cost.n_orch) == (3, 0, 0, 3)
+    # total = 3*1 + 0.25*0 + 0.5*0 + 0.05*3 = 3.15
+    assert ctx.cost.total(cfg) == pytest.approx(3.15)

@@ -64,8 +64,14 @@ class Config:
     crop_scale: float = 1.4
     crop_size: int = 256
     answer_mode: str = "batched"  # "batched" | "sequential"
+    sam3_presence_tau: float = 0.5  # RouterOracle SAM3-presence threshold: a sam3-routed
+    #     query answers +1 when the SAM3 presence score on the crop is >= this, else -1
+    #     (v2 step 8.4; was a getattr default, promoted here in 8.5).
 
     # --- oracle (Qwen-3-VL via OpenAI-compatible endpoint) ---
+    oracle_kind: str = "qwen"  # "qwen" (one VLM call per crop answers every query) |
+    #     "router" (RouterOracle: cv/sam3 queries answered locally per their `route`,
+    #     only the residual sent to Qwen). Selects which verify oracle run_eval builds.
     oracle_base_url: str = dataclasses.field(
         default_factory=lambda: os.environ.get("QWEN_BASE_URL", "")
     )
@@ -93,8 +99,6 @@ class Config:
         }
     )
     budget_max_actions: int = 12
-    c0: float = 1.0            # base orchestration cost in the VoI-per-cost ratio
-    small_area: float = 1024.0 # median candidate area (px^2) below which tiling is boosted
     tau_w: float = 0.5         # support-score threshold: low-w verification / N_supp
     k_min: int = 2             # min support k for the N_cons estimator
     tau_high: float = 0.5      # high-confidence s_bar threshold for N_cons

@@ -1,15 +1,13 @@
 """
-Tests for agent/policy_heuristic.choose, agent/runner.run_episode, and the
-belief.count_estimates estimators added for this step.
+Tests for agent/policy_heuristic.choose (v2 look/stop fallback),
+agent/runner.run_episode, and the belief.count_estimates estimators.
 """
 
 from config import Config
 from graph import OrchardGraph
 from agent.belief import DiscoveryCurve, count_estimates
-from agent.actions import (
-    QueryA, TileQueryA, SubdivideA, VerifyA, StopA, ActionContext,
-)
-from agent.policy_heuristic import choose
+from agent.actions import QueryA, LookROIA, StopA, ActionContext
+from agent.policy_heuristic import choose, _grid_cells
 from agent import runner
 
 
@@ -59,29 +57,40 @@ def test_choose_does_not_stop_when_uncertainty_high():
     assert not isinstance(action, StopA)
 
 
-# ----------------------- action selection -----------------------
+# ----------------------- action selection (v2: look/stop only) -----------------------
 
-def test_empty_graph_first_action_is_a_query():
+def test_empty_graph_first_action_is_a_look_inside_the_anchor():
     action = choose(_phi(D=[], K=0), [(0, 0, 100, 100)], Config())
-    assert isinstance(action, QueryA)
-    assert action.region == (0, 0, 100, 100)
+    assert isinstance(action, LookROIA)
+    assert action.region in _grid_cells((0, 0, 100, 100))
 
 
-def test_small_objects_prefer_tiling():
-    # One tiny-area candidate; TileQuery gets the small-object boost and should win.
-    cfg = Config()
+def test_look_targets_the_emptiest_grid_cell():
+    # All candidates crowd the top-left cell; with no sensing passes yet (D=[]),
+    # the pick is the emptiest-ranked cell, i.e. NOT the top-left one.
     phi = _phi(
-        K=1, D=[3], U=5.0,
-        ids=["n1"], centers=[[50, 50]], area=[100.0], classification=["fruit"],
-        w=[1.5], s=[0.9], k=[3], delta=[0.0],
+        K=3, D=[], U=5.0,
+        ids=["a", "b", "c"], centers=[[10, 10], [20, 20], [30, 30]],
+        area=[100.0] * 3, classification=["fruit"] * 3,
+        w=[1.5] * 3, s=[0.9] * 3, k=[1] * 3, delta=[0.0] * 3,
     )
-    action = choose(phi, [(0, 0, 100, 100)], cfg)
-    assert isinstance(action, TileQueryA)
+    action = choose(phi, [(0, 0, 100, 100)], Config())
+    assert isinstance(action, LookROIA)
+    assert action.region != (0, 0, 50.0, 50.0)          # crowded TL cell not picked
 
 
-def test_returns_a_valid_action_type():
+def test_look_cycles_cells_with_sensing_passes():
+    # Same belief, growing D: the pick must walk through all four grid cells
+    # before repeating, so consecutive fallback calls never re-propose a cell.
+    cells = _grid_cells((0, 0, 100, 100))
+    picks = [choose(_phi(D=[1] * t, K=0, U=9.0), [(0, 0, 100, 100)], Config()).region
+             for t in range(4)]
+    assert sorted(picks) == sorted(cells)               # each cell exactly once
+
+
+def test_choose_returns_only_v2_actions():
     action = choose(_phi(D=[1], K=0), [(0, 0, 100, 100)], Config())
-    assert isinstance(action, (QueryA, TileQueryA, SubdivideA, VerifyA, StopA))
+    assert isinstance(action, (LookROIA, StopA))
 
 
 # ----------------------- count estimators -----------------------
@@ -135,13 +144,12 @@ def test_run_episode_stops_by_step_five():
 
 
 def test_run_episode_records_only_sensing_actions_in_discovery():
-    # Non-sensing actions (subdivide) must not enter the discovery curve;
-    # otherwise their zeros fake saturation and can stop the episode at zero.
+    # Non-sensing actions (stop) must not enter the discovery curve; otherwise
+    # their zeros fake saturation.
     cfg = Config()
     ctx = ActionContext(cfg=cfg, graph=OrchardGraph(), discovery=DiscoveryCurve(),
                         partition=[(0, 0, 100, 100)])
     script = iter([
-        SubdivideA(region=(0, 0, 100, 100)),
         QueryA(region=(0, 0, 100, 100), prompt="green fruit", conf=0.3),
         StopA(estimate_name="N_obs"),
     ])
@@ -157,5 +165,5 @@ def test_run_episode_records_only_sensing_actions_in_discovery():
 
     runner.run_episode(image=None, ctx=ctx, policy=policy,
                        max_actions=5, execute_fn=stub_execute)
-    # Only the single Query contributed; subdivide and stop did not.
+    # Only the single Query contributed; the stop did not.
     assert ctx.discovery.as_list() == [1]

@@ -1,7 +1,7 @@
 """
-Tests for the LookROIA sensing action (step 7.1).
+Tests for the LookROIA sensing action (step 7.1; untiled since v2 step 8.1).
 
-LookROIA expands a VLM-proposed ROI, guards it, and runs a tiled SAM3 query
+LookROIA expands a VLM-proposed ROI, guards it, and runs ONE untiled SAM3 query
 restricted to it via pipeline.execute_pass. The ROI is a SENSING TARGET ONLY and
 must never become a graph node. execute_pass pulls in torch, so we stub `pipeline`
 in sys.modules (same pattern as test_actions.py) to keep this CPU-only.
@@ -10,7 +10,6 @@ in sys.modules (same pattern as test_actions.py) to keep this CPU-only.
 import sys
 import types
 
-import numpy as np
 import pytest
 from PIL import Image
 
@@ -85,13 +84,13 @@ def test_roi_iou_basic():
 
 # ----------------------- sensing -----------------------
 
-def test_look_senses_expanded_roi_tiled(fake_pipeline):
+def test_look_senses_expanded_roi_untiled(fake_pipeline):
     ctx = _ctx()
     n = execute(LookROIA(region=(40, 40, 120, 120)), ctx)
     assert isinstance(n, int) and n == 3
     call = fake_pipeline.calls[-1]
     assert call["roi_override"] == (32, 32, 128, 128)   # +10% margin, clamped
-    assert call["tiling"] is True                        # ROI query is tiled
+    assert call["tiling"] is False                       # v2: one untiled query
     assert ctx.n_passes == 1                             # counts as a sensing pass
     assert ctx.sensed_rois == [(32, 32, 128, 128)]       # recorded for dedup
 

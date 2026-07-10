@@ -130,9 +130,18 @@ def verifier_label(cfg, force_tile=False) -> str:
     return cfg.verifier_mode + tag
 
 
-def build_verifier(verifier: str, base_cfg=None, query_file=None, oracle=None):
+def build_verifier(verifier: str, base_cfg=None, query_file=None, oracle=None,
+                   oracle_kind="qwen", processor=None):
     """Return (cfg, oracle, query_set) for a verifier mode. Oracle/query_set are
-    None unless verifier == 'vip'. A prebuilt oracle may be injected (tests)."""
+    None unless verifier == 'vip'. A prebuilt oracle may be injected (tests).
+
+    oracle_kind selects the verify oracle when none is injected:
+      "qwen"   -> QwenOracle (one VLM call per crop answers every query).
+      "router" -> RouterOracle: cv/sam3 queries answered locally per their
+                  `route`, only the residual sent to a wrapped QwenOracle. The
+                  `processor` (SAM3) is passed through for the sam3 channel;
+                  None just makes sam3-routed queries answer 0 (unsure).
+    """
     cfg = dataclasses.replace(base_cfg or Config(), verifier_mode=verifier)
     if verifier != "vip":
         return cfg, None, None
@@ -140,7 +149,12 @@ def build_verifier(verifier: str, base_cfg=None, query_file=None, oracle=None):
     query_set = load_query_set(query_file or cfg.vip_query_file)
     if oracle is None:
         from verifier.oracle import QwenOracle
-        oracle = QwenOracle(cfg)
+        vlm_oracle = QwenOracle(cfg)
+        if oracle_kind == "router":
+            from verifier.oracle import RouterOracle
+            oracle = RouterOracle(cfg, processor=processor, vlm_oracle=vlm_oracle)
+        else:
+            oracle = vlm_oracle
     return cfg, oracle, query_set
 
 
@@ -203,11 +217,10 @@ def _run_agent_policy(policy, processor, image_pil, cfg, oracle, query_set,
                       graph, episode_execute_fn, force_tile=False):
     """heuristic / vlm episodes. Returns (CostMeter, n_actions).
 
-    force_tile: run one unconditional TileQueryA before the policy loop starts
-    (consuming 1 unit of the action budget), so every episode gets at least one
-    genuine tiled pass regardless of what the policy would have picked.
+    force_tile is ignored for agent episodes (v2: the action space has no tiled
+    action -- a warning is logged); fixed policies keep their tiled pass 1.
     """
-    from agent.actions import ActionContext, TileQueryA, execute as default_execute
+    from agent.actions import ActionContext
     from agent.belief import DiscoveryCurve
     from agent import runner, policy_heuristic
 
@@ -238,12 +251,7 @@ def _run_agent_policy(policy, processor, image_pil, cfg, oracle, query_set,
     )
     forced_actions = 0
     if force_tile:
-        exec_fn = episode_execute_fn or default_execute
-        tile_prompt = getattr(cfg, "target_prompt", "green fruit")
-        tile_conf = getattr(cfg, "conf", 0.3)
-        n_new = int(exec_fn(TileQueryA(prompt=tile_prompt, conf=tile_conf), ctx))
-        ctx.discovery.append(n_new)
-        forced_actions = 1
+        logging.warning("--force-tile is ignored for agent policies (v2 has no tiled action).")
 
     pol = policy_heuristic.choose if policy == "heuristic" else runner.make_vlm_policy(ctx)
     # The guided-ROI VLM episode opens with a mandatory global bootstrap pass
@@ -476,6 +484,11 @@ def parse_args(argv=None):
     parser.add_argument("--policy", required=True,
                         choices=["oneshot", "cascade", "tiled", "convergence", "heuristic", "vlm"])
     parser.add_argument("--verifier", choices=["ioc", "vip", "off"], default="ioc")
+    parser.add_argument("--oracle", choices=["qwen", "router"], default="qwen",
+                        help="Verify oracle for --verifier vip. 'qwen' (default): one VLM "
+                             "call per crop. 'router': RouterOracle -- cv/sam3 queries are "
+                             "answered locally per their query-set `route`, only the residual "
+                             "goes to Qwen (<=1 VLM call per crop).")
     parser.add_argument("--overlap-mode", choices=["box", "mask"], default="box",
                         help="Overlap geometry: NMS IoU/IoM + cross-pass dedup on boxes "
                              "(default) or SAM3 instance masks.")
@@ -604,7 +617,18 @@ def main():
 
     base_cfg = Config()
     conf = args.conf if args.conf is not None else base_cfg.conf
-    cfg, oracle, query_set = build_verifier(args.verifier, base_cfg, args.query_file)
+
+    # Load SAM3 once (real run). Imported lazily so this module stays torch-free.
+    # Done BEFORE build_verifier so a RouterOracle (--oracle router) can use the
+    # processor for its SAM3-presence channel.
+    import torch
+    import inference
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    bpe_path = f"{base_cfg.sam3_repo}/assets/bpe_simple_vocab_16e6.txt.gz"
+    _, processor = inference.load_sam3_model(bpe_path, conf, device=device)
+
+    cfg, oracle, query_set = build_verifier(args.verifier, base_cfg, args.query_file,
+                                            oracle_kind=args.oracle, processor=processor)
     if args.canopy_roi == "auto":
         use_canopy_roi = args.dataset == "local"
     else:
@@ -634,13 +658,7 @@ def main():
     logger.info("cross-pass dedup metric=%s threshold=%.3f (--dedup-metric=%s --dedup-threshold=%s)",
                cfg.cross_pass_dedup_metric, cfg.cross_pass_dedup_threshold,
                args.dedup_metric, args.dedup_threshold)
-
-    # Load SAM3 once (real run). Imported lazily so this module stays torch-free.
-    import torch
-    import inference
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    bpe_path = f"{cfg.sam3_repo}/assets/bpe_simple_vocab_16e6.txt.gz"
-    _, processor = inference.load_sam3_model(bpe_path, conf, device=device)
+    logger.info("verify oracle: %s (--oracle=%s, verifier=%s)", args.oracle, args.oracle, args.verifier)
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     done = existing_keys(args.out)

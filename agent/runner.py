@@ -10,39 +10,44 @@ import json
 import logging
 
 from agent import belief
-from agent.actions import QueryA, TileQueryA, LookROIA, StopA
+from agent.actions import QueryA, LookROIA, StopA
 from agent.actions import execute as default_execute
 from agent import policy_vlm
-from agent.inspect import inspect_scene, should_inspect
+from agent.history import EpisodeHistory, action_params, node_summary
 
 logger = logging.getLogger(__name__)
 
 
-def make_vlm_policy(ctx, inspect_client=None, vlm_client=None):
-    """Adapt the VLM orchestrator into a runner policy `callable(phi, partition, cfg)`.
+def make_vlm_policy(ctx, vlm_client=None):
+    """Adapt the v2 full-history VLM orchestrator into a runner policy
+    `callable(phi, partition, cfg)`.
 
-    Maintains the episode step counter and last scene assessment z. Runs
-    inspect_scene only when the fixed protocol (should_inspect) fires, then asks
-    policy_vlm.choose to pick an action (which hard-validates and falls back to
-    the heuristic on any violation). Clients are injectable for offline testing.
+    The policy is stateless per step: it shows the VLM the whole episode history
+    (ctx.history) plus the raw + overlay frames and asks for the next region to
+    sense. policy_vlm.choose hard-validates and falls back to the heuristic on any
+    violation. There is no separate scene-inspection (z) call in v2 -- the full
+    history subsumes it. Client injectable for offline testing.
     """
-    state = {"t": 0, "last_z": None}
-
     def policy(phi, partition, cfg):
-        state["t"] += 1
-        if should_inspect(state["t"], phi, state["last_z"]):
-            state["last_z"] = inspect_scene(ctx.image_pil, phi, cfg, client=inspect_client)
-        # The VLM sees the frame so it can place ROI ("look") boxes.
-        return policy_vlm.choose(phi, state["last_z"], partition, ctx.graph, cfg,
-                                 client=vlm_client, image=ctx.image_pil)
+        return policy_vlm.choose(
+            phi, getattr(ctx, "history", None), ctx.graph, cfg,
+            client=vlm_client, image=ctx.image_pil,
+            sensed_rois=getattr(ctx, "sensed_rois", None),
+        )
 
     return policy
 
 
 # Sensing actions observe new candidates and so feed the discovery curve; the
-# non-sensing ones (subdivide/verify/stop) do not (recording their 0 would fake
-# saturation and could end the episode before it has ever sensed).
-_SENSING = (QueryA, TileQueryA, LookROIA)
+# non-sensing StopA does not (recording its 0 would fake saturation and could
+# end the episode before it has ever sensed).
+_SENSING = (QueryA, LookROIA)
+
+
+def _totals(ctx) -> dict:
+    """A compact snapshot of the current count state for a history record."""
+    return {"K": len(ctx.graph.nodes),
+            "N_obs": int(belief.count_estimates(ctx.graph, ctx.cfg)["N_obs"])}
 
 
 def run_episode(image, ctx, policy, max_actions, execute_fn=None,
@@ -51,67 +56,102 @@ def run_episode(image, ctx, policy, max_actions, execute_fn=None,
 
     image      : PIL image (stored on ctx.image_pil).
     ctx        : ActionContext (graph, cfg, oracle, query_set, discovery,
-                 partition, cost).
+                 partition, cost). An EpisodeHistory is attached as ctx.history.
     policy     : callable(phi, partition, cfg) -> action.
-    max_actions: hard budget cap on the number of actions.
+    max_actions: hard budget cap on the number of SENSING actions.
     execute_fn : injectable executor (defaults to agent.actions.execute).
     bootstrap_global_pass: when True, run one mandatory global (non-tiled) QueryA
         over the full-frame region (partition[0], the canopy tree_roi) BEFORE the
-        policy loop, seeding candidates + pseudo-exemplars. Counts against
-        max_actions. Default off so existing (heuristic-baseline) episodes are
-        unchanged.
+        policy loop, seeding candidates + pseudo-exemplars. This ONE sensing pass
+        is decomposed into three explicit history records the policy will see --
+        canopy_roi, leaf_map, global_pass -- and is billed as ONE sensing action
+        against max_actions (the canopy/leaf-map records document the pass, they
+        are not separately billed). Default off so existing (heuristic-baseline)
+        episodes are unchanged.
     auto_stop: when True, end the episode once discovery saturates on a non-empty
         graph (DiscoveryCurve.saturated over cfg.window_m / cfg.delta_disc), even
         if the policy never returns StopA. Budget exhaustion is the other backstop
         (the loop cap); "all proposed ROIs sensed" is subsumed by saturation.
         Default off.
 
-    Returns {"graph", "counts": {N_obs,N_supp,N_cons}, "log": [...], "cost"}.
+    Returns {"graph", "counts": {N_obs,N_supp,N_cons}, "log": [...],
+             "history": [...], "cost"}. "log" and "history" have equal length
+    (one entry per executed action, with the bootstrap contributing three).
     """
     execute_fn = execute_fn or default_execute
     if image is not None:
         ctx.image_pil = image
+    ctx.history = EpisodeHistory()
 
     log = []
 
-    def _step(t, action):
-        n_new = int(execute_fn(action, ctx))
-        if isinstance(action, _SENSING):
-            ctx.discovery.append(n_new)
+    def _record(x, y):
+        """Append one history record + its mirrored one-line log entry."""
+        ctx.history.append(x, y)
         u = belief.uncertainty(ctx.graph, ctx.discovery, ctx.cfg)
         cost_so_far = ctx.cost.total(ctx.cfg) if ctx.cost is not None else 0.0
         log.append({
-            "t": t,
-            "action": type(action).__name__,
-            "n_new": n_new,
+            "t": len(log) + 1,
+            "action": x["action"],
+            "n_new": y["n_new"],
             "U": round(u, 3),
             "cost_so_far": round(cost_so_far, 3),
         })
         logger.info(json.dumps(log[-1]))
-        return n_new
 
-    t = 0
-    # Mandatory global bootstrap pass (proposal §"Guided-ROI policy"): a non-tiled
-    # QueryA over the episode's full-frame region seeds candidates + pseudo-exemplars
-    # before the policy ever acts, so later tiled/Look passes are exemplar-primed.
+    def _sense(action):
+        """Execute a sensing/stop action; return (n_new, [new node summaries])."""
+        pre_ids = set(ctx.graph.nodes)
+        n_new = int(execute_fn(action, ctx))
+        if isinstance(action, _SENSING):
+            ctx.discovery.append(n_new)
+        new_nodes = [node_summary(ctx.graph.nodes[nid])
+                     for nid in ctx.graph.nodes if nid not in pre_ids]
+        return n_new, new_nodes
+
+    sensing_used = 0  # sensing actions consumed (the budget counter, != len(log))
+
+    # Mandatory global bootstrap pass (docs/active_perception_formulation.md §
+    # "bootstrap"): one non-tiled QueryA over partition[0] (the canopy tree_roi),
+    # decomposed into three explicit records so the policy sees what was done.
     if bootstrap_global_pass:
-        t += 1
         region = tuple(ctx.partition[0]) if ctx.partition else (0, 0, 0, 0)
         prompt = getattr(ctx.cfg, "target_prompt", "green fruit")
         conf = getattr(ctx.cfg, "conf", 0.3)
-        _step(t, QueryA(region=region, prompt=prompt, conf=conf))
+        boot = QueryA(region=region, prompt=prompt, conf=conf)
+        n_new, new_nodes = _sense(boot)
+        sensing_used += 1
+        totals = _totals(ctx)
 
-    while t < max_actions:
+        # (1) canopy_roi: the tree ROI box actually used (graph.tree_roi or, when
+        #     unset -- offline/stub runs -- the region the pass ran over).
+        tree_roi = getattr(ctx.graph, "tree_roi", None) or list(region)
+        _record({"action": "canopy_roi", "roi": list(tree_roi)},
+                {"n_new": 0, "new_nodes": [], "totals": totals})
+        # (2) leaf_map: the number of background-leaf boxes the pass generated.
+        leaf_boxes = getattr(ctx.graph, "cached_leaf_boxes", None)
+        n_leaves = int(len(leaf_boxes)) if leaf_boxes is not None else 0
+        _record({"action": "leaf_map", "n_leaves": n_leaves},
+                {"n_new": 0, "new_nodes": [], "totals": totals})
+        # (3) global_pass: the standard observation record for the QueryA.
+        x_global = action_params(boot)
+        x_global["action"] = "global_pass"
+        _record(x_global, {"n_new": n_new, "new_nodes": new_nodes, "totals": totals})
+
+    while sensing_used < max_actions:
         # Auto-stop backstop: saturated discovery on a non-empty graph ends the
         # episode before spending another action, even if the policy never stops.
         if (auto_stop and len(ctx.graph.nodes) > 0
                 and ctx.discovery.saturated(ctx.cfg.window_m, ctx.cfg.delta_disc)):
             break
-        t += 1
-        remaining = max_actions - (t - 1)
+        remaining = max_actions - sensing_used
         phi = belief.summarize(ctx.graph, ctx.discovery, remaining, ctx.cfg)
         action = policy(phi, ctx.partition, ctx.cfg)
-        _step(t, action)
+        n_new, new_nodes = _sense(action)
+        if isinstance(action, _SENSING):
+            sensing_used += 1
+        _record(action_params(action),
+                {"n_new": n_new, "new_nodes": new_nodes, "totals": _totals(ctx)})
         if isinstance(action, StopA):
             break
 
@@ -119,5 +159,6 @@ def run_episode(image, ctx, policy, max_actions, execute_fn=None,
         "graph": ctx.graph,
         "counts": belief.count_estimates(ctx.graph, ctx.cfg),
         "log": log,
+        "history": ctx.history.as_list(),
         "cost": ctx.cost.total(ctx.cfg) if ctx.cost is not None else 0.0,
     }

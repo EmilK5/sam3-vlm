@@ -52,8 +52,8 @@ def test_policy_tunables_live_in_config():
     # live in config (CLAUDE.md: no magic numbers outside config.py).
     cfg = Config()
     assert cfg.target_prompt == "green fruit"
-    assert cfg.c0 == 1.0
-    assert cfg.small_area == 1024.0
+    # (c0 / small_area were removed in v2 step 8.5 -- only the deleted tile-menu
+    # heuristic used them.)
     assert cfg.tau_w == 0.5
     assert cfg.k_min == 2
     assert cfg.tau_high == 0.5

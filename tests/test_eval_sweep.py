@@ -318,7 +318,9 @@ def test_force_tile_cascade_only_tiles_pass1():
     assert cost.n_tile == 1 and cost.n_sam == 3 and n_actions == 4
 
 
-def test_force_tile_agent_episode_runs_tile_first_and_counts_one_extra_action():
+def test_force_tile_is_ignored_for_agent_episodes():
+    # v2 (8.1): the agent action space has no tiled action, so --force-tile must
+    # not inject anything into an episode -- it runs exactly as without it.
     seen_actions = []
 
     def episode_fn(action, ctx):
@@ -330,9 +332,9 @@ def test_force_tile_agent_episode_runs_tile_first_and_counts_one_extra_action():
         "heuristic", processor=None, image_pil=Image.new("RGB", (64, 64)), cfg=cfg,
         oracle=None, query_set=None, prompt="green fruit", conf=0.35,
         episode_execute_fn=episode_fn, force_tile=True)
-    assert seen_actions[0] == "TileQueryA"
+    assert "TileQueryA" not in seen_actions
     assert isinstance(cost, CostMeter)
-    assert n_actions == 3  # forced pass (1) + remaining budget (2), never over budget_max_actions
+    assert n_actions == 3  # the full budget; force_tile consumed nothing
 
 
 def test_evaluate_image_row_uses_mask_tagged_verifier(tmp_path):

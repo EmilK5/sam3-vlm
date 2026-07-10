@@ -252,19 +252,19 @@ def _build_oracle(cfg, verifier, use_mock, mock_true_class):
 
 
 def _forced_tile_pass(ctx, cfg):
-    """Unconditionally run one tiled SAM3 pass (pipeline.tiled_engine splits the
-    canopy ROI into an overlapping grid of quadrant-ish tiles) before the policy
-    loop starts, so every episode gets at least one genuine tiled/split call
-    regardless of what the heuristic/VLM would have picked on its own. Uses only
+    """Unconditionally run one global SAM3 pass over the anchor region before
+    the policy loop starts (v2: the action space has no tiled action, so the
+    old forced TileQueryA became a global QueryA over partition[0]). Uses only
     the public agent.actions API (same call runner.run_episode makes internally),
     so no core file is touched."""
-    from agent.actions import TileQueryA, execute as agent_execute
+    from agent.actions import QueryA, execute as agent_execute
     prompt = getattr(cfg, "target_prompt", "green fruit")
     conf = getattr(cfg, "conf", 0.3)
-    n_new = int(agent_execute(TileQueryA(prompt=prompt, conf=conf), ctx))
+    region = tuple(ctx.partition[0]) if ctx.partition else (0, 0, 0, 0)
+    n_new = int(agent_execute(QueryA(region=region, prompt=prompt, conf=conf), ctx))
     ctx.discovery.append(n_new)
     logging.getLogger("agent.runner").info(json.dumps({
-        "t": 0, "action": "TileQueryA(forced-initial-split)", "n_new": n_new,
+        "t": 0, "action": "QueryA(forced-initial-global)", "n_new": n_new,
         "cost_so_far": round(ctx.cost.total(cfg), 3),
     }))
 
@@ -299,13 +299,19 @@ def _run_episode(image_pil, cfg, policy, oracle, query_set, use_mock, force_tile
     if policy == "heuristic":
         pol = policy_heuristic.choose
     elif use_mock:
+        # v2: make_vlm_policy takes only vlm_client (scene-inspection retired in 8.3).
         stub = _StubChatClient(cfg)
-        pol = runner.make_vlm_policy(ctx, inspect_client=stub, vlm_client=stub)
+        pol = runner.make_vlm_policy(ctx, vlm_client=stub)
     else:
         pol = runner.make_vlm_policy(ctx)
 
+    # v2: VLM episodes ALWAYS open with the mandatory bootstrap (canopy_roi /
+    # leaf_map / global_pass records) and auto-stop on saturation, mirroring
+    # eval.run_eval._run_agent_policy; the heuristic baseline is untouched.
+    is_vlm = policy != "heuristic"
     remaining_budget = max(0, cfg.budget_max_actions - (1 if force_tile else 0))
-    result = runner.run_episode(image_pil, ctx, pol, max_actions=remaining_budget)
+    result = runner.run_episode(image_pil, ctx, pol, max_actions=remaining_budget,
+                                bootstrap_global_pass=is_vlm, auto_stop=is_vlm)
     return result, ctx
 
 

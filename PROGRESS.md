@@ -45,8 +45,123 @@ follow the "Suggested order of the first week" in the plan.
 - [x] 7.3 Guided-ROI VLM policy (agent/policy_vlm.py, agent/runner.py, eval/run_eval.py, tests/test_policy_vlm_roi.py; + tests/test_policy_vlm.py migration) — implemented; suite green (228). Check: run_eval --policy vlm --limit 1; after the bootstrap pass every look/tile/verify senses, no no-op spins, stops on saturation/budget.
 - [x] 7.4 Config, thinking toggle, CLAUDE.md #3 reword (config.py, CLAUDE.md, agent/policy_vlm.py, tests/test_thinking_toggle.py) — implemented; suite green (232). Check: grep a policy-loop request log — disable-thinking arg present, no thinking trace; inspect/verify still think; pytest green. CAVEAT: verify the exact Ollama qwen3-vl disable-thinking key (see config.thinking_call_kwargs).
 
+## Phase 8 — v2: full-history amortized policy (branch: v2)
+- [x] 8.1 Action space v2: untiled look, delete tile/subdivide/verify (agent/actions.py, agent/policy_heuristic.py, tests/test_actions_v2.py + stale-test migration; scope widened w/ user approval to runner/policy_vlm/run_eval/orchestration_app ripple fixes) — check: REPL LookROIA logs a single global (not tiled) inference inside the expanded box; pytest green (264).
+- [x] 8.2 Episode history + explicit 3-action bootstrap (agent/history.py, agent/runner.py, tests/test_history.py; migrated tests/test_runner_bootstrap.py) — implemented; suite green (271). Check: episode log starts canopy_roi/leaf_map/global_pass with a sane tree ROI box + leaf count; history length == log length.
+- [x] 8.3 Full-history VLM policy + overlay image, retire inspect (agent/policy_vlm.py, agent/overlay.py, agent/runner.py; deleted agent/inspect.py + tests/test_inspect.py; new tests/test_policy_vlm_v2.py; migrated test_policy_vlm.py/test_policy_vlm_roi.py; trimmed 1 inspect test in test_review_fixes.py) — implemented; suite green (258). Check: one logged prompt carries raw+overlay images and the complete x/y history; no "fallback" lines on a healthy run.
+- [x] 8.4 V-IP routing: CV + SAM3 channels, RouterOracle (verifier/queries.py, verifier/cv_answers.py, verifier/oracle.py, queries/green_citrus.json, tests/test_oracle_routing.py; scope: scripts/demo_verify.py --oracle router) — implemented; suite green (270). Check: demo_verify --oracle router shows ≤1 Qwen call per candidate; hand-review routed green_citrus.json.
+- [~] 8.5 v2 wiring: config, eval, apps (config.py, eval/run_eval.py, orchestration_app.py, tests/test_v2_wiring.py; scope: tests/test_smoke.py for removed knobs) — implemented; suite green (277). runner.py needed no change. Check: run_eval --policy vlm --oracle router --limit 1 end-to-end.
+
 ## Notes / decisions log
 <!-- Append dated one-liners here when a step deviates from the plan. -->
+- 2026-07-10 (phase-8 review, user request): whole-phase code review found and
+  fixed 2 bugs outside any step's file list: (1) citrus_orchestration_app.py
+  still called the pre-8.3 make_vlm_policy(ctx, inspect_client=..., vlm_client=...)
+  signature -> TypeError on its mock-VLM path; now (ctx, vlm_client=...).
+  (2) orchestration_app.py ran VLM episodes WITHOUT the mandatory v2 bootstrap
+  (violating the locked "3 bootstrap records always precede the policy" design;
+  citrus app + run_eval both had it) -> run_episode now gets
+  bootstrap_global_pass/auto_stop = (policy != "heuristic"). Suite green (277).
+  Flagged-not-fixed runtime risks recorded in the review handoff: full-frame/16
+  ROI area floor vs free VLM looks on high-res frames; guarded no-op looks are
+  indistinguishable from zero-detection senses in the history; two full-res
+  base64 images per policy call; per-look leaf-map regeneration (2 SAM3 calls
+  per look); CSV n_actions counts the bootstrap as 3 records; untuned cv
+  thresholds in green_citrus.json.
+- 2026-07-10 (8.5): config.py removed small_area + c0 (only the deleted
+  tile-menu heuristic used them; grep-confirmed dead) and added
+  sam3_presence_tau=0.5 (promoted from the 8.4 getattr) + oracle_kind="qwen".
+  run_eval: --oracle {qwen,router}; build_verifier gained oracle_kind+processor
+  and builds RouterOracle(cfg, processor, vlm_oracle=QwenOracle) when selected;
+  main() reordered to load SAM3 BEFORE build_verifier so the router gets the
+  processor for its sam3 channel. orchestration_app.py: minimal fix of the
+  broken make_vlm_policy(ctx, inspect_client=..., vlm_client=...) call ->
+  (ctx, vlm_client=...) (inspect retired in 8.3). SCOPE WIDENED (forced):
+  test_smoke.py dropped the small_area/c0 asserts. RESIDUALS left for a future
+  cleanup (out of 8.5's scope): (a) c_inspect/n_inspect are now dead too
+  (inspect deleted in 8.3) but still referenced by agent/budget.py +
+  eval/metrics.py, so left in place (n_inspect is always 0 -> inert);
+  (b) orchestration_app's _StubChatClient still emits a v1 "tile"/"assess" mock
+  which now just falls back to the heuristic (harmless) -- a fuller v2 mock is a
+  demo-only nicety. runner.py listed in the plan but needed no change (bootstrap/
+  auto_stop + the router oracle already flow through run_eval -> ActionContext).
+  Phase 8 code complete (8.1-8.5 all [~]/[x]).
+- 2026-07-10 (8.4): four resolutions vs the plan text, all logged. (1) cv_check
+  gains an optional "direction": "high"|"low" (default "high" == the plan's
+  yes-above/no-below); "low" flips the answer sign so shape/texture queries
+  whose "yes" is the LOW end (leaf-like = low circularity; smooth bg = low
+  edge_density) can route to cv. (2) green_citrus.json gets NO sam3 route: it
+  has no part-presence query, and adding one with a sam3_phrase would break the
+  out-of-scope test_oracle.py assertion that the set is phrase-free — so the
+  sam3 channel is exercised by a synthetic set in test_oracle_routing.py, and a
+  part query is left for the human's JSON review. (3) SCOPE WIDENED (You-verify
+  needs it, precedent 0.2/8.1): scripts/demo_verify.py gains --oracle router
+  (RouterOracle with processor=None, vlm_oracle=QwenOracle) + a per-crop
+  vlm/sam call-count print. (4) sam3 presence tau read via getattr(cfg,
+  "sam3_presence_tau", 0.5) — promote to config.py in 8.5. RouterOracle exposes
+  n_vlm_calls/n_sam_calls but wiring them into cost metering is NOT done here
+  (verify.py/pipeline.py unchanged, still meter n_oracle_calls=1 per candidate);
+  that reconciliation is a later step. green_citrus routing: q01/q03 circularity
+  (high/low), q06 edge_density (low), q02/q04/q05 stay vlm.
+- 2026-07-10 (8.3): policy_vlm.choose new signature is
+  choose(phi, history, graph, cfg, client, image, sensed_rois) per the plan
+  (partition dropped). The heuristic fallback needs a partition, so it is
+  derived as [tree_roi] (the v2 partition IS the single tree ROI):
+  tree_roi = graph.tree_roi, else the full frame when an image is present, else
+  None. look is validated INSIDE tree_roi (not merely the frame). The prompt
+  now sends TWO image parts (raw frame + agent/overlay.render_overlay drawing:
+  candidate boxes by class, sensed ROIs blue, tree ROI magenta — PIL only).
+  make_vlm_policy signature changed to (ctx, vlm_client=None) — inspect_client
+  dropped; it reads ctx.history + ctx.sensed_rois via getattr. SCOPE WIDENED
+  (same precedent as 8.1, out-of-scope but forced by the mandated deletion of
+  agent/inspect.py): trimmed test_review_fixes.py's
+  test_inspect_scene_survives_request_exceptions (its subject module is gone).
+  orchestration_app.py / citrus_orchestration_app.py keep a now-dead "assess"
+  branch in their mock-client dispatch (comment references agent.inspect, no
+  import — no breakage); left for 8.5. run_eval calls make_vlm_policy(ctx)
+  positionally, unaffected by the signature change.
+- 2026-07-10 (8.2): two resolutions vs the plan text, both logged. (1) history
+  new_nodes are computed by a pre/post node-id DIFF, not by filtering on
+  found_in_pass — equivalent on the real pipeline but robust to stub executors
+  that reuse a fixed pass number. (2) run_episode now decouples a per-record
+  counter (one per log line / history record) from the sensing-budget counter
+  (max_actions caps SENSING actions only): the bootstrap trio is 3 records but 1
+  budget unit. ctx.history (EpisodeHistory) is set as a runtime attribute on
+  ActionContext (not a declared field — actions.py is out of 8.2's scope; the
+  dataclass isn't slotted so this is legal). run_episode return dict gains an
+  additive "history" key; "log"/"history" are 1:1. KNOWN follow-up for 8.5:
+  eval/run_eval.py:251 and orchestration_app.py report len(result["log"]) as
+  "actions used", which now counts the bootstrap as 3 lines instead of 1 (a
+  cosmetic reporting artifact — budget itself is enforced inside run_episode).
+  bootstrap_global_pass default stays False (heuristic-baseline episodes
+  unchanged); the v2 VLM path already passes True.
+- 2026-07-10 (8.1, scope widened w/ user approval): deleting TileQueryA/
+  SubdivideA/VerifyA broke module-level imports outside 8.1's named files, so
+  the step also made minimal mechanical fixes there: agent/runner.py (drop
+  TileQueryA from the import + _SENSING), agent/policy_vlm.py (menu/validation
+  reduced to look/stop; tile/verify branches and their helpers _valid_conf/
+  _valid_prompt/_valid_node_ids/_verifiable_ids removed — pulled forward from
+  8.3), eval/run_eval.py (agent-episode --force-tile now warns + no-ops; fixed
+  policies keep their tiled pass 1), orchestration_app.py (forced TileQueryA ->
+  global QueryA over partition[0] — pulled forward from 8.5). Additionally
+  migrated tests beyond the named four: test_look_roi.py (tiling False),
+  test_runner_bootstrap.py (TileQueryA -> LookROIA), test_eval_sweep.py
+  (force-tile agent test now asserts it is ignored), test_policy_vlm.py +
+  test_policy_vlm_roi.py (tile/verify tests removed; "fell back" now asserted
+  as equality with the heuristic's action, since the v2 heuristic itself emits
+  LookROIA). Heuristic cell "cycling" is stateless: rank 2x2 cells by fewest
+  candidates, rotate the pick by len(phi["D"]) % 4. 8.3/8.5 shrink accordingly.
+- 2026-07-10 (Phase 8 planned, user decisions): v2 simplification per
+  docs/active_perception_formulation.md. Locked with the user: full history
+  (x_1^t, y_1^t) rebuilt into ONE stateless prompt per step (raw image +
+  annotated overlay + JSON history); action menu collapses to look/stop with
+  look = ONE UNTILED SAM3 query on a free ROI inside the tree ROI;
+  TileQueryA/SubdivideA/VerifyA and agent/inspect.py are DELETED on the v2
+  branch (user-approved amendment of the "old path stays default" rule for
+  these); fixed 3-record bootstrap (canopy_roi, leaf_map, global_pass) always
+  precedes the policy; V-IP queries get a per-query route field
+  (cv/sam3/vlm) with a RouterOracle so Qwen only answers the residual.
+  Plan only — no code changed this session.
 - 2026-07-06 (7.1): roi_margin/roi_min_size/roi_max_depth/roi_dup_iou read via
   getattr with defaults (0.10 / 32px / 2 / 0.7); promoted to config.py in 7.4
   (matches policy_heuristic's "not yet in config" precedent). "Max 2 splits"

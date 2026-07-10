@@ -1,26 +1,22 @@
 """
-Tests for agent/actions.py.
+Tests for agent/actions.py (v2 action space: QueryA / LookROIA / StopA).
 
-QueryA/TileQueryA call pipeline.execute_pass, which pulls in torch/inference; we
-stub `pipeline` in sys.modules with a fake execute_pass so dispatch is testable on
-CPU. Subdivide/Verify need no models (Verify uses the torch-free MockOracle path).
+QueryA calls pipeline.execute_pass, which pulls in torch/inference; we stub
+`pipeline` in sys.modules with a fake execute_pass so dispatch is testable on
+CPU. LookROIA-specific behavior (guards, grounding) lives in test_look_roi.py
+and test_actions_v2.py.
 """
 
 import sys
 import types
 
-import numpy as np
 import pytest
 from PIL import Image
 
 from config import Config
 from graph import OrchardGraph
 from agent.belief import DiscoveryCurve
-from agent import actions
-from agent.actions import (
-    QueryA, TileQueryA, SubdivideA, VerifyA, StopA, ActionContext,
-    execute, subdivide_region,
-)
+from agent.actions import QueryA, StopA, ActionContext, execute
 
 
 # ----------------------- fake pipeline.execute_pass -----------------------
@@ -63,14 +59,7 @@ def _ctx(**overrides):
     return ActionContext(**base)
 
 
-# ----------------------- subdivide_region (pure) -----------------------
-
-def test_subdivide_region_quadrants():
-    quads = subdivide_region((0, 0, 100, 100))
-    assert quads == [(0, 0, 50, 50), (50, 0, 100, 50), (0, 50, 50, 100), (50, 50, 100, 100)]
-
-
-# ----------------------- QueryA / TileQueryA dispatch -----------------------
+# ----------------------- QueryA dispatch -----------------------
 
 def test_query_action_restricts_to_region_and_returns_int(fake_pipeline):
     ctx = _ctx()
@@ -81,59 +70,15 @@ def test_query_action_restricts_to_region_and_returns_int(fake_pipeline):
     assert len(ctx.graph.nodes) == 3
 
 
-def test_tilequery_action_is_global_tiled(fake_pipeline):
-    ctx = _ctx()
-    n = execute(TileQueryA(prompt="green fruit", conf=0.3), ctx)
-    assert n == 3
-    assert fake_pipeline.calls[-1]["roi_override"] is None
-    assert fake_pipeline.calls[-1]["tiling"] is True
-
-
 def test_pass_number_advances_only_with_sensing_passes(fake_pipeline):
     ctx = _ctx()
     execute(QueryA(region=(0, 0, 50, 50), prompt="p", conf=0.3), ctx)
     assert fake_pipeline.calls[-1]["pass_number"] == 1   # first sensing pass
     # Non-sensing actions must NOT advance the pass number (they used to, via
     # the discovery-curve length, skewing pass-dependent pipeline behavior).
-    execute(SubdivideA(region=(0, 0, 100, 100)), ctx)   # non-sensing: runner records nothing
-    execute(QueryA(region=(0, 0, 25, 25), prompt="p", conf=0.3), ctx)
+    execute(StopA(estimate_name="N_obs"), ctx)           # non-sensing
+    execute(QueryA(region=(0, 0, 60, 60), prompt="p", conf=0.3), ctx)
     assert fake_pipeline.calls[-1]["pass_number"] == 2
-
-
-# ----------------------- SubdivideA (no model) -----------------------
-
-def test_subdivide_updates_partition_without_calling_models():
-    # processor that explodes if touched, and no fake pipeline installed
-    exploding = types.SimpleNamespace()
-    ctx = _ctx(processor=exploding)
-    n = execute(SubdivideA(region=(0, 0, 100, 100)), ctx)
-    assert n == 0
-    assert ctx.partition == [(0, 0, 50, 50), (50, 0, 100, 50), (0, 50, 50, 100), (50, 50, 100, 100)]
-
-
-def test_subdivide_unknown_region_raises():
-    ctx = _ctx(partition=[(0, 0, 100, 100)])
-    with pytest.raises(ValueError):
-        execute(SubdivideA(region=(10, 10, 20, 20)), ctx)
-
-
-# ----------------------- VerifyA (real FM+V-IP via MockOracle) -----------------------
-
-def test_verify_action_classifies_named_nodes():
-    import os
-    from verifier.queries import load_query_set
-    from verifier.oracle import MockOracle
-    qs = load_query_set(os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "queries", "green_citrus.json"))
-
-    graph = OrchardGraph()
-    nid = graph.add_candidate([10, 10, 50, 50], 0.9, 1)  # unresolved
-    ctx = _ctx(graph=graph, oracle=MockOracle("target"), query_set=qs)
-
-    n = execute(VerifyA(node_ids=[nid]), ctx)
-    assert n == 0
-    assert graph.nodes[nid].classification == "fruit"
-    assert graph.nodes[nid].vip_chain is not None
 
 
 # ----------------------- StopA + unknown -----------------------

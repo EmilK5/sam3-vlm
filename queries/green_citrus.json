@@ -7,32 +7,41 @@
     {
       "id": "q01",
       "text": "Is the central object round or ball-shaped in outline?",
-      "templates": {"target": 1, "distractor": -1, "spurious": 0}
+      "templates": {"target": 1, "distractor": -1, "spurious": 0},
+      "route": "cv",
+      "cv_check": {"feature": "circularity", "direction": "high", "yes_above": 0.72, "no_below": 0.5}
     },
     {
       "id": "q02",
       "text": "Is the central object compact and roughly as wide as it is tall?",
-      "templates": {"target": 1, "distractor": -1, "spurious": 0}
+      "templates": {"target": 1, "distractor": -1, "spurious": 0},
+      "route": "vlm"
     },
     {
       "id": "q03",
       "text": "Is the central object a flat, thin, leaf-like shape?",
-      "templates": {"target": -1, "distractor": 1, "spurious": 0}
+      "templates": {"target": -1, "distractor": 1, "spurious": 0},
+      "route": "cv",
+      "cv_check": {"feature": "circularity", "direction": "low", "yes_above": 0.72, "no_below": 0.5}
     },
     {
       "id": "q04",
       "text": "Does the object have a pointed tip or an elongated, tapering leaf outline?",
-      "templates": {"target": -1, "distractor": 1, "spurious": 0}
+      "templates": {"target": -1, "distractor": 1, "spurious": 0},
+      "route": "vlm"
     },
     {
       "id": "q05",
       "text": "Is most of the crop plain background such as bare soil, ground, bark, or dead debris?",
-      "templates": {"target": -1, "distractor": -1, "spurious": 1}
+      "templates": {"target": -1, "distractor": -1, "spurious": 1},
+      "route": "vlm"
     },
     {
       "id": "q06",
       "text": "Is most of the crop open sky or a smooth, out-of-focus background with no leaves or fruit?",
-      "templates": {"target": -1, "distractor": -1, "spurious": 1}
+      "templates": {"target": -1, "distractor": -1, "spurious": 1},
+      "route": "cv",
+      "cv_check": {"feature": "edge_density", "direction": "low", "yes_above": 0.12, "no_below": 0.03}
     }
   ]
 }

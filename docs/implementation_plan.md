@@ -534,3 +534,180 @@ exemplars grow), there are no no-op spins, and it stops on saturation/budget.
 **You verify:** grep a policy-loop request log — the disable-thinking arg is
 present and the response carries no thinking trace; `inspect`/`verify` requests
 still think. `pytest -q` green.
+
+---
+
+# Phase 8 — v2: full-history amortized policy (active-perception formulation)
+
+Motivation: `docs/active_perception_formulation.md` recasts the system as He
+et al.-style active perception — the sensing action $x_t$ is a SAM3 query, and
+Qwen-3-VL is an amortized policy $\pi_\theta(u_t \mid \xi, x_{past}, y_{past})$
+that must therefore SEE the full past $x_1^t, y_1^t$. v2 collapses the agent to
+exactly that formulation and simplifies everything around it. Branch: `v2`.
+
+Design decisions locked in with the user (2026-07-10, do not relitigate):
+- **Full history each step, rebuilt prompt.** Every policy call is one
+  stateless prompt containing: the raw frame, an annotated overlay image
+  (current candidate boxes colored by class + already-sensed ROIs + tree ROI),
+  and a JSON log of every past action $x_1^t$ and observation $y_1^t$ (ROI,
+  n_new, new boxes with id/conf/class, running totals) plus the current belief
+  summary. No multi-turn chat state; each prompt is self-contained and
+  auditable from the episode log.
+- **One policy action: `look`.** Menu = {`look(region)`, `stop`}. The region is
+  any xyxy box inside the tree ROI; a look = ONE untiled SAM3 query on the
+  (margin-expanded, clamped) ROI — no tiling, since selecting a box already IS
+  tiling. `TileQueryA` / `SubdivideA` / `VerifyA` are **deleted** on v2 (a
+  user-approved amendment of the "old path stays default" rule for these three;
+  the fixed run_eval baselines call `execute_pass` directly and are unaffected).
+  Verification stays automatic inside `execute_pass` (`verifier_mode`), never a
+  policy action. Runner auto-stop (saturation/budget) stays as the backstop.
+- **Fixed 3-action bootstrap** before the policy ever acts, each recorded as an
+  explicit history entry the VLM will see: (1) canopy/tree-ROI detection,
+  (2) global leaf map, (3) one global untiled SAM3 pass on the tree ROI.
+  (Physically these already happen at episode setup / inside the first
+  `execute_pass`; v2 makes them explicit $x_1..x_3$ records with observations.)
+- **V-IP answers routed to the cheapest able channel.** A per-query `route`
+  field in the query-set JSON: `"cv"` (deterministic crop/mask features —
+  color/shape/texture, no model call), `"sam3"` (presence score via
+  `sam3_phrase`), `"vlm"` (default). A `RouterOracle` composes the channels;
+  Qwen receives only the residual `vlm` queries, in one batched call.
+- **`inspect_scene` / z is retired.** The full-history prompt subsumes the
+  separate scene-inspection call; `agent/inspect.py` and its wiring are deleted.
+- Grounding invariant unchanged: candidates originate only from SAM3; a VLM
+  region is a sensing target only (CLAUDE.md hard-constraint #3).
+- `orchestration_app.py` imports the deleted actions; it gets a minimal import
+  fix only (no restructuring) in 8.5.
+
+### Step 8.1 — Action space v2: untiled look, delete legacy actions
+**Files:** `agent/actions.py`, `agent/policy_heuristic.py`,
+`tests/test_actions_v2.py`; migrate/trim stale tests: `tests/test_actions.py`,
+`tests/test_policy_heuristic.py`, `tests/test_budget.py`,
+`tests/test_review_fixes.py`.
+**Prompt:**
+> In `agent/actions.py`: change `_execute_look` to run ONE untiled SAM3 query
+> (`tiling=False`) on the margin-expanded ROI via `execute_pass`
+> `roi_override` — everything else about LookROIA (margin, clamp, min-size /
+> depth-floor / duplicate guards, grounding invariant, metering) is unchanged.
+> Delete `TileQueryA`, `SubdivideA`, `VerifyA`, `subdivide_region`,
+> `_execute_subdivide`, `_execute_verify`, and their `execute()` branches.
+> `QueryA` stays (it is the bootstrap/global sensing primitive). Rewrite
+> `policy_heuristic.choose` as the minimal look/stop fallback: stop when
+> discovery is saturated (or the graph is empty of unsensed evidence), else
+> look at the cell of a fixed 2x2 grid over `partition[0]` (the tree ROI) with
+> the fewest registered candidates, cycling cells so repeats don't hit the
+> duplicate-ROI guard. Migrate the named test files (delete tests of removed
+> actions; keep every guard/grounding/metering test alive). New
+> `tests/test_actions_v2.py`: a LookROIA executes exactly one untiled pass
+> (stub pipeline asserts `tiling is False` and `roi_override` equals the
+> expanded box); the removed action names are gone from the module; the
+> heuristic emits only LookROIA/StopA and stops on a saturated curve.
+**You verify:** REPL LookROIA on a dense corner of a real image — overlay shows
+detections only inside the expanded box, log shows a single global (not tiled)
+inference; `pytest -q` green.
+
+### Step 8.2 — Episode history record + explicit 3-action bootstrap
+**Files:** `agent/history.py` (new), `agent/runner.py`,
+`tests/test_history.py`; migrate `tests/test_runner_bootstrap.py`.
+**Prompt:**
+> New `agent/history.py`: an `EpisodeHistory` (list of plain dicts, JSON-ready)
+> with one record per executed action:
+> `{t, x: {action, params...}, y: {n_new, new_nodes: [{id, box, conf, class}],
+> totals: {K, N_obs}}}` — boxes in global-frame xyxy pixels; `new_nodes` are the
+> graph nodes whose `found_in_pass` equals the pass just executed.
+> In `runner.run_episode`: store the history on `ctx.history`; after every
+> executed action append its record. Replace the single bootstrap QueryA with
+> the fixed 3-action bootstrap, always on for this runner path (flag
+> `bootstrap_global_pass` may remain as the switch, still counted against
+> budget as ONE sensing action — the canopy and leaf-map records document what
+> the pass did, they are not separately billed): record (1) `canopy_roi` with
+> the tree ROI box actually used (`graph.tree_roi` or full frame), (2)
+> `leaf_map` with the leaf-box count (`graph.cached_leaf_boxes`), (3)
+> `global_pass` with the standard observation record. Keep one JSON log line
+> per record. Policy callable signature stays `(phi, partition, cfg)`; policies
+> that need history read `ctx.history` via their closure (make_vlm_policy).
+> Pytest with a stub executor: bootstrap yields exactly 3 leading records with
+> those action names; a look appends a record whose `new_nodes` match the stub
+> graph; records are `json.dumps`-able.
+**You verify:** run one episode; the log's first three lines are
+canopy_roi/leaf_map/global_pass with a sane tree ROI box and leaf count;
+history length == log length.
+
+### Step 8.3 — Full-history VLM policy + overlay image
+**Files:** `agent/policy_vlm.py`, `agent/overlay.py` (new), `agent/runner.py`
+(drop inspect wiring), delete `agent/inspect.py` + `tests/test_inspect.py`;
+`tests/test_policy_vlm_v2.py`; migrate/trim `tests/test_policy_vlm.py`,
+`tests/test_policy_vlm_roi.py`.
+**Prompt:**
+> New `agent/overlay.py`: `render_overlay(image_pil, graph, sensed_rois,
+> tree_roi) -> PIL.Image` — PIL ImageDraw only; candidate boxes colored by
+> classification (fruit/leaf/spurious/unresolved), sensed ROIs and the tree ROI
+> in distinct styles; no matplotlib, no model. Rework `policy_vlm`: `choose(phi,
+> history, graph, cfg, client=None, image=None, sensed_rois=None)` builds ONE
+> stateless prompt per step: system prompt = active-perception orchestrator
+> (you pick the next region $x_t$ to sense, guided by the FULL past); user
+> content = JSON body {target_concept, image_size, tree_roi, history (complete
+> $x_1^t, y_1^t$), phi (compact belief), action_menu: {look: {region:
+> \[x1,y1,x2,y2\]}, stop: {estimate_name}}} + the raw image + the overlay
+> image (two image parts). Delete the z/inspect plumbing and the tile/verify
+> menu entries. Validation: look region must be four numbers inside the tree
+> ROI (not merely the frame); stop only on a non-empty graph; any
+> parse/validation failure falls back to `policy_heuristic.choose` (unchanged
+> safety net). `runner.make_vlm_policy` drops should_inspect/inspect_scene and
+> passes `ctx.history` + `ctx.sensed_rois`. Pytest with a fake client: the
+> request carries exactly two image parts and the full history JSON verbatim;
+> a legal look inside the tree ROI maps to LookROIA; a look outside the tree
+> ROI (but inside the frame) falls back; menu contains only look/stop.
+**You verify:** run a VLM episode with prompt logging; read one full prompt —
+history matches the episode log line-for-line, overlay image opens and shows
+the boxes; every executed action validated (grep for "fallback").
+
+### Step 8.4 — V-IP routing: CV + SAM3 channels, RouterOracle
+**Files:** `verifier/queries.py`, `verifier/cv_answers.py` (new),
+`verifier/oracle.py`, `queries/green_citrus.json`,
+`tests/test_oracle_routing.py`.
+**Prompt:**
+> `queries.py`: add optional per-query `route` in {"cv","sam3","vlm"} (default
+> "vlm"; validate: route=="sam3" requires `sam3_phrase`; route=="cv" requires a
+> new `cv_check` dict naming a feature + thresholds). New
+> `verifier/cv_answers.py`: deterministic features on the 256px crop —
+> `hue_fraction(lo,hi)` (color), `circularity` of the dominant contour after
+> Otsu/HSV threshold (shape), `edge_density` via cv2.Laplacian (texture);
+> `answer(crop_pil, cv_check) -> {-1,0,+1}` with a yes-above / no-below /
+> unsure-between threshold pair. New `RouterOracle(cfg, processor=None,
+> vlm_oracle=None)` in `oracle.py` exposing the standard
+> `answer_batch(crop_pil, query_set)`: cv queries answered locally; sam3
+> queries by the existing presence-score pattern (0 when no processor); the
+> residual vlm queries answered by ONE `QwenOracle` call on a subset view of
+> the query set (0-fill when no vlm oracle); expose `n_vlm_calls` (0 or 1) and
+> `n_sam_calls` from the last batch so verify metering counts only real model
+> calls. Update `queries/green_citrus.json`: route the color/shape/texture
+> queries to cv, part-presence queries to sam3 (add phrases), leave the
+> genuinely semantic ones on vlm — the human re-reviews the JSON by hand.
+> V-IP math (`vip.py`, `verify.py`) unchanged: only the SOURCE of answers
+> moves. Pytest: routing partitions the query ids exactly; a synthetic green
+> disc crop answers yes-green/yes-round without any oracle; the fake vlm
+> client receives ONLY the vlm-routed queries; missing channels yield 0
+> (never a wrong confident answer).
+**You verify:** `scripts/demo_verify.py --oracle router` (add the choice) on a
+clear fruit crop and a leaf crop — chains sensible, log shows ≤1 Qwen call per
+candidate; hand-review the routed green_citrus.json.
+
+### Step 8.5 — v2 wiring: config, eval, apps, docs
+**Files:** `config.py`, `eval/run_eval.py`, `agent/runner.py`,
+`orchestration_app.py` (import fix only), `PROGRESS.md`,
+`tests/test_v2_wiring.py`.
+**Prompt:**
+> `config.py`: remove knobs orphaned by the deletions (anything only the
+> tile/subdivide/verify menu used), add `oracle_kind`/router option and any 8.4
+> thresholds that were getattr defaults. `run_eval`: `--policy vlm` runs the v2
+> episode (3-record bootstrap + look/stop loop + auto-stop) and `--oracle
+> router` wires RouterOracle; heuristic/fixed policies keep working.
+> `orchestration_app.py`: fix imports of deleted actions minimally (drop the
+> broken menu paths). Offline end-to-end pytest with stub processor +
+> MockOracle + fake VLM client: a full v2 episode produces history =
+> [canopy_roi, leaf_map, global_pass, look..., stop/auto-stop], counts sane,
+> cost metered, everything `json.dumps`-able.
+**You verify:** `run_eval --policy vlm --oracle router --limit 1` on a real
+image end-to-end; read the episode JSON — bootstrap trio first, every look is
+inside the tree ROI, Qwen verify calls ≤ 1 per candidate, episode stops on its
+own.

@@ -31,11 +31,22 @@ class Query:
 
     sam3_phrase (optional): a segmentable noun phrase (e.g. "stem") for the
     SAM3-presence oracle channel; None means only VLM oracles answer this query.
+
+    route (v2 step 8.4): which oracle channel answers this query under
+    RouterOracle -- "cv" (classical CV, no model call), "sam3" (SAM3 presence),
+    or "vlm" (default, the residual answered by one VLM call). route is ignored
+    by the single-channel oracles (MockOracle/QwenOracle/Sam3Oracle answer every
+    query regardless), so it is a no-op on those paths.
+
+    cv_check (required iff route=="cv"): the classical-CV feature + thresholds
+    (see verifier/cv_answers.py) used to answer this query locally.
     """
     id: str
     text: str
     templates: dict
     sam3_phrase: str = None
+    route: str = "vlm"
+    cv_check: dict = None
 
 
 @dataclasses.dataclass
@@ -121,8 +132,23 @@ def _validate(data: dict) -> QuerySet:
         if sam3_phrase is not None and (not isinstance(sam3_phrase, str) or not sam3_phrase.strip()):
             raise ValueError(f"Query '{qid}' has a non-string/empty 'sam3_phrase': {sam3_phrase!r}.")
 
+        # --- routing channel (v2 step 8.4) ---
+        route = q.get("route", "vlm")
+        if route not in ("cv", "sam3", "vlm"):
+            raise ValueError(f"Query '{qid}' has an invalid 'route' {route!r}; "
+                             f"must be one of 'cv', 'sam3', 'vlm'.")
+        cv_check = q.get("cv_check")
+        if route == "sam3" and not sam3_phrase:
+            raise ValueError(f"Query '{qid}' is route='sam3' but has no 'sam3_phrase'.")
+        if route == "cv":
+            if cv_check is None:
+                raise ValueError(f"Query '{qid}' is route='cv' but has no 'cv_check'.")
+            from verifier.cv_answers import validate_cv_check  # lazy: keeps cv2 out of the import path
+            validate_cv_check(cv_check)  # raises ValueError on a bad feature/threshold spec
+
         queries.append(Query(id=qid, text=q["text"], templates=dict(templates),
-                             sam3_phrase=sam3_phrase))
+                             sam3_phrase=sam3_phrase, route=route,
+                             cv_check=dict(cv_check) if cv_check is not None else None))
 
     return QuerySet(
         concept=concept,

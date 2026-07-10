@@ -1,20 +1,20 @@
 """
 agent/actions.py
 
-The sensing action layer (proposal §"Action Space"): plain dataclasses for the
-allowed actions and a single execute() dispatcher.
+The sensing action layer (v2, active-perception formulation): plain dataclasses
+for the allowed actions and a single execute() dispatcher.
 
-    QueryA(region, prompt, conf)   - SAM3 on one region (roi_override)
-    TileQueryA(prompt, conf)       - tiled SAM3 over the (canopy) image
-    LookROIA(region)               - tiled SAM3 on a VLM-proposed ROI (sensing
-                                     target only; +margin, guarded, never a node)
-    SubdivideA(region)             - split a region 2x2 in the partition (no model)
-    VerifyA(node_ids)              - FM+V-IP verify named candidates, update them
+    QueryA(region, prompt, conf)   - SAM3 on one region (roi_override); the
+                                     bootstrap/global sensing primitive
+    LookROIA(region)               - ONE untiled SAM3 query on a policy-proposed
+                                     ROI (sensing target only; +margin, guarded,
+                                     never a node)
     StopA(estimate_name)           - terminate; names the count estimator to report
 
 execute(action, ctx) -> int  (number of new candidate tracks the action created;
-0 for Subdivide / Verify / Stop, and 0 for a guarded/no-op LookROIA).
-ctx (ActionContext) bundles the sensing state.
+0 for Stop, and 0 for a guarded/no-op LookROIA). ctx (ActionContext) bundles the
+sensing state. Verification is not an action: it runs automatically inside
+execute_pass (cfg.verifier_mode).
 
 Grounding invariant: no VLM-supplied box ever becomes a candidate. A LookROIA
 region is a SENSING TARGET ONLY -- it is passed to execute_pass as roi_override to
@@ -27,11 +27,7 @@ import logging
 
 import numpy as np
 
-from verifier.verify import verify_candidate  # torch-free
 from agent.budget import CostMeter
-
-# target/distractor/spurious -> candidate-graph classification tags (mirrors pipeline).
-_VIP_TAG = {"target": "fruit", "distractor": "leaf", "spurious": "spurious"}
 
 
 # ----------------------- action dataclasses -----------------------
@@ -44,26 +40,11 @@ class QueryA:
 
 
 @dataclasses.dataclass
-class TileQueryA:
-    prompt: str
-    conf: float
-
-
-@dataclasses.dataclass
 class LookROIA:
-    region: tuple            # xyxy ROI the VLM proposes to sense. A SENSING TARGET
-                             # ONLY: expanded + tiled by execute(), never added to
-                             # the graph as a candidate (grounding invariant).
-
-
-@dataclasses.dataclass
-class SubdivideA:
-    region: tuple            # xyxy region to split 2x2
-
-
-@dataclasses.dataclass
-class VerifyA:
-    node_ids: list           # candidate node ids to (re)verify
+    region: tuple            # xyxy ROI the policy proposes to sense. A SENSING
+                             # TARGET ONLY: expanded + sensed once (untiled) by
+                             # execute(), never added to the graph as a candidate
+                             # (grounding invariant).
 
 
 @dataclasses.dataclass
@@ -83,27 +64,13 @@ class ActionContext:
     discovery: object = None
     partition: list = dataclasses.field(default_factory=list)
     cost: CostMeter = dataclasses.field(default_factory=CostMeter)
-    n_passes: int = 0        # sensing passes executed (Query/TileQuery/Look only),
-                             # so Verify/Subdivide/Stop never inflate pass numbers
+    n_passes: int = 0        # sensing passes executed (Query/Look only), so a
+                             # Stop never inflates pass numbers
     sensed_rois: list = dataclasses.field(default_factory=list)  # expanded xyxy ROIs
                              # already sensed by LookROIA, for de-duplicating repeats
 
 
 # ----------------------- helpers -----------------------
-
-def subdivide_region(region) -> list:
-    """Split an xyxy region into its four quadrants (top-left, top-right,
-    bottom-left, bottom-right)."""
-    x1, y1, x2, y2 = region
-    mx = (x1 + x2) / 2.0
-    my = (y1 + y2) / 2.0
-    return [
-        (x1, y1, mx, my),
-        (mx, y1, x2, my),
-        (x1, my, mx, y2),
-        (mx, my, x2, y2),
-    ]
-
 
 def _expand_and_clamp(region, margin, img_w, img_h) -> tuple:
     """Grow an xyxy region outward by `margin` (a fraction of its OWN width/height)
@@ -140,7 +107,7 @@ def _next_pass_number(ctx) -> int:
     """execute_pass pass_number for the next sensing action in the episode.
 
     Counts only sensing passes (ctx.n_passes), not all episode actions, so a
-    VerifyA/SubdivideA between queries does not skew pass-dependent behavior in
+    non-sensing action between queries does not skew pass-dependent behavior in
     the pipeline (leaf-map caching, exemplar feedback, the pass>=3 IoC guard).
     """
     return int(getattr(ctx, "n_passes", 0)) + 1
@@ -176,7 +143,7 @@ def _execute_query(action, ctx, tiling, roi_override) -> int:
 
 
 def _meter_query(ctx, stats):
-    """Meter a Query/TileQuery from the pass's actual call counts (PassStats):
+    """Meter a Query/Look from the pass's actual call counts (PassStats):
     global SAM3 calls (canopy if run + leaf map if generated + global proposal),
     tile calls, and any inline FM+V-IP oracle calls made under verifier='vip'."""
     if ctx.cost is None:
@@ -187,19 +154,20 @@ def _meter_query(ctx, stats):
 
 
 def _execute_look(action, ctx) -> int:
-    """Sense a VLM-proposed ROI (proposal §"Guided-ROI policy").
+    """Sense a policy-proposed ROI (docs/active_perception_formulation.md §6).
 
-    Expand the proposed region by cfg.roi_margin, clamp to the image, then run a
-    tiled SAM3 query restricted to it. The ROI is a SENSING TARGET ONLY: it is
-    forwarded to execute_pass as roi_override and is never inserted into the graph;
-    every candidate still originates from SAM3 inside the ROI. Exemplars are picked
-    up automatically by execute_pass (the graph feedback path), so a Look run after
-    the global bootstrap pass is exemplar-primed.
+    Expand the proposed region by cfg.roi_margin, clamp to the image, then run
+    ONE untiled SAM3 query restricted to it -- selecting an ROI already is the
+    tiling, so the crop is sensed in a single global inference (v2 decision).
+    The ROI is a SENSING TARGET ONLY: it is forwarded to execute_pass as
+    roi_override and is never inserted into the graph; every candidate still
+    originates from SAM3 inside the ROI. Exemplars are picked up automatically
+    by execute_pass (the graph feedback path), so a Look run after the global
+    bootstrap pass is exemplar-primed.
 
     Returns the number of new candidate tracks, or 0 (no model call) when the ROI
     is below cfg.roi_min_size, zoomed past cfg.roi_max_depth quadrant levels, or
-    duplicates an already-sensed ROI. roi_* are read via getattr with documented
-    defaults; step 7.4 promotes them into config.py.
+    duplicates an already-sensed ROI.
     """
     cfg = ctx.cfg
     margin = getattr(cfg, "roi_margin", 0.10)
@@ -233,51 +201,14 @@ def _execute_look(action, ctx) -> int:
             return 0
 
     # Sense: reuse the Query executor (metering + pass-number bookkeeping) with a
-    # tiled, ROI-restricted pass. The VLM chose only WHERE to look; the concept
-    # prompt and confidence are system-level (never model-supplied).
+    # single untiled, ROI-restricted pass. The VLM chose only WHERE to look; the
+    # concept prompt and confidence are system-level (never model-supplied).
     prompt = getattr(cfg, "target_prompt", "green fruit")
     conf = getattr(cfg, "conf", 0.3)
     inner = QueryA(region=roi, prompt=prompt, conf=conf)
-    n_new = _execute_query(inner, ctx, tiling=True, roi_override=roi)
+    n_new = _execute_query(inner, ctx, tiling=False, roi_override=roi)
     ctx.sensed_rois.append(roi)
     return n_new
-
-
-def _execute_subdivide(action, ctx) -> int:
-    quadrants = subdivide_region(action.region)
-    if action.region in ctx.partition:
-        idx = ctx.partition.index(action.region)
-        ctx.partition[idx:idx + 1] = quadrants
-    else:
-        raise ValueError(f"SubdivideA region {action.region} is not in the current partition.")
-    return 0  # no model call, no new candidates
-
-
-def _execute_verify(action, ctx) -> int:
-    if ctx.oracle is None or ctx.query_set is None:
-        # Surface the misconfiguration loudly (mirrors the pipeline's vip guard):
-        # VerifyA needs the FM+V-IP oracle; the policies only propose it when
-        # cfg.verifier_mode == "vip", so reaching this means bad episode wiring.
-        raise ValueError("VerifyA requires an oracle and query_set on the ActionContext "
-                         "(configure verifier_mode='vip').")
-    image_np = np.array(ctx.image_pil)
-    classes = ctx.query_set.classes
-    has_distractor = "distractor" in classes
-    for node_id in action.node_ids:
-        node = ctx.graph.nodes.get(node_id)
-        if node is None:
-            continue
-        result = verify_candidate(image_np, node.box, ctx.oracle, ctx.query_set, ctx.cfg)
-        dist_score = result["posterior"][classes.index("distractor")] if has_distractor else 0.0
-        node.scores["fruit_verification"] = float(result["p_target"])
-        node.scores["leaf_verification"] = float(dist_score)
-        node.classification = _VIP_TAG.get(result["verdict"], "unresolved")
-        node.vip_chain = result["chain"]
-        node.vip_posterior = result["posterior"]
-        # n_oracle_calls is 1 (batched) or the chain length (sequential).
-        if ctx.cost is not None:
-            ctx.cost.n_verify += int(result["n_oracle_calls"])
-    return 0  # verification doesn't create new tracks
 
 
 def execute(action, ctx) -> int:
@@ -286,14 +217,8 @@ def execute(action, ctx) -> int:
         ctx.cost.n_orch += 1  # one orchestration decision per executed action
     if isinstance(action, QueryA):
         return _execute_query(action, ctx, tiling=False, roi_override=action.region)
-    if isinstance(action, TileQueryA):
-        return _execute_query(action, ctx, tiling=True, roi_override=None)
     if isinstance(action, LookROIA):
         return _execute_look(action, ctx)
-    if isinstance(action, SubdivideA):
-        return _execute_subdivide(action, ctx)
-    if isinstance(action, VerifyA):
-        return _execute_verify(action, ctx)
     if isinstance(action, StopA):
         return 0
     raise TypeError(f"Unknown action type: {type(action).__name__}")

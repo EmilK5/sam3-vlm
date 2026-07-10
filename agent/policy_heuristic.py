@@ -1,22 +1,23 @@
 """
 agent/policy_heuristic.py
 
-Non-visual value-of-information heuristic policy (the baseline controller).
-choose() ranks every concrete candidate action by an approximate VoI-per-cost
-ratio using cheap predicted-Delta-U proxies, then returns the argmax. It stops
-when the discovery curve has saturated and uncertainty is low.
+Minimal non-visual look/stop fallback policy (v2). choose() stops when the
+discovery curve has saturated and uncertainty is low; otherwise it proposes a
+LookROIA on one cell of a fixed 2x2 grid over the episode's anchor region
+(partition[0], the tree ROI or full frame).
+
+Cell choice: cells are ranked by how few registered candidates they contain
+(fewest first -- the least-sensed area is where predictive information is
+highest), and the pick rotates through that ranking with the number of sensing
+passes taken so far (len(phi["D"])), so consecutive calls never re-propose the
+same cell and trip the duplicate-ROI guard in actions._execute_look.
 
 It consumes only the belief summary phi (from belief.summarize) and the current
-image partition -- no image/crop observations (that is the VLM policy's job).
-
-Config knobs read via getattr (documented defaults; not yet in config):
-    c0=1.0          base orchestration cost keeping the ratio finite
-    target_prompt="green fruit"   the concept string for Query/TileQuery
-    small_area=1024 median-area threshold below which tiling is boosted
-    tau_w=0.5       low-support threshold for choosing verification
+partition -- no image/crop observations (that is the VLM policy's job). All
+boxes are global-frame xyxy pixels.
 """
 
-from agent.actions import QueryA, TileQueryA, SubdivideA, VerifyA, StopA
+from agent.actions import LookROIA, StopA
 
 
 def _in_region(center, region) -> bool:
@@ -25,93 +26,39 @@ def _in_region(center, region) -> bool:
     return x1 <= cx < x2 and y1 <= cy < y2
 
 
-def _region_area(region) -> float:
+def _grid_cells(region) -> list:
+    """The four 2x2 grid cells of an xyxy region (TL, TR, BL, BR)."""
     x1, y1, x2, y2 = region
-    return max(1.0, (x2 - x1) * (y2 - y1))
-
-
-def _median(values):
-    if not values:
-        return 0.0
-    return sorted(values)[len(values) // 2]
+    mx = (x1 + x2) / 2.0
+    my = (y1 + y2) / 2.0
+    return [
+        (x1, y1, mx, my),
+        (mx, y1, x2, my),
+        (x1, my, mx, y2),
+        (mx, my, x2, y2),
+    ]
 
 
 def choose(phi, partition, cfg):
-    """Pick the next action by VoI-per-cost, or StopA when saturated and low-U.
+    """Pick LookROIA on the emptiest grid cell (rotating), or StopA when done.
 
-    Per-action value proxies (all cheap, no model calls):
-      QueryA(r)    = lambda_D * (#fresh k==1 candidates in r)          # recent local discovery
-                   + lambda_U * (region instability sum)              # U(b~; r)
-                   + lambda_C * (|G(r)| / area(r))                     # crowding C_t(r)
-      TileQueryA   = the global version of the above, doubled when the median
-                     candidate area is small (tiling helps small objects)
-      SubdivideA(r)= fraction of r's candidates with k==1              # region still churning
-      VerifyA      = sum of instability over unresolved / low-w nodes
-    Each value is divided by (c0 + cost_sense(action)).
-
-    VerifyA is only proposed when cfg.verifier_mode == "vip": executing it needs
-    the FM+V-IP oracle/query_set, which episode wiring provides only in vip mode.
+    Stopping rule (unchanged from the validated baseline): discovery saturated
+    over cfg.window_m at cfg.delta_disc AND uncertainty U <= cfg.delta_U, and
+    never on an empty graph (an empty graph passes both tests vacuously, which
+    would end the episode having detected nothing).
     """
-    lam = cfg.lambdas
     m = cfg.window_m
-    c0 = getattr(cfg, "c0", 1.0)
-    prompt = getattr(cfg, "target_prompt", "green fruit")
-    small_area = getattr(cfg, "small_area", 1024.0)
-    tau_w = getattr(cfg, "tau_w", 0.5)
-    conf = cfg.conf
-
-    # --- stopping rule: saturated discovery AND low uncertainty ---
-    # Never stop before anything has been sensed. On an empty graph both tests
-    # are vacuously true -- D fills with non-sensing zeros and U=0 because there
-    # are no nodes -- which would end the episode having detected nothing.
     D = phi["D"]
     recent = (sum(D[-m:]) / min(len(D), m)) if D else 0.0
     saturated = len(D) >= m and recent <= cfg.delta_disc
     if phi["K"] > 0 and saturated and phi["U"] <= cfg.delta_U:
         return StopA(estimate_name="N_cons")
 
-    K = phi["K"]
-    centers, k, delta, s, w = phi["centers"], phi["k"], phi["delta"], phi["s"], phi["w"]
-    cls, ids, area = phi["classification"], phi["ids"], phi["area"]
-
-    def instability(i):
-        return 1.0 / (1 + k[i]) + lam["alpha_delta"] * delta[i] + lam["alpha_s"] * (1.0 - s[i])
-
-    scored = []  # (voi_per_cost, action)
-
-    # --- region-restricted Query and Subdivide ---
-    for r in partition:
-        region = tuple(r)
-        idxs = [i for i in range(K) if _in_region(centers[i], region)]
-        local_disc = sum(1 for i in idxs if k[i] == 1)
-        region_inst = sum(instability(i) for i in idxs)
-        crowding = len(idxs) / _region_area(region)
-        v_query = lam["lambda_D"] * local_disc + lam["lambda_U"] * region_inst + lam["lambda_C"] * crowding
-        scored.append((v_query / (c0 + cfg.c_sam), QueryA(region=region, prompt=prompt, conf=conf)))
-
-        frac_fresh = (sum(1 for i in idxs if k[i] == 1) / len(idxs)) if idxs else 0.0
-        scored.append((frac_fresh / (c0 + 0.0), SubdivideA(region=region)))  # no model call
-
-    # --- global TileQuery, boosted for small objects ---
-    global_disc = sum(1 for i in range(K) if k[i] == 1)
-    global_inst = sum(instability(i) for i in range(K))
-    total_area = sum(_region_area(tuple(r)) for r in partition) or 1.0
-    v_tile = lam["lambda_D"] * global_disc + lam["lambda_U"] * global_inst + lam["lambda_C"] * (K / total_area)
-    if area and _median(area) < small_area:
-        v_tile *= 2.0
-    tile_cost = cfg.c_tile * 4  # ~4 tiles (proxy pending real tile count from execution)
-    scored.append((v_tile / (c0 + tile_cost), TileQueryA(prompt=prompt, conf=conf)))
-
-    # --- VerifyA over unresolved / low-support-score nodes (vip verifier only) ---
-    verify_available = getattr(cfg, "verifier_mode", "ioc") == "vip"
-    verify_idxs = [i for i in range(K) if cls[i] == "unresolved" or w[i] < tau_w] if verify_available else []
-    if verify_idxs:
-        v_verify = sum(instability(i) for i in verify_idxs)
-        verify_cost = cfg.c_verify * len(verify_idxs)
-        node_ids = [ids[i] for i in verify_idxs]
-        scored.append((v_verify / (c0 + verify_cost), VerifyA(node_ids=node_ids)))
-
-    if not scored:
-        return StopA(estimate_name="N_cons")
-    scored.sort(key=lambda pair: pair[0], reverse=True)
-    return scored[0][1]
+    anchor = tuple(partition[0]) if partition else (0.0, 0.0, 0.0, 0.0)
+    cells = _grid_cells(anchor)
+    counts = [sum(1 for c in phi["centers"] if _in_region(c, cell)) for cell in cells]
+    # Rank cells emptiest-first (index breaks ties deterministically), then
+    # rotate the pick with the sensing-pass count so repeats cycle the grid.
+    order = sorted(range(len(cells)), key=lambda j: (counts[j], j))
+    pick = order[len(D) % len(cells)]
+    return LookROIA(region=cells[pick])

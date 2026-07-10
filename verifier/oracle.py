@@ -26,6 +26,8 @@ import logging
 
 import numpy as np
 
+from verifier.queries import QuerySet
+
 logger = logging.getLogger(__name__)
 
 # yes/no/unsure -> +1/-1/0. Anything else (incl. missing) maps to 0.
@@ -198,3 +200,84 @@ class Sam3Oracle:
         )[0]
         scores = result["scores"]
         return float(scores[0]) if len(scores) > 0 else 0.0
+
+
+def _subset_view(query_set, idxs) -> QuerySet:
+    """A QuerySet holding only the queries at `idxs`, preserving
+    classes/epsilon/names (the Query objects are shared, so route/cv_check/
+    sam3_phrase come along)."""
+    return QuerySet(
+        concept=query_set.concept,
+        classes=query_set.classes,
+        epsilon=query_set.epsilon,
+        queries=[query_set.queries[m] for m in idxs],
+        class_names=query_set.class_names,
+    )
+
+
+class RouterOracle:
+    """Route each query to the cheapest channel that can answer it, so the VLM is
+    asked as little as possible (docs/active_perception_formulation.md; v2 step
+    8.4). Each query's `route` (verifier/queries.py) selects the channel:
+
+        "cv"   -> deterministic crop features (cv_answers), NO model call
+        "sam3" -> SAM3 presence score (needs a processor; 0 for every sam3 query
+                  when processor is None)
+        "vlm"  -> the residual, answered by ONE vlm_oracle.answer_batch call on a
+                  subset view of just the vlm-routed queries (0-fill when
+                  vlm_oracle is None)
+
+    Same interface as the other oracles: answer_batch(crop_pil, query_set) ->
+    int8 vector of length M in {-1, 0, +1}. After each call, n_vlm_calls (0 or 1)
+    and n_sam_calls hold how many real model calls the LAST batch made, so a
+    caller can meter only real model usage. A missing channel yields 0 (unsure) --
+    never a wrong confident answer (V-IP then falls back to the prior for it).
+
+    Models are injected: `processor` (SAM3) and `vlm_oracle` (e.g. a QwenOracle)
+    are passed in, never imported-and-called globally, so RouterOracle stays
+    testable offline with both absent.
+    """
+
+    def __init__(self, cfg, processor=None, vlm_oracle=None):
+        self.cfg = cfg
+        self.processor = processor
+        self.vlm_oracle = vlm_oracle
+        # sam3_presence_tau is a getattr default here; step 8.5 promotes it to config.
+        tau = getattr(cfg, "sam3_presence_tau", 0.5)
+        self._sam3 = Sam3Oracle(processor, tau) if processor is not None else None
+        self.n_vlm_calls = 0
+        self.n_sam_calls = 0
+
+    def answer_batch(self, crop_pil, query_set) -> np.ndarray:
+        M = len(query_set.queries)
+        out = np.zeros(M, dtype=np.int8)
+        self.n_vlm_calls = 0
+        self.n_sam_calls = 0
+
+        routes = [getattr(q, "route", "vlm") for q in query_set.queries]
+        cv_idx = [m for m in range(M) if routes[m] == "cv"]
+        sam_idx = [m for m in range(M) if routes[m] == "sam3"]
+        vlm_idx = [m for m in range(M) if routes[m] == "vlm"]
+
+        # cv: answered locally, no model call.
+        if cv_idx:
+            from verifier import cv_answers  # lazy: only cv-routed queries need cv2
+            for m in cv_idx:
+                out[m] = cv_answers.answer(crop_pil, query_set.queries[m].cv_check)
+
+        # sam3: presence per phrase (one presence call per sam3 query). 0 when no
+        # processor -- an absent channel is unsure, never a wrong confident answer.
+        if sam_idx and self._sam3 is not None:
+            sam_answers = self._sam3.answer_batch(crop_pil, _subset_view(query_set, sam_idx))
+            self.n_sam_calls = len(sam_idx)
+            for j, m in enumerate(sam_idx):
+                out[m] = sam_answers[j]
+
+        # vlm: ONE batched call over just the residual queries. 0 when no oracle.
+        if vlm_idx and self.vlm_oracle is not None:
+            vlm_answers = self.vlm_oracle.answer_batch(crop_pil, _subset_view(query_set, vlm_idx))
+            self.n_vlm_calls = 1
+            for j, m in enumerate(vlm_idx):
+                out[m] = vlm_answers[j]
+
+        return out

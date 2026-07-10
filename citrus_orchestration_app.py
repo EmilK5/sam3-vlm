@@ -314,8 +314,9 @@ def _run_episode(image_pil, cfg, policy, oracle, query_set, use_mock):
         bootstrap, auto_stop = False, False
     else:
         if use_mock:
+            # v2: make_vlm_policy takes only vlm_client (scene-inspection retired in 8.3).
             stub = _StubChatClient(cfg)
-            pol = runner.make_vlm_policy(ctx, inspect_client=stub, vlm_client=stub)
+            pol = runner.make_vlm_policy(ctx, vlm_client=stub)
         else:
             pol = runner.make_vlm_policy(ctx)
         # Guided-ROI VLM policy episode wiring (mirrors eval.run_eval._run_agent_policy,
