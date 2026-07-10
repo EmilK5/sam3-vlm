@@ -19,7 +19,7 @@ public entry points:
     pipeline.initialize_canopy_roi             - canopy ROI for the initial partition
     eval.datasets.load_split                   - YOLO-format ground truth loader
     verifier.queries.load_query_set            - FM+V-IP query set (vip mode)
-    verifier.oracle.MockOracle/QwenOracle
+    verifier.oracle.MockOracle/QwenOracle/RouterOracle
     inference.load_sam3_model
 
 Dataset: a local YOLO-format green-fruit/citrus split
@@ -120,7 +120,8 @@ _CLASS_COLORS = {
     "spurious": (154, 160, 166),   # rejected
     "unresolved": (0, 229, 255),   # unverified candidate (still counted toward N_obs)
 }
-_ROI_COLOR = (255, 215, 0)
+_ROI_COLOR = (255, 215, 0)         # canopy / tree ROI
+_LOOK_COLOR = (255, 105, 180)      # VLM "look" ROIs already sensed (v2)
 _GT_COLOR = (0, 229, 255)
 
 
@@ -131,11 +132,11 @@ def _font():
         return None
 
 
-def draw_sam3_view(image_pil, graph, prompt_str):
-    """Left panel: canopy ROI box + every candidate's box, colored by
-    classification, with a translucent mask fill wherever the node carries one
-    (overlap_mode='mask', non-tiled passes); boxless candidates just get an
-    outline."""
+def draw_sam3_view(image_pil, graph, prompt_str, sensed_rois=None):
+    """Left panel: canopy ROI box + the VLM's already-sensed "look" ROIs (v2) +
+    every candidate's box, colored by classification, with a translucent mask
+    fill wherever the node carries one (overlap_mode='mask', non-tiled passes);
+    boxless candidates just get an outline."""
     canvas = image_pil.convert("RGBA").copy()
     font = _font()
 
@@ -158,6 +159,12 @@ def draw_sam3_view(image_pil, graph, prompt_str):
     if roi is not None:
         draw.rectangle([int(v) for v in roi], outline=_ROI_COLOR, width=4)
         draw.text((roi[0] + 4, max(0, roi[1] - 16)), "canopy ROI", fill=_ROI_COLOR, font=font)
+
+    # v2: the ROIs the VLM chose to sense (LookROIA), so the decision trace is
+    # visible on the image, not just in the log. Never candidates -- sensing only.
+    for i, look in enumerate(sensed_rois or []):
+        draw.rectangle([int(v) for v in look], outline=_LOOK_COLOR, width=2)
+        draw.text((look[0] + 4, max(0, look[1] - 12)), f"look {i + 1}", fill=_LOOK_COLOR, font=font)
 
     tally = {}
     for node in graph.nodes.values():
@@ -197,12 +204,6 @@ def draw_gt_view(image_pil, gt_boxes, gt_count, pred_count):
 # ==========================================
 # 3. Offline mock client (sandbox testing without a live Qwen endpoint)
 # ==========================================
-_MOCK_INSPECT_Z = {
-    "target_present": True, "density": "medium", "object_scale": "medium",
-    "occlusion": "medium", "recommend": "tile", "notes": "mock (offline stub)",
-}
-
-
 class _Resp:
     """Minimal stand-in for an OpenAI chat completion response."""
     def __init__(self, content):
@@ -210,12 +211,14 @@ class _Resp:
 
 
 class _StubChatClient:
-    """Deterministic offline stand-in for the Qwen endpoint.
+    """Deterministic offline stand-in for the Qwen endpoint (v2 look/stop policy).
 
-    Distinguishes an inspection call (returns a neutral z) from an orchestration
-    call (returns a short tile-then-stop plan), so both the inspect and VLM-policy
-    parse/validation paths are exercised without any network. Used only when the
-    Mock toggle is on and policy='vlm'.
+    Exercises the real policy_vlm.choose validation path without a network: it
+    parses the tree ROI out of the v2 prompt body and emits ONE centered "look"
+    inside it, then "stop". So a mock episode runs the genuine active-perception
+    loop -- bootstrap trio -> one validated look -> stop -- rather than silently
+    falling back to the heuristic. Used only when the Mock toggle is on and
+    policy='vlm'.
     """
     def __init__(self, cfg):
         self.cfg = cfg
@@ -224,17 +227,34 @@ class _StubChatClient:
         self.completions = self
 
     def create(self, model=None, temperature=None, messages=None, **kwargs):
-        system = (messages[0]["content"] if messages else "").lower()
-        if "assess" in system:  # agent.inspect.SYSTEM_PROMPT ("You assess images...")
-            return _Resp(json.dumps(_MOCK_INSPECT_Z))
-        # agent.policy_vlm.SYSTEM_PROMPT ("You are the orchestrator...")
         self._orch_calls += 1
-        conf = float(min(0.9, max(0.1, self.cfg.conf)))
-        if self._orch_calls >= 2:
+        tree_roi = self._parse_tree_roi(messages)
+        if self._orch_calls >= 2 or tree_roi is None:
             action = {"action": "stop", "args": {"estimate_name": "N_obs"}}
         else:
-            action = {"action": "tile", "args": {"conf": round(conf, 2)}}
+            action = {"action": "look", "args": {"region": self._center_box(tree_roi)}}
         return _Resp(json.dumps(action))
+
+    @staticmethod
+    def _parse_tree_roi(messages):
+        """Recover the tree_roi from the v2 prompt body (the user text part)."""
+        try:
+            content = messages[-1]["content"]
+            text = (content if isinstance(content, str)
+                    else next(p["text"] for p in content if p.get("type") == "text"))
+            body = json.loads(text.split("\n", 1)[1].rsplit("\n", 1)[0])
+            return body.get("tree_roi")
+        except Exception:
+            return None
+
+    @staticmethod
+    def _center_box(roi):
+        """A box covering the central ~60% of the tree ROI (safely above the
+        min-size / area-floor guards, and inside the ROI so it validates)."""
+        x1, y1, x2, y2 = (float(v) for v in roi)
+        w, h = x2 - x1, y2 - y1
+        return [round(x1 + 0.2 * w), round(y1 + 0.2 * h),
+                round(x2 - 0.2 * w), round(y2 - 0.2 * h)]
 
 
 # ==========================================
@@ -272,8 +292,14 @@ def _build_cfg(prompt, verifier, overlap_mode, gate_mode, iou_threshold, iom_thr
     )
 
 
-def _build_oracle(cfg, verifier, use_mock, mock_true_class):
-    """Return (oracle, query_set) for the run. Both None unless verifier='vip'."""
+def _build_oracle(cfg, verifier, use_mock, mock_true_class, oracle_kind):
+    """Return (oracle, query_set) for the run. Both None unless verifier='vip'.
+
+    oracle_kind (non-mock): "qwen" -> one VLM call per crop answers every query;
+    "router" -> RouterOracle (v2 step 8.4): cv/sam3 queries answered locally per
+    their query-set `route`, only the residual sent to Qwen (<=1 VLM call/crop).
+    The loaded SAM3 processor is passed through for the router's sam3 channel.
+    """
     if verifier != "vip":
         return None, None
     from verifier.queries import load_query_set
@@ -281,6 +307,9 @@ def _build_oracle(cfg, verifier, use_mock, mock_true_class):
     if use_mock:
         from verifier.oracle import MockOracle
         oracle = MockOracle(true_class=mock_true_class)
+    elif oracle_kind == "router":
+        from verifier.oracle import RouterOracle, QwenOracle
+        oracle = RouterOracle(cfg, processor=PROCESSOR, vlm_oracle=QwenOracle(cfg))
     else:
         from verifier.oracle import QwenOracle
         oracle = QwenOracle(cfg)
@@ -337,7 +366,8 @@ def _classification_tally(graph):
 
 def run_orchestration(split, idx, prompt, policy, verifier, overlap_mode, gate_mode,
                       iou_threshold, iom_threshold, dedup_metric, dedup_threshold, conf,
-                      budget, enable_thinking, use_mock, query_file, mock_true_class):
+                      budget, enable_thinking, use_mock, query_file, mock_true_class,
+                      oracle_kind):
     """Full-pipeline episode on one dataset image. Returns (sam3_view, gt_view, status, verbose)."""
     idx = int(idx)
     samples = get_samples(split)
@@ -363,7 +393,7 @@ def run_orchestration(split, idx, prompt, policy, verifier, overlap_mode, gate_m
                      dedup_metric, dedup_threshold, conf, budget, query_file, enable_thinking)
 
     try:
-        oracle, query_set = _build_oracle(cfg, verifier, use_mock, mock_true_class)
+        oracle, query_set = _build_oracle(cfg, verifier, use_mock, mock_true_class, oracle_kind)
     except Exception as exc:
         return image_pil, gt_view_plain, f"ERROR building verifier: {exc}", str(exc)
 
@@ -377,12 +407,14 @@ def run_orchestration(split, idx, prompt, policy, verifier, overlap_mode, gate_m
     root.addHandler(handler)
     root.setLevel(logging.INFO)
 
+    oracle_desc = "mock" if use_mock else (oracle_kind if verifier == "vip" else "n/a")
     header = [
         "=" * 78,
         f"RUN  dataset=citrus split={split} idx={idx}  policy={policy}  verifier={verifier}"
-        f"  overlap={overlap_mode}  nms_gate={gate_mode} (iou_t={cfg.nms_iou_threshold:.2f} "
-        f"iom_t={cfg.nms_iom_threshold:.2f})  dedup={cfg.cross_pass_dedup_metric}@"
-        f"{cfg.cross_pass_dedup_threshold:.2f}  conf={cfg.conf:.2f}  budget={cfg.budget_max_actions}"
+        f"  oracle={oracle_desc}  overlap={overlap_mode}  nms_gate={gate_mode} "
+        f"(iou_t={cfg.nms_iou_threshold:.2f} iom_t={cfg.nms_iom_threshold:.2f})  "
+        f"dedup={cfg.cross_pass_dedup_metric}@{cfg.cross_pass_dedup_threshold:.2f}  "
+        f"conf={cfg.conf:.2f}  budget={cfg.budget_max_actions}"
         f"  thinking={'on' if enable_thinking else 'off'}  mock={'on' if use_mock else 'off'}",
         f"TARGET CONCEPT: '{target}'   IMAGE: {os.path.basename(sample['image_path'])}",
         "=" * 78,
@@ -410,6 +442,23 @@ def run_orchestration(split, idx, prompt, policy, verifier, overlap_mode, gate_m
             f"U={e['U']:.3f}  cost={e['cost_so_far']:.3f}"
         )
 
+    # v2 full history (x_t -> y_t): the exact record the VLM policy is shown each
+    # step -- the bootstrap trio (canopy_roi/leaf_map/global_pass) then look/stop.
+    hist_lines = ["", "--- EPISODE HISTORY (x_t -> y_t, what the VLM sees) ---"]
+    for rec in result.get("history", []):
+        x, y = rec["x"], rec["y"]
+        extra = ""
+        if "roi" in x:
+            extra = f" roi={x['roi']}"
+        elif "n_leaves" in x:
+            extra = f" n_leaves={x['n_leaves']}"
+        elif "region" in x:
+            extra = f" region={x['region']}"
+        hist_lines.append(
+            f"  t={rec['t']:>2}  {x['action']:<11}{extra}  ->  "
+            f"y: new={y['n_new']} totals={y['totals']}"
+        )
+
     footer = [
         "",
         "--- COUNT ESTIMATES ---",
@@ -421,9 +470,9 @@ def run_orchestration(split, idx, prompt, policy, verifier, overlap_mode, gate_m
     ]
 
     verbose = "\n".join(header + ["", "--- CAPTURED LOG (chronological) ---"]
-                        + handler.records + step_lines + footer)
+                        + handler.records + step_lines + hist_lines + footer)
 
-    sam3_view = draw_sam3_view(image_pil, graph, target)
+    sam3_view = draw_sam3_view(image_pil, graph, target, sensed_rois=getattr(ctx, "sensed_rois", None))
     gt_view = draw_gt_view(image_pil, gt_boxes, gt_count, pred)
     if pred == gt_count:
         status = f"EXACT MATCH  |  N_obs={pred} == GT={gt_count}"
@@ -556,6 +605,10 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Citrus Orchestration Sandbox") as 
             with gr.Accordion("FM+V-IP (vip) options", open=False):
                 query_file_dropdown = gr.Dropdown(
                     choices=_QUERY_FILES, value=_DEFAULT_QUERY_FILE, label="Query set (vip)")
+                oracle_dropdown = gr.Dropdown(
+                    choices=["qwen", "router"], value=Config().oracle_kind,
+                    label="\U0001f5c2️ Oracle (non-mock): qwen = 1 VLM call/crop; "
+                          "router = cv/sam3 answered locally, only residual to Qwen")
                 mock_checkbox = gr.Checkbox(
                     value=False, label="\U0001f9ea Mock backend (offline: MockOracle + stubbed VLM)")
                 mock_class_dropdown = gr.Dropdown(
@@ -578,7 +631,8 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Citrus Orchestration Sandbox") as 
     run_inputs = [split_dropdown, idx_state, prompt_input, policy_dropdown, verifier_radio,
                   overlap_radio, gate_mode_radio, iou_threshold_slider, iom_threshold_slider,
                   dedup_metric_radio, dedup_threshold_slider, conf_slider, budget_number,
-                  thinking_checkbox, mock_checkbox, query_file_dropdown, mock_class_dropdown]
+                  thinking_checkbox, mock_checkbox, query_file_dropdown, mock_class_dropdown,
+                  oracle_dropdown]
     run_outputs = [sam3_display, gt_display, status_box, verbose_box]
 
     app.load(fn=load_sample_view, inputs=[split_dropdown, idx_state], outputs=nav_outputs)
