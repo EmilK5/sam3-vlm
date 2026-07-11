@@ -1,39 +1,38 @@
 """
 citrus_orchestration_app.py
 
-Interactive Gradio sandbox that runs the FULL active-perception orchestration
-pipeline of this repo (agent episode: policy -> action -> belief update) on the
-local green-fruit/citrus dataset, with a verbose log window exposing every
-action, per-pass SAM3 diagnostic, verifier call, and count estimate. Built to
-watch the VLM (Qwen-3-VL) orchestration policy decide -- prompts, responses,
-and fallbacks are all in the verbose log.
+Three-window prompt-refinement experiment (Phase 9). For each image the app shows
+THREE panels side by side so the human can eyeball whether the VLM refining the
+SAM3 text prompt actually helps:
 
-This is a standalone driver, structured like orchestration_app.py (does NOT
-touch app.py, pipeline.py, or any validated core module). It only *uses* their
-public entry points:
+  1. Ground truth        - GT boxes + count.
+  2. Generic SAM3 arm    - a FIXED two-call cascade on ONE prompt (no VLM):
+                           canopy ROI + leaf map + global pass @ cfg.seed_conf
+                           (seeds confident exemplars) + tiled pass @
+                           cfg.refine_conf_default, sharing those exemplars.
+  3. Active-refine arm    - the v3 loop (agent/policy_vlm_v3): bootstrap global
+                           pass @ cfg.seed_conf on the tree ROI, then the VLM
+                           refines the TEXT PROMPT (1-2 adjectives + noun) +
+                           threshold each step over the SAME region (the tree ROI,
+                           one global pass) until it stops / discovery saturates /
+                           budget is hit.
 
-    agent.runner.run_episode                  - the orchestration loop
-    agent.policy_heuristic / policy_vlm        - the two policies
-    agent.actions.ActionContext                - the episode sensing state
-    agent.belief.count_estimates                - N_obs / N_supp / N_cons
-    pipeline.initialize_canopy_roi             - canopy ROI for the initial partition
-    eval.datasets.load_split                   - YOLO-format ground truth loader
-    verifier.queries.load_query_set            - FM+V-IP query set (vip mode)
-    verifier.oracle.MockOracle/QwenOracle/RouterOracle
-    inference.load_sam3_model
+Grounding invariant (CLAUDE.md #3): the VLM only emits text; SAM3 grounds every
+box. No sub-ROI zoom -- the region is fixed, which keeps every found exemplar in
+frame (SAM3 exemplars are welded to the query frame) and isolates the causal effect
+of prompt refinement. This is a debug/intuition tool; the statistical claim
+(adaptive vs. equal-budget random/fixed prompt schedule) is a later eval ablation.
 
-Dataset: a local YOLO-format green-fruit/citrus split
-    root/images/<split>/*.jpg
-    root/labels/<split>/*.txt   ("cls xc yc w h", normalized)
-Root defaults to "datasets/citruses_dataset" (override with env var
-CITRUS_DATASET_ROOT); split falls back to a flat root/images layout when no
-train/val/test subdirectory exists (see eval.datasets._split_dir).
+Standalone driver: it does NOT touch app.py, pipeline.py, or any validated core
+module -- it only *uses* their public entry points (pipeline.execute_pass /
+initialize_canopy_roi, agent.runner.run_episode / make_refine_policy,
+agent.belief.count_estimates, eval.datasets.load_split, verifier.oracle/queries,
+inference.load_sam3_model). Run on the GPU box -- SAM3 (and, for a live run, a
+Qwen-3-VL endpoint) must be reachable; use the Mock toggle to dry-run the loop.
 
-View: left panel is the SAM3 sensor view (canopy ROI box + every candidate's
-box, with a translucent mask fill when overlap_mode="mask" produced one, color
-coded by verifier classification); right panel is the ground-truth overlay for
-the same image. Run this on the GPU box -- SAM3 (and, for the vlm policy, a
-live Qwen-3-VL endpoint) must be reachable.
+Dataset: a local YOLO-format green-fruit/citrus split (images/<split>,
+labels/<split>). Root defaults to "datasets/citruses_dataset" (override with
+CITRUS_DATASET_ROOT); split falls back to a flat root/images layout.
 """
 
 import dataclasses
@@ -67,8 +66,9 @@ DEFAULT_PROMPT = "green fruit"
 
 from graph import OrchardGraph
 from agent.actions import ActionContext
-from agent.belief import DiscoveryCurve
-from agent import runner, policy_heuristic
+from agent.belief import DiscoveryCurve, count_estimates
+from agent.budget import CostMeter
+from agent import runner
 from eval.datasets import load_split
 import inference
 
@@ -121,7 +121,6 @@ _CLASS_COLORS = {
     "unresolved": (0, 229, 255),   # unverified candidate (still counted toward N_obs)
 }
 _ROI_COLOR = (255, 215, 0)         # canopy / tree ROI
-_LOOK_COLOR = (255, 105, 180)      # VLM "look" ROIs already sensed (v2)
 _GT_COLOR = (0, 229, 255)
 
 
@@ -132,11 +131,11 @@ def _font():
         return None
 
 
-def draw_sam3_view(image_pil, graph, prompt_str, sensed_rois=None):
-    """Left panel: canopy ROI box + the VLM's already-sensed "look" ROIs (v2) +
-    every candidate's box, colored by classification, with a translucent mask
-    fill wherever the node carries one (overlap_mode='mask', non-tiled passes);
-    boxless candidates just get an outline."""
+def draw_sam3_view(image_pil, graph, prompt_str, arm_label="SAM3"):
+    """A SAM3 arm panel: canopy ROI box + every candidate's box, colored by verifier
+    classification, with a translucent mask fill wherever the node carries one
+    (overlap_mode='mask', non-tiled passes). The banner names the arm + the (final)
+    prompt + the per-class tally."""
     canvas = image_pil.convert("RGBA").copy()
     font = _font()
 
@@ -158,13 +157,7 @@ def draw_sam3_view(image_pil, graph, prompt_str, sensed_rois=None):
     roi = getattr(graph, "tree_roi", None)
     if roi is not None:
         draw.rectangle([int(v) for v in roi], outline=_ROI_COLOR, width=4)
-        draw.text((roi[0] + 4, max(0, roi[1] - 16)), "canopy ROI", fill=_ROI_COLOR, font=font)
-
-    # v2: the ROIs the VLM chose to sense (LookROIA), so the decision trace is
-    # visible on the image, not just in the log. Never candidates -- sensing only.
-    for i, look in enumerate(sensed_rois or []):
-        draw.rectangle([int(v) for v in look], outline=_LOOK_COLOR, width=2)
-        draw.text((look[0] + 4, max(0, look[1] - 12)), f"look {i + 1}", fill=_LOOK_COLOR, font=font)
+        draw.text((roi[0] + 4, max(0, roi[1] - 16)), "tree ROI", fill=_ROI_COLOR, font=font)
 
     tally = {}
     for node in graph.nodes.values():
@@ -175,34 +168,25 @@ def draw_sam3_view(image_pil, graph, prompt_str, sensed_rois=None):
         tag = f"P{node.found_in_pass} {node.classification[:1]}:{node.scores['detection_confidence']:.2f}"
         draw.text((x1 + 2, max(0, y1 - 12)), tag, fill=rgb, font=font)
 
-    banner = f"SAM3 sensor view | prompt='{prompt_str}' | {tally or 'no candidates yet'}"
+    banner = f"{arm_label} | prompt='{prompt_str}' | {tally or 'no candidates'}"
     draw.text((8, 8), banner, fill=(255, 255, 255), font=font)
     return canvas
 
 
-def draw_gt_view(image_pil, gt_boxes, gt_count, pred_count):
-    """Right panel: ground-truth overlay, with a match/mismatch banner once a
-    prediction is available."""
+def draw_gt_view(image_pil, gt_boxes, gt_count):
+    """Ground-truth panel: GT boxes + count."""
     canvas = image_pil.convert("RGB").copy()
     draw = ImageDraw.Draw(canvas)
     font = _font()
-
     for box in gt_boxes:
         x1, y1, x2, y2 = [float(v) for v in box]
         draw.rectangle([x1, y1, x2, y2], outline=_GT_COLOR, width=3)
-
-    banner = f"GROUND TRUTH | count={gt_count}"
-    color = (255, 255, 255)
-    if pred_count is not None:
-        match = pred_count == gt_count
-        banner += f" | SAM3 N_obs={pred_count} | {'MATCH' if match else 'MISMATCH'}"
-        color = (46, 204, 113) if match else (231, 76, 60)
-    draw.text((8, 8), banner, fill=color, font=font)
+    draw.text((8, 8), f"GROUND TRUTH | count={gt_count}", fill=(255, 255, 255), font=font)
     return canvas
 
 
 # ==========================================
-# 3. Offline mock client (sandbox testing without a live Qwen endpoint)
+# 3. Offline mock client (dry-run the refine loop without a live Qwen endpoint)
 # ==========================================
 class _Resp:
     """Minimal stand-in for an OpenAI chat completion response."""
@@ -210,58 +194,35 @@ class _Resp:
         self.choices = [type("C", (), {"message": type("M", (), {"content": content})()})()]
 
 
-class _StubChatClient:
-    """Deterministic offline stand-in for the Qwen endpoint (v2 look/stop policy).
-
-    Exercises the real policy_vlm.choose validation path without a network: it
-    parses the tree ROI out of the v2 prompt body and emits ONE centered "look"
-    inside it, then "stop". So a mock episode runs the genuine active-perception
-    loop -- bootstrap trio -> one validated look -> stop -- rather than silently
-    falling back to the heuristic. Used only when the Mock toggle is on and
-    policy='vlm'.
-    """
+class _StubRefineClient:
+    """Deterministic offline stand-in for the Qwen endpoint driving the v3 refine
+    policy: emits ONE refined prompt ("round <target-noun>") then "stop". So a mock
+    episode runs the genuine bootstrap -> refine -> stop loop without a network,
+    exercising the real policy_vlm_v3.choose validation path (not a silent
+    heuristic fallback). Used only when the Mock toggle is on."""
     def __init__(self, cfg):
         self.cfg = cfg
-        self._orch_calls = 0
+        self._calls = 0
         self.chat = self
         self.completions = self
 
     def create(self, model=None, temperature=None, messages=None, **kwargs):
-        self._orch_calls += 1
-        tree_roi = self._parse_tree_roi(messages)
-        if self._orch_calls >= 2 or tree_roi is None:
+        self._calls += 1
+        if self._calls >= 2:
             action = {"action": "stop", "args": {"estimate_name": "N_obs"}}
         else:
-            action = {"action": "look", "args": {"region": self._center_box(tree_roi)}}
+            noun = (getattr(self.cfg, "target_prompt", "fruit").split() or ["fruit"])[-1]
+            action = {"action": "refine",
+                      "args": {"prompt": f"round {noun}",
+                               "threshold": self.cfg.refine_conf_default}}
         return _Resp(json.dumps(action))
 
-    @staticmethod
-    def _parse_tree_roi(messages):
-        """Recover the tree_roi from the v2 prompt body (the user text part)."""
-        try:
-            content = messages[-1]["content"]
-            text = (content if isinstance(content, str)
-                    else next(p["text"] for p in content if p.get("type") == "text"))
-            body = json.loads(text.split("\n", 1)[1].rsplit("\n", 1)[0])
-            return body.get("tree_roi")
-        except Exception:
-            return None
-
-    @staticmethod
-    def _center_box(roi):
-        """A box covering the central ~60% of the tree ROI (safely above the
-        min-size / area-floor guards, and inside the ROI so it validates)."""
-        x1, y1, x2, y2 = (float(v) for v in roi)
-        w, h = x2 - x1, y2 - y1
-        return [round(x1 + 0.2 * w), round(y1 + 0.2 * h),
-                round(x2 - 0.2 * w), round(y2 - 0.2 * h)]
-
 
 # ==========================================
-# 4. Orchestration driver
+# 4. Experiment driver
 # ==========================================
 class _ListLogHandler(logging.Handler):
-    """Captures formatted log records emitted during one episode run."""
+    """Captures formatted log records emitted during one experiment run."""
     def __init__(self):
         super().__init__()
         self.records = []
@@ -274,9 +235,14 @@ class _ListLogHandler(logging.Handler):
 
 
 def _build_cfg(prompt, verifier, overlap_mode, gate_mode, iou_threshold, iom_threshold,
-               dedup_metric, dedup_threshold, conf, budget, query_file, enable_thinking):
+               dedup_metric, dedup_threshold, seed_conf, budget, query_file, enable_thinking):
+    """Both arms share one cfg. conf is set to seed_conf so the arm-3 bootstrap
+    (runner uses cfg.conf) seeds confident exemplars; refine passes carry their own
+    VLM-chosen threshold, and the generic arm passes seed_conf/refine_conf_default
+    explicitly."""
+    base = Config()
     return dataclasses.replace(
-        Config(),
+        base,
         verifier_mode=verifier,
         overlap_mode=overlap_mode,
         gate_mode=gate_mode,
@@ -284,22 +250,17 @@ def _build_cfg(prompt, verifier, overlap_mode, gate_mode, iou_threshold, iom_thr
         nms_iom_threshold=float(iom_threshold),
         cross_pass_dedup_metric=dedup_metric,
         cross_pass_dedup_threshold=float(dedup_threshold),
-        conf=float(conf),
+        conf=float(seed_conf),
+        seed_conf=float(seed_conf),
         target_prompt=prompt,
         budget_max_actions=int(budget),
-        vip_query_file=query_file or Config().vip_query_file,
+        vip_query_file=query_file or base.vip_query_file,
         policy_enable_thinking=bool(enable_thinking),
     )
 
 
 def _build_oracle(cfg, verifier, use_mock, mock_true_class, oracle_kind):
-    """Return (oracle, query_set) for the run. Both None unless verifier='vip'.
-
-    oracle_kind (non-mock): "qwen" -> one VLM call per crop answers every query;
-    "router" -> RouterOracle (v2 step 8.4): cv/sam3 queries answered locally per
-    their query-set `route`, only the residual sent to Qwen (<=1 VLM call/crop).
-    The loaded SAM3 processor is passed through for the router's sam3 channel.
-    """
+    """Return (oracle, query_set) for the run. Both None unless verifier='vip'."""
     if verifier != "vip":
         return None, None
     from verifier.queries import load_query_set
@@ -316,89 +277,106 @@ def _build_oracle(cfg, verifier, use_mock, mock_true_class, oracle_kind):
     return oracle, query_set
 
 
-def _run_episode(image_pil, cfg, policy, oracle, query_set, use_mock):
-    """Build the ActionContext, run the episode, return (result, ctx)."""
-    from agent.budget import CostMeter
+def _pass_kwargs(cfg, oracle, query_set, graph):
+    return dict(
+        processor=PROCESSOR, graph=graph, cfg=cfg, oracle=oracle, query_set=query_set,
+        nms_mode=getattr(cfg, "nms_mode", "dualgate"), gate_mode=cfg.gate_mode,
+        use_canopy_roi=cfg.use_canopy_roi, nms_iou_threshold=cfg.nms_iou_threshold,
+        nms_iom_threshold=cfg.nms_iom_threshold,
+        cross_pass_dedup_metric=cfg.cross_pass_dedup_metric,
+        cross_pass_dedup_threshold=cfg.cross_pass_dedup_threshold,
+    )
 
+
+def run_generic_arm(image_pil, cfg, oracle, query_set):
+    """Arm 2: fixed two-call cascade on ONE prompt, no VLM. Global @ seed_conf
+    (seeds confident exemplars) then tiled @ refine_conf_default (shares them)."""
+    from pipeline import execute_pass
     graph = OrchardGraph()
     cost = CostMeter()
+    kw = _pass_kwargs(cfg, oracle, query_set, graph)
+    s1 = execute_pass(image_pil=image_pil, conf=cfg.seed_conf, clahe=False, tiling=False,
+                      pass_number=1, prompt=cfg.target_prompt, **kw)
+    s2 = execute_pass(image_pil=image_pil, conf=cfg.refine_conf_default, clahe=False, tiling=True,
+                      pass_number=2, prompt=cfg.target_prompt, **kw)
+    for s in (s1, s2):
+        cost.n_sam += int(getattr(s, "n_sam_calls", 0))
+        cost.n_tile += int(getattr(s, "n_tiles", 0))
+        cost.n_verify += int(getattr(s, "n_verify_calls", 0))
+    return {"graph": graph, "counts": count_estimates(graph, cfg), "cost": cost, "stats": [s1, s2]}
 
-    if PROCESSOR is not None:
-        from pipeline import initialize_canopy_roi
-        roi = initialize_canopy_roi(PROCESSOR, np.array(image_pil), graph)
-        cost.n_sam += 1
-        partition = [tuple(int(v) for v in roi)]
-    else:
-        w, h = image_pil.size
-        partition = [(0, 0, w, h)]
 
+def run_active_arm(image_pil, cfg, oracle, query_set, vlm_client=None):
+    """Arm 3: the v3 refine loop. Bootstrap global pass @ seed_conf on the tree ROI,
+    then make_refine_policy drives prompt+threshold refinement over the same region
+    with the hybrid stop (VLM stop / saturation / budget)."""
+    from pipeline import initialize_canopy_roi
+    graph = OrchardGraph()
+    cost = CostMeter()
+    roi = initialize_canopy_roi(PROCESSOR, np.array(image_pil), graph)
+    cost.n_sam += 1  # the canopy sweep is a real global SAM3 call
     ctx = ActionContext(
         processor=PROCESSOR, image_pil=image_pil, graph=graph, cfg=cfg,
         oracle=oracle, query_set=query_set, discovery=DiscoveryCurve(),
-        partition=partition, cost=cost,
+        partition=[tuple(int(v) for v in roi)], cost=cost,
     )
-
-    if policy == "heuristic":
-        pol = policy_heuristic.choose
-        bootstrap, auto_stop = False, False
-    else:
-        if use_mock:
-            # v2: make_vlm_policy takes only vlm_client (scene-inspection retired in 8.3).
-            stub = _StubChatClient(cfg)
-            pol = runner.make_vlm_policy(ctx, vlm_client=stub)
-        else:
-            pol = runner.make_vlm_policy(ctx)
-        # Guided-ROI VLM policy episode wiring (mirrors eval.run_eval._run_agent_policy,
-        # PROGRESS.md 7.3): the heuristic baseline is untouched.
-        bootstrap, auto_stop = True, True
-
+    pol = runner.make_refine_policy(ctx, vlm_client=vlm_client)
     result = runner.run_episode(image_pil, ctx, pol, max_actions=cfg.budget_max_actions,
-                                bootstrap_global_pass=bootstrap, auto_stop=auto_stop)
-    return result, ctx
+                                bootstrap_global_pass=True, auto_stop=True)
+    result["ctx"] = ctx
+    return result
 
 
-def _classification_tally(graph):
-    tally = {}
+def _final_prompt(history, default):
+    """The last text prompt the active arm actually sensed (bootstrap or a refine)."""
+    last = default
+    for rec in history:
+        p = rec.get("x", {}).get("prompt")
+        if p:
+            last = p
+    return last
+
+
+def _tally(graph):
+    t = {}
     for node in graph.nodes.values():
-        tally[node.classification] = tally.get(node.classification, 0) + 1
-    return tally
+        t[node.classification] = t.get(node.classification, 0) + 1
+    return t
 
 
-def run_orchestration(split, idx, prompt, policy, verifier, overlap_mode, gate_mode,
-                      iou_threshold, iom_threshold, dedup_metric, dedup_threshold, conf,
-                      budget, enable_thinking, use_mock, query_file, mock_true_class,
-                      oracle_kind):
-    """Full-pipeline episode on one dataset image. Returns (sam3_view, gt_view, status, verbose)."""
+def run_experiment(split, idx, prompt, verifier, overlap_mode, gate_mode, iou_threshold,
+                   iom_threshold, dedup_metric, dedup_threshold, seed_conf, budget,
+                   enable_thinking, use_mock, query_file, mock_true_class, oracle_kind):
+    """Run both arms on one dataset image. Returns (gt_view, generic_view,
+    active_view, status, verbose)."""
     idx = int(idx)
     samples = get_samples(split)
     if not samples:
-        placeholder = Image.new("RGB", (640, 400), "#c0392b")
-        return (placeholder, placeholder, "Dataset unavailable.",
-                f"ERROR: no samples loaded for split '{split}' from root '{DATASET_ROOT}'. "
+        ph = Image.new("RGB", (512, 400), "#c0392b")
+        return (ph, ph, ph, "Dataset unavailable.",
+                f"ERROR: no samples for split '{split}' from root '{DATASET_ROOT}'. "
                 "Check CITRUS_DATASET_ROOT / the images+labels layout.")
 
     sample = samples[idx]
     image_pil = Image.open(sample["image_path"]).convert("RGB")
     gt_boxes, gt_count = sample["gt_boxes"], sample["count"]
-    gt_view_plain = draw_gt_view(image_pil, gt_boxes, gt_count, None)
+    gt_view = draw_gt_view(image_pil, gt_boxes, gt_count)
 
     if PROCESSOR is None:
-        placeholder = Image.new("RGB", (640, 400), "#2c3e50")
-        return (placeholder, gt_view_plain, "SAM3 model not loaded on this machine.",
+        ph = Image.new("RGB", (512, 400), "#2c3e50")
+        return (gt_view, ph, ph, "SAM3 model not loaded on this machine.",
                 f"[FATAL] SAM3 weights did not load:\n{_LOAD_ERROR}\n\n"
                 "Run this app on the GPU box with the SAM3 repo present.")
 
     target = (prompt or "").strip() or DEFAULT_PROMPT
     cfg = _build_cfg(target, verifier, overlap_mode, gate_mode, iou_threshold, iom_threshold,
-                     dedup_metric, dedup_threshold, conf, budget, query_file, enable_thinking)
+                     dedup_metric, dedup_threshold, seed_conf, budget, query_file, enable_thinking)
 
     try:
         oracle, query_set = _build_oracle(cfg, verifier, use_mock, mock_true_class, oracle_kind)
     except Exception as exc:
-        return image_pil, gt_view_plain, f"ERROR building verifier: {exc}", str(exc)
+        return gt_view, image_pil, image_pil, f"ERROR building verifier: {exc}", str(exc)
 
-    # Capture everything logged during the episode into the verbose window,
-    # including policy_vlm's prompt/response lines -- this is the VLM decision trace.
     handler = _ListLogHandler()
     handler.setFormatter(logging.Formatter("%(levelname)-7s %(name)s: %(message)s"))
     handler.setLevel(logging.INFO)
@@ -409,98 +387,84 @@ def run_orchestration(split, idx, prompt, policy, verifier, overlap_mode, gate_m
 
     oracle_desc = "mock" if use_mock else (oracle_kind if verifier == "vip" else "n/a")
     header = [
-        "=" * 78,
-        f"RUN  dataset=citrus split={split} idx={idx}  policy={policy}  verifier={verifier}"
-        f"  oracle={oracle_desc}  overlap={overlap_mode}  nms_gate={gate_mode} "
-        f"(iou_t={cfg.nms_iou_threshold:.2f} iom_t={cfg.nms_iom_threshold:.2f})  "
-        f"dedup={cfg.cross_pass_dedup_metric}@{cfg.cross_pass_dedup_threshold:.2f}  "
-        f"conf={cfg.conf:.2f}  budget={cfg.budget_max_actions}"
-        f"  thinking={'on' if enable_thinking else 'off'}  mock={'on' if use_mock else 'off'}",
-        f"TARGET CONCEPT: '{target}'   IMAGE: {os.path.basename(sample['image_path'])}",
-        "=" * 78,
+        "=" * 84,
+        f"EXPERIMENT  dataset=citrus split={split} idx={idx}  verifier={verifier}"
+        f"  oracle={oracle_desc}  seed_conf={cfg.seed_conf:.2f}  refine_conf={cfg.refine_conf_default:.2f}"
+        f"  budget={cfg.budget_max_actions}  thinking={'on' if enable_thinking else 'off'}"
+        f"  mock={'on' if use_mock else 'off'}",
+        f"INITIAL CONCEPT: '{target}'   IMAGE: {os.path.basename(sample['image_path'])}   GT={gt_count}",
+        "=" * 84,
     ]
+
     try:
-        result, ctx = _run_episode(image_pil, cfg, policy, oracle, query_set, use_mock)
-        graph = result["graph"]
-        counts = result["counts"]
+        generic = run_generic_arm(image_pil, cfg, oracle, query_set)
+        vlm_client = _StubRefineClient(cfg) if use_mock else None
+        active = run_active_arm(image_pil, cfg, oracle, query_set, vlm_client=vlm_client)
     except Exception as exc:
         root.removeHandler(handler)
         root.setLevel(prev_level)
         detail = "\n".join(header + ["", "[PIPELINE EXCEPTION]", str(exc), "",
                                      "--- captured log ---"] + handler.records)
-        return image_pil, gt_view_plain, f"Pipeline error: {exc}", detail
+        return gt_view, image_pil, image_pil, f"Pipeline error: {exc}", detail
     finally:
         root.removeHandler(handler)
         root.setLevel(prev_level)
 
-    pred = counts["N_obs"]
+    g_graph, g_counts = generic["graph"], generic["counts"]
+    a_graph, a_counts = active["graph"], active["counts"]
+    a_history = active.get("history", [])
+    final_prompt = _final_prompt(a_history, target)
 
-    step_lines = ["", "--- ACTION LOG (per step) ---"]
-    for e in result["log"]:
-        step_lines.append(
-            f"  t={e['t']:>2}  {e['action']:<11}  new={e['n_new']:>3}  "
-            f"U={e['U']:.3f}  cost={e['cost_so_far']:.3f}"
-        )
+    generic_view = draw_sam3_view(image_pil, g_graph, target, arm_label="GENERIC (fixed cascade)")
+    active_view = draw_sam3_view(image_pil, a_graph, final_prompt, arm_label="ACTIVE (VLM refine)")
 
-    # v2 full history (x_t -> y_t): the exact record the VLM policy is shown each
-    # step -- the bootstrap trio (canopy_roi/leaf_map/global_pass) then look/stop.
-    hist_lines = ["", "--- EPISODE HISTORY (x_t -> y_t, what the VLM sees) ---"]
-    for rec in result.get("history", []):
+    # Refinement trajectory (x_t -> y_t) the VLM produced -- the story of the run.
+    traj = ["", "--- ACTIVE ARM: prompt refinement trajectory (x_t -> y_t) ---"]
+    for rec in a_history:
         x, y = rec["x"], rec["y"]
-        extra = ""
-        if "roi" in x:
-            extra = f" roi={x['roi']}"
-        elif "n_leaves" in x:
-            extra = f" n_leaves={x['n_leaves']}"
-        elif "region" in x:
-            extra = f" region={x['region']}"
-        hist_lines.append(
-            f"  t={rec['t']:>2}  {x['action']:<11}{extra}  ->  "
-            f"y: new={y['n_new']} totals={y['totals']}"
-        )
+        p = x.get("prompt")
+        label = x["action"] if p is None else f"{x['action']} prompt='{p}' @{x.get('conf'):.2f}"
+        traj.append(f"  t={rec['t']:>2}  {label:<48}  ->  new={y['n_new']} totals={y['totals']}")
 
     footer = [
         "",
-        "--- COUNT ESTIMATES ---",
-        f"  N_obs={counts['N_obs']}   N_supp={counts['N_supp']}   N_cons={counts['N_cons']}"
-        f"   (headline = N_obs)   GT={gt_count}",
-        f"  classification tally: {_classification_tally(graph)}",
-        f"  actions used: {len(result['log'])}   normalized cost: {ctx.cost.total(cfg):.3f}",
-        f"  cost breakdown: {ctx.cost.as_dict()}",
+        "--- RESULTS (headline = N_obs) ---",
+        f"  GROUND TRUTH   N* = {gt_count}",
+        f"  GENERIC arm    N_obs={g_counts['N_obs']}  N_supp={g_counts['N_supp']}  N_cons={g_counts['N_cons']}"
+        f"   tally={_tally(g_graph)}   cost={generic['cost'].total(cfg):.3f}",
+        f"  ACTIVE  arm    N_obs={a_counts['N_obs']}  N_supp={a_counts['N_supp']}  N_cons={a_counts['N_cons']}"
+        f"   tally={_tally(a_graph)}   cost={active['ctx'].cost.total(cfg):.3f}"
+        f"   actions={len(active.get('log', []))}",
     ]
 
     verbose = "\n".join(header + ["", "--- CAPTURED LOG (chronological) ---"]
-                        + handler.records + step_lines + hist_lines + footer)
+                        + handler.records + traj + footer)
 
-    sam3_view = draw_sam3_view(image_pil, graph, target, sensed_rois=getattr(ctx, "sensed_rois", None))
-    gt_view = draw_gt_view(image_pil, gt_boxes, gt_count, pred)
-    if pred == gt_count:
-        status = f"EXACT MATCH  |  N_obs={pred} == GT={gt_count}"
-    else:
-        direction = "under" if pred < gt_count else "over"
-        status = f"MISMATCH ({direction})  |  N_obs={pred} vs GT={gt_count}   (N_supp={counts['N_supp']}, N_cons={counts['N_cons']})"
-    return sam3_view, gt_view, status, verbose
+    def _delta(n):
+        return f"{n - gt_count:+d}"
+    status = (f"GT={gt_count}  |  GENERIC N_obs={g_counts['N_obs']} ({_delta(g_counts['N_obs'])})  "
+              f"|  ACTIVE N_obs={a_counts['N_obs']} ({_delta(a_counts['N_obs'])})  |  final prompt='{final_prompt}'")
+    return gt_view, generic_view, active_view, status, verbose
 
 
 # ==========================================
-# 5. Navigation
+# 5. Navigation (load the image + GT only; running the experiment is on demand)
 # ==========================================
 def load_sample_view(split, idx):
-    """Load an image + GT overlay without running the pipeline (on-demand only)."""
     samples = get_samples(split)
     n = len(samples)
     if n == 0:
-        placeholder = Image.new("RGB", (640, 400), "#c0392b")
-        return (placeholder, placeholder, f"### split '{split}' empty/unavailable",
+        ph = Image.new("RGB", (512, 400), "#c0392b")
+        return (ph, None, None, f"### split '{split}' empty/unavailable",
                 f"Dataset unavailable: check CITRUS_DATASET_ROOT='{DATASET_ROOT}' and its "
                 "images/<split> + labels/<split> layout.", 0)
     idx = max(0, min(int(idx), n - 1))
     sample = samples[idx]
     image_pil = Image.open(sample["image_path"]).convert("RGB")
-    gt_view = draw_gt_view(image_pil, sample["gt_boxes"], sample["count"], None)
+    gt_view = draw_gt_view(image_pil, sample["gt_boxes"], sample["count"])
     banner = (f"### [{split}] index {idx} / {n - 1} | "
               f"{os.path.basename(sample['image_path'])} | GT count: {sample['count']}")
-    return image_pil, gt_view, banner, "Loaded. Press ▶ Run Orchestration.", idx
+    return gt_view, None, None, banner, "Loaded. Press ▶ Run Experiment.", idx
 
 
 def nav_next(split, idx):
@@ -529,16 +493,16 @@ _QUERY_FILES = sorted(
 ) if os.path.isdir("queries") else [Config().vip_query_file]
 _DEFAULT_QUERY_FILE = "queries/green_citrus.json" if "queries/green_citrus.json" in _QUERY_FILES else _QUERY_FILES[0]
 
-with gr.Blocks(theme=gr.themes.Soft(), title="Citrus Orchestration Sandbox") as app:
+with gr.Blocks(theme=gr.themes.Soft(), title="Citrus Prompt-Refinement Experiment") as app:
     idx_state = gr.State(value=0)
 
-    gr.Markdown("# \U0001f34a Citrus Active-Perception Orchestration Sandbox")
+    gr.Markdown("# \U0001f34a Citrus Prompt-Refinement Experiment")
     gr.Markdown(
-        "Runs the **full agent orchestration** (policy -> action -> belief update) on "
-        f"the local green-fruit dataset (`{DATASET_ROOT}`), with every action, per-pass "
-        "SAM3 stat, verifier call, and VLM prompt/response streamed to the verbose window. "
-        "Left = SAM3 sensor view (canopy ROI + candidate boxes/masks). Right = ground truth. "
-        "Navigation only loads the image; press **Run Orchestration** to execute the pipeline."
+        "Three windows per image: **Ground truth** | **Generic** (fixed cascade, one "
+        "prompt) | **Active** (the VLM refines the SAM3 text prompt + threshold over "
+        "the tree ROI, `agent/policy_vlm_v3`). The VLM only writes text; SAM3 grounds "
+        "every box; the region never changes. Navigation only loads the image; press "
+        "**Run Experiment** to execute both arms."
     )
     if _LOAD_ERROR:
         gr.Markdown(f"> ⚠️ **SAM3 not loaded:** `{_LOAD_ERROR}` -- runs will report this.")
@@ -547,11 +511,12 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Citrus Orchestration Sandbox") as 
         with gr.Column(scale=5):
             banner_md = gr.Markdown("### Initializing...")
             with gr.Row():
-                sam3_display = gr.Image(label="\U0001f4e1 SAM3 sensor view (left)", type="pil", interactive=False)
-                gt_display = gr.Image(label="✅ Ground truth (right)", type="pil", interactive=False)
+                gt_display = gr.Image(label="✅ Ground truth", type="pil", interactive=False)
+                generic_display = gr.Image(label="\U0001f4e6 Generic (fixed cascade)", type="pil", interactive=False)
+                active_display = gr.Image(label="\U0001f9e0 Active (VLM refine)", type="pil", interactive=False)
             status_box = gr.Textbox(label="\U0001f4ca Result", interactive=False)
             verbose_box = gr.Textbox(
-                label="\U0001f52c Verbose orchestration log (actions · per-pass SAM3 · verifier · VLM prompts · estimates)",
+                label="\U0001f52c Verbose log (both arms · refinement trajectory · counts)",
                 interactive=False, lines=24, max_lines=24,
             )
 
@@ -559,65 +524,56 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Citrus Orchestration Sandbox") as 
             split_dropdown = gr.Dropdown(
                 choices=["train", "val", "test"], value="train", label="\U0001f4c2 Dataset split")
 
+            prompt_input = gr.Textbox(value=DEFAULT_PROMPT, label="✏️ Initial concept (seed prompt for both arms)")
+
             with gr.Row():
-                policy_dropdown = gr.Dropdown(
-                    choices=["heuristic", "vlm"], value="heuristic", label="\U0001f9e0 Policy")
-                verifier_radio = gr.Radio(
-                    choices=["off", "ioc", "vip"], value="ioc", label="✅ Verification")
+                seed_conf_slider = gr.Slider(
+                    minimum=0.30, maximum=0.90, value=Config().seed_conf, step=0.05,
+                    label="\U0001f39a️ Seed confidence (global/bootstrap pass)")
+                budget_number = gr.Number(value=Config().budget_max_actions, precision=0,
+                                          label="\U0001f501 Active budget (max actions)")
+
+            verifier_radio = gr.Radio(
+                choices=["off", "ioc", "vip"], value="ioc", label="✅ Verification (both arms)")
 
             with gr.Row():
                 overlap_radio = gr.Radio(
-                    choices=["box", "mask"], value="box",
-                    label="\U0001f4d0 Overlap metric (geometry: boxes vs instance masks)")
-                conf_slider = gr.Slider(
-                    minimum=0.10, maximum=0.90, value=Config().conf, step=0.05,
-                    label="\U0001f39a️ Detection confidence")
-
-            gate_mode_radio = gr.Radio(
-                choices=["dual", "iou_only", "iom_only"], value=Config().gate_mode,
-                label="\U0001f3af NMS suppression gate (dual = IoU+IoM default; pick one per dataset)")
+                    choices=["box", "mask"], value="box", label="\U0001f4d0 Overlap metric")
+                gate_mode_radio = gr.Radio(
+                    choices=["dual", "iou_only", "iom_only"], value=Config().gate_mode,
+                    label="\U0001f3af NMS gate")
 
             with gr.Row():
                 iou_threshold_slider = gr.Slider(
                     minimum=0.05, maximum=0.95, value=Config().nms_iou_threshold, step=0.05,
-                    label="Gate A: IoU threshold")
+                    label="Gate A: IoU")
                 iom_threshold_slider = gr.Slider(
                     minimum=0.05, maximum=0.95, value=Config().nms_iom_threshold, step=0.05,
-                    label="Gate B: IoM threshold")
+                    label="Gate B: IoM")
 
-            gr.Markdown("**Cross-pass dedup** (is this box the same object as one already "
-                       "registered from an earlier pass/tile? distinct from, and more "
-                       "consequential than, the NMS gate above)")
             with gr.Row():
                 dedup_metric_radio = gr.Radio(
                     choices=["iou", "iom"], value=Config().cross_pass_dedup_metric,
-                    label="Metric")
+                    label="Cross-pass dedup metric")
                 dedup_threshold_slider = gr.Slider(
                     minimum=0.10, maximum=0.95, value=Config().cross_pass_dedup_threshold, step=0.05,
-                    label="Threshold")
+                    label="Cross-pass dedup threshold")
 
-            budget_number = gr.Number(value=Config().budget_max_actions, precision=0,
-                                      label="\U0001f501 Max actions (budget)")
             thinking_checkbox = gr.Checkbox(
-                value=Config().policy_enable_thinking,
-                label="\U0001f9e0 Enable VLM thinking trace (policy loop)")
+                value=Config().policy_enable_thinking, label="\U0001f9e0 VLM thinking trace (policy loop)")
 
             with gr.Accordion("FM+V-IP (vip) options", open=False):
                 query_file_dropdown = gr.Dropdown(
                     choices=_QUERY_FILES, value=_DEFAULT_QUERY_FILE, label="Query set (vip)")
                 oracle_dropdown = gr.Dropdown(
-                    choices=["qwen", "router"], value=Config().oracle_kind,
-                    label="\U0001f5c2️ Oracle (non-mock): qwen = 1 VLM call/crop; "
-                          "router = cv/sam3 answered locally, only residual to Qwen")
+                    choices=["qwen", "router"], value=Config().oracle_kind, label="\U0001f5c2️ Oracle (non-mock)")
                 mock_checkbox = gr.Checkbox(
-                    value=False, label="\U0001f9ea Mock backend (offline: MockOracle + stubbed VLM)")
+                    value=False, label="\U0001f9ea Mock backend (offline: MockOracle + stubbed refine VLM)")
                 mock_class_dropdown = gr.Dropdown(
                     choices=["target", "distractor", "spurious"], value="target",
                     label="MockOracle assumed true class (UI testing only)")
 
-            prompt_input = gr.Textbox(value=DEFAULT_PROMPT, label="✏️ Target concept (drives SAM3 + agent)")
-
-            run_button = gr.Button("▶ Run Orchestration", variant="primary")
+            run_button = gr.Button("▶ Run Experiment", variant="primary")
 
             gr.HTML("<hr>")
             with gr.Row():
@@ -627,19 +583,18 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Citrus Orchestration Sandbox") as 
                 jump_input = gr.Textbox(label="Jump to index", placeholder="e.g. 42", scale=2)
                 btn_jump = gr.Button("\U0001f3af Jump", scale=1)
 
-    nav_outputs = [sam3_display, gt_display, banner_md, status_box, idx_state]
-    run_inputs = [split_dropdown, idx_state, prompt_input, policy_dropdown, verifier_radio,
-                  overlap_radio, gate_mode_radio, iou_threshold_slider, iom_threshold_slider,
-                  dedup_metric_radio, dedup_threshold_slider, conf_slider, budget_number,
-                  thinking_checkbox, mock_checkbox, query_file_dropdown, mock_class_dropdown,
-                  oracle_dropdown]
-    run_outputs = [sam3_display, gt_display, status_box, verbose_box]
+    nav_outputs = [gt_display, generic_display, active_display, banner_md, status_box, idx_state]
+    run_inputs = [split_dropdown, idx_state, prompt_input, verifier_radio, overlap_radio,
+                  gate_mode_radio, iou_threshold_slider, iom_threshold_slider, dedup_metric_radio,
+                  dedup_threshold_slider, seed_conf_slider, budget_number, thinking_checkbox,
+                  mock_checkbox, query_file_dropdown, mock_class_dropdown, oracle_dropdown]
+    run_outputs = [gt_display, generic_display, active_display, status_box, verbose_box]
 
     app.load(fn=load_sample_view, inputs=[split_dropdown, idx_state], outputs=nav_outputs)
     split_dropdown.change(fn=on_split_change, inputs=[split_dropdown], outputs=nav_outputs)
 
-    run_button.click(fn=run_orchestration, inputs=run_inputs, outputs=run_outputs)
-    prompt_input.submit(fn=run_orchestration, inputs=run_inputs, outputs=run_outputs)
+    run_button.click(fn=run_experiment, inputs=run_inputs, outputs=run_outputs)
+    prompt_input.submit(fn=run_experiment, inputs=run_inputs, outputs=run_outputs)
 
     btn_next.click(fn=nav_next, inputs=[split_dropdown, idx_state], outputs=nav_outputs)
     btn_prev.click(fn=nav_prev, inputs=[split_dropdown, idx_state], outputs=nav_outputs)
@@ -647,7 +602,7 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Citrus Orchestration Sandbox") as 
 
 
 def main():
-    logger.info("Launching citrus orchestration sandbox on %s", device)
+    logger.info("Launching citrus prompt-refinement experiment on %s", device)
     app.launch()
 
 

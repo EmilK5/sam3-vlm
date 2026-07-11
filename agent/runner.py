@@ -12,7 +12,7 @@ import logging
 from agent import belief
 from agent.actions import QueryA, LookROIA, StopA
 from agent.actions import execute as default_execute
-from agent import policy_vlm
+from agent import policy_vlm, policy_vlm_v3
 from agent.history import EpisodeHistory, action_params, node_summary
 
 logger = logging.getLogger(__name__)
@@ -33,6 +33,25 @@ def make_vlm_policy(ctx, vlm_client=None):
             phi, getattr(ctx, "history", None), ctx.graph, cfg,
             client=vlm_client, image=ctx.image_pil,
             sensed_rois=getattr(ctx, "sensed_rois", None),
+        )
+
+    return policy
+
+
+def make_refine_policy(ctx, vlm_client=None):
+    """Adapt the v3 prompt-refinement policy (phase 9) into a runner policy
+    `callable(phi, partition, cfg)`.
+
+    Same episode wiring as make_vlm_policy -- the VLM is shown the whole history
+    plus the raw + overlay frames -- but it refines the SAM3 TEXT PROMPT (1-2
+    adjectives + noun) + threshold over a FIXED region (the tree ROI), so there is
+    no sensed_rois to pass (no sub-ROI zoom). policy_vlm_v3.choose hard-validates
+    and falls back to the heuristic on any violation. Client injectable for offline
+    testing. make_vlm_policy is left unchanged (v2 look/stop stays the default)."""
+    def policy(phi, partition, cfg):
+        return policy_vlm_v3.choose(
+            phi, getattr(ctx, "history", None), ctx.graph, cfg,
+            client=vlm_client, image=ctx.image_pil,
         )
 
     return policy

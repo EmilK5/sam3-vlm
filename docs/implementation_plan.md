@@ -711,3 +711,73 @@ candidate; hand-review the routed green_citrus.json.
 image end-to-end; read the episode JSON — bootstrap trio first, every look is
 inside the tree ROI, Qwen verify calls ≤ 1 per candidate, episode stops on its
 own.
+
+## Phase 9 — Prompt-refinement active loop (VLM refines the SAM3 text prompt)
+
+**Design (locked with the human).** The active arm senses the SAME region every
+step — the canopy tree ROI, ONE global pass — and the VLM refines *what* it asks
+SAM3: a 1-2 adjective + noun text prompt and a detection threshold. It is NOT a
+sub-ROI zoom policy. Rationale: (a) a global tree-ROI pass keeps every found
+positive exemplar in-frame, so exemplar priming is never lost — SAM3 exemplars are
+welded to the query frame (roi_align'd against that image's own features; there is
+no cross-image exemplar conditioning, confirmed against the HF `modeling_sam3.py`
+source), so a sub-ROI crop would silently drop out-of-crop exemplars; (b) fixing
+the region isolates the causal effect of prompt refinement from any tiling/
+ensembling confound, which is exactly the claim under test. Sub-ROI zoom may be
+re-added later behind a flag. Purpose of the phase: a three-window GUI (ground
+truth | fixed generic cascade | VLM-refine loop) to build intuition on whether
+prompt refinement helps; the statistical claim (adaptive vs. equal-budget random/
+fixed prompt schedule) is a later `eval/` ablation, NOT this GUI.
+
+### Step 9.1 — v3 prompt-refinement policy + config
+**Files:** `config.py`, `agent/policy_vlm_v3.py` (new),
+`tests/test_policy_vlm_v3.py` (new).
+**Prompt:**
+> `config.py`: add a phase-9 group — `seed_conf=0.65` (confident-seed / bootstrap
+> threshold), `refine_conf_default=0.40`, `refine_conf_min=0.30`,
+> `refine_conf_max=0.70`, `refine_min_words=1`, `refine_max_words=3`. New
+> `agent/policy_vlm_v3.py`: `choose(phi, history, graph, cfg, client=None,
+> image=None)`, shape mirroring `policy_vlm` but menu = {refine, stop}. Body =
+> {initial_concept, image_size, tree_roi, prompts_tried (distilled prompt→yield
+> trajectory), history (full x/y), phi, action_menu} + raw image + overlay (two
+> image parts). A legal `refine` validates the prompt to a
+> refine_min_words..refine_max_words plain-word noun phrase and clamps the
+> threshold to [refine_conf_min, refine_conf_max] (default when missing/non-numeric),
+> then returns a GLOBAL `QueryA(region=tree_roi, prompt, conf)` — text only, never a
+> box (CLAUDE.md #3). `stop` obeys the non-empty-graph guard + valid estimator.
+> Any parse/validation failure OR a refine with no image falls back to
+> `policy_heuristic.choose` (unchanged safety net). Reuse policy_vlm's request
+> plumbing (`_build_client/_request/_data_url/_compact_phi/_history_records/
+> _resolve_tree_roi/_log_text/_coerce_json_string/_ESTIMATORS`); do NOT modify
+> policy_vlm (v2 look/stop stays the default policy). Pytest with a fake client:
+> two image parts + full history + prompts_tried in the body; menu is refine/stop;
+> a legal refine → global QueryA over the tree ROI with normalized prompt + clamped
+> conf; missing threshold → default; over-long/empty prompt → fallback; empty-graph
+> stop → fallback; no image → refine absent from the menu and a refine response
+> falls back.
+**You verify:** read one built prompt (log it) — the body carries the raw+overlay
+images, the full history, and the prompt→yield trajectory; the menu is refine/stop;
+`pytest -q` green; grep the run for "fallback" on a healthy episode (none).
+
+### Step 9.2 — Three-window citrus experiment app
+**Files:** `citrus_orchestration_app.py`, `agent/runner.py` (additive
+`make_refine_policy`), `tests/test_refine_app.py` (new).
+**Prompt:**
+> `agent/runner.py`: add `make_refine_policy(ctx, vlm_client=None)` mirroring
+> `make_vlm_policy` but dispatching to `policy_vlm_v3.choose` (no sensed_rois);
+> `make_vlm_policy` unchanged. `citrus_orchestration_app.py`: render THREE panels
+> per image — (1) ground truth (existing `draw_gt_view`); (2) generic SAM3 arm: a
+> fixed two-call cascade on ONE prompt — canopy ROI → leaf map → global pass @
+> `seed_conf` (seeds confident exemplars) → tiled pass @ `refine_conf_default`;
+> (3) active arm: the v3 refine loop (bootstrap global @ seed_conf on the tree ROI,
+> then `make_refine_policy` with `bootstrap_global_pass=True, auto_stop=True` for
+> the hybrid VLM-stop / saturation / budget termination). Both arms run on separate
+> OrchardGraphs; show each arm's N_obs vs GT and stream the VLM prompt→yield trace
+> to the verbose log. Offline pytest with a stub processor + stubbed VLM client:
+> the three views render and the active arm's history is
+> [canopy_roi, leaf_map, global_pass, (refine…), stop/auto-stop] with every refine
+> a global QueryA over the tree ROI.
+**You verify:** launch the app on the GPU box; step a few images — the generic arm
+matches the old cascade, the active arm's log shows the prompt evolving
+(green fruit → …) with N_obs moving toward GT; the region never changes (always
+the tree ROI); no "fallback" spam on a healthy run.

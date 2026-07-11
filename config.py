@@ -119,6 +119,25 @@ class Config:
                                   # oracle keep thinking on (their default call). One
                                   # model id throughout -- never switch models.
 
+    # --- prompt-refinement active loop (phase 9) ---
+    # The active arm senses the SAME region every step (the canopy tree ROI, one
+    # global pass) and lets the VLM refine WHAT it asks SAM3: a 1-2 adjective +
+    # noun text prompt and a detection threshold. Global-tree-ROI keeps every
+    # found positive exemplar in frame (SAM3 exemplars are welded to the query
+    # frame -- no cross-image conditioning), and fixing the region isolates the
+    # causal effect of prompt refinement from any tiling/ensembling confound.
+    seed_conf: float = 0.65        # confident-seed threshold for the bootstrap / first
+                                   # global pass (arm-2 pass 1 + arm-3 bootstrap): only
+                                   # detections >= this survive, so seeded exemplars are
+                                   # confident by construction.
+    refine_conf_default: float = 0.40  # threshold for a refine pass when the VLM omits
+                                   # or gives an out-of-range one (the "lowered" recall
+                                   # threshold used after the confident seed).
+    refine_conf_min: float = 0.30  # a VLM-chosen refine threshold is clamped to
+    refine_conf_max: float = 0.70  # [refine_conf_min, refine_conf_max].
+    refine_min_words: int = 1      # a VLM refine prompt must have at least this many and
+    refine_max_words: int = 3      # at most this many words (1-2 adjectives + a noun).
+
     # --- costs (normalized relative to one global SAM3 call) ---
     c_sam: float = 1.0
     c_tile: float = 0.25

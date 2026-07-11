@@ -52,8 +52,28 @@ follow the "Suggested order of the first week" in the plan.
 - [x] 8.4 V-IP routing: CV + SAM3 channels, RouterOracle (verifier/queries.py, verifier/cv_answers.py, verifier/oracle.py, queries/green_citrus.json, tests/test_oracle_routing.py; scope: scripts/demo_verify.py --oracle router) — implemented; suite green (270). Check: demo_verify --oracle router shows ≤1 Qwen call per candidate; hand-review routed green_citrus.json.
 - [~] 8.5 v2 wiring: config, eval, apps (config.py, eval/run_eval.py, orchestration_app.py, tests/test_v2_wiring.py; scope: tests/test_smoke.py for removed knobs) — implemented; suite green (277). runner.py needed no change. Check: run_eval --policy vlm --oracle router --limit 1 end-to-end.
 
+## Phase 9 — Prompt-refinement active loop (VLM refines the SAM3 text prompt)
+Active arm = global passes on the canopy tree ROI ONLY (no sub-ROI zoom); the VLM
+refines the text prompt (1-2 adjectives + noun) + threshold each step. Keeps every
+found exemplar in-frame and isolates the prompt-refinement effect (see plan Phase 9
+design note + the SAM3 exemplar frame-coupling finding).
+- [~] 9.1 v3 prompt-refinement policy + config (config.py, agent/policy_vlm_v3.py, tests/test_policy_vlm_v3.py) — implemented; suite green (287, +10). policy_vlm untouched (v2 look/stop stays default). Check: read one built prompt — body has raw+overlay images, full history, prompts_tried trajectory; menu is refine/stop; a legal refine → global QueryA over the tree ROI with clamped conf; over-long/empty prompt & empty-graph stop fall back to heuristic.
+- [~] 9.2 Three-window citrus experiment app (citrus_orchestration_app.py, agent/runner.py additive make_refine_policy, tests/test_runner_refine.py) — implemented; suite green (289, +2). Test file named test_runner_refine.py (not test_refine_app.py): the app loads SAM3 at import, so it cannot be imported in a CPU/no-network test; the CPU-testable unit is make_refine_policy (history reaches the v3 prompt, refine -> global QueryA over the tree ROI). The app itself (three-panel render, both arms) is GPU hand-verified. Check: launch on the GPU box; step a few images — generic arm matches the old cascade, active arm's log shows the prompt evolving (green fruit -> ...) with N_obs moving toward GT; region never changes (always the tree ROI); no "fallback" spam on a healthy run.
+
 ## Notes / decisions log
 <!-- Append dated one-liners here when a step deviates from the plan. -->
+- 2026-07-11 (Phase 9 opened, mentor-driven reformulation): new research direction
+  — the VLM refines the SAM3 TEXT PROMPT (1-2 adjectives + noun) + threshold, SAM3
+  grounds it, repeat to convergence. Investigated the human's "inject out-of-ROI
+  exemplars into the Sam3Processor" idea and the fork alternative; BOTH rejected —
+  SAM3's geometry/exemplar encoder is welded to the query frame (roi_align on that
+  image's own features), no decoupled concept-embedding injection exists (verified
+  vs HF modeling_sam3.py, 2026-07-11), and forking would put SAM3 off its training
+  distribution + break the "frozen sensor" framing. Resolution: active arm does
+  GLOBAL passes on the tree ROI only (all exemplars stay in-frame; isolates the
+  prompt-refinement effect). Hybrid stop = VLM stop OR saturation OR budget. 9.1
+  reuses policy_vlm's request plumbing and leaves the v2 look/stop policy as the
+  default. See memory: sam3-exemplar-frame-coupling.
 - 2026-07-10 (phase-8 review, user request): whole-phase code review found and
   fixed 2 bugs outside any step's file list: (1) citrus_orchestration_app.py
   still called the pre-8.3 make_vlm_policy(ctx, inspect_client=..., vlm_client=...)
