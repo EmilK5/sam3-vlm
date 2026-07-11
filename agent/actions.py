@@ -37,6 +37,10 @@ class QueryA:
     region: tuple            # xyxy pixel region to query
     prompt: str
     conf: float
+    tiling: bool = False     # additive, backward-compatible: True runs the pass TILED
+                             # over `region` (recall on small/clustered objects), False
+                             # (default) keeps the single global pass. Never a sub-ROI
+                             # zoom -- the region is unchanged; only the pass is tiled.
 
 
 @dataclasses.dataclass
@@ -68,6 +72,10 @@ class ActionContext:
                              # Stop never inflates pass numbers
     sensed_rois: list = dataclasses.field(default_factory=list)  # expanded xyxy ROIs
                              # already sensed by LookROIA, for de-duplicating repeats
+    last_pass_stats: dict = None  # detection feedback from the most recent sensing
+                             # pass (n_new / n_redetected / n_detections), stashed by
+                             # _execute_query for the runner's observation record.
+                             # None between passes and for non-sensing actions.
 
 
 # ----------------------- helpers -----------------------
@@ -139,6 +147,16 @@ def _execute_query(action, ctx, tiling, roi_override) -> int:
     )
     ctx.n_passes = pass_number
     _meter_query(ctx, stats)
+    # Stash per-pass detection feedback for the observation record: how many distinct
+    # detections this prompt produced (post_nms), how many were previously-unseen
+    # (n_new = accepted new tracks), and how many re-detected already-known objects
+    # (duplicates_rejected). n_redetected is what lets the policy judge whether a
+    # prompt actually covers the target concept, not merely whether it added anything.
+    ctx.last_pass_stats = {
+        "n_new": int(stats),
+        "n_redetected": int(getattr(stats, "duplicates_rejected", 0)),
+        "n_detections": int(getattr(stats, "post_nms", 0)),
+    }
     return int(stats)
 
 
@@ -215,8 +233,10 @@ def execute(action, ctx) -> int:
     """Dispatch an action, returning the number of new candidate tracks created."""
     if ctx.cost is not None:
         ctx.cost.n_orch += 1  # one orchestration decision per executed action
+    ctx.last_pass_stats = None  # cleared each action; a sensing pass repopulates it
     if isinstance(action, QueryA):
-        return _execute_query(action, ctx, tiling=False, roi_override=action.region)
+        return _execute_query(action, ctx, tiling=getattr(action, "tiling", False),
+                              roi_override=action.region)
     if isinstance(action, LookROIA):
         return _execute_look(action, ctx)
     if isinstance(action, StopA):

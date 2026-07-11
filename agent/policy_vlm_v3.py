@@ -7,23 +7,28 @@ look, this policy does the opposite: the region is FIXED to the canopy tree ROI
 (one global pass per step) and the VLM chooses WHAT to ask SAM3 -- a refined text
 prompt (1-2 adjectives + a noun) plus the detection threshold.
 
-Why global-tree-ROI only:
-  * A global pass over the tree ROI keeps every already-found positive exemplar in
+Why the region is FIXED to the tree ROI (and LookROIA is banned here):
+  * A pass over the whole tree ROI keeps every already-found positive exemplar in
     frame, so exemplar priming is never lost. SAM3 visual exemplars are welded to
     the query frame (roi_align'd against that image's own features); there is no
-    cross-image exemplar conditioning, so a sub-ROI crop would silently drop the
-    out-of-crop exemplars.
-  * Fixing the region isolates the causal effect of prompt refinement -- no tiling
-    or ensembling confound -- which is exactly the hypothesis under test (does the
-    VLM proposing better descriptive terms improve SAM3's precision/recall?).
+    cross-image exemplar conditioning, so a sub-ROI crop (LookROIA) would silently
+    drop the out-of-crop exemplars and is intentionally NOT available in this arm.
+  * Fixing the region isolates the causal effect of prompt refinement -- the only
+    thing that varies step to step is the wording, which is exactly the hypothesis
+    under test (does the VLM proposing better descriptive terms improve SAM3's r/p?).
+
+Recall parity: the region is fixed but a pass may be TILED (cfg.refine_tiling) over
+the tree ROI, which is the recall mechanism the generic cascade uses -- tiling is
+NOT a sub-ROI zoom (the region is unchanged), so it does not reintroduce LookROIA.
 
 Grounding guarantee (CLAUDE.md #3): the VLM emits TEXT, never a box. SAM3 grounds
 the prompt into detections; no VLM-supplied box ever becomes a candidate. The
-prompt only parameterizes a SAM3 query (region + threshold).
+prompt only parameterizes a SAM3 query (region + threshold + tiled-or-not).
 
-Menu: {"refine", "stop"}. A refine maps to a global QueryA over the tree ROI with
-the validated prompt + clamped threshold. Any parse/validation failure falls back
-to the non-visual heuristic, so the VLM can never drive an illegal action.
+Menu: {"refine", "stop"}. A refine maps to a QueryA over the tree ROI (tiled per
+cfg.refine_tiling) with the validated NEW prompt + clamped threshold. Any parse/
+validation failure -- including a repeated prompt -- makes the arm STOP; it never
+falls back to a sensing action the VLM did not choose (in particular never LookROIA).
 
 Shares the request plumbing (client build, request, image encode, belief compaction,
 tree-ROI resolution, JSON coercion) with policy_vlm to stay behaviorally identical
@@ -34,7 +39,6 @@ import json
 import logging
 
 from agent.actions import QueryA, StopA
-from agent import policy_heuristic
 from agent.policy_vlm import (
     _ESTIMATORS,
     _build_client,
@@ -54,13 +58,21 @@ SYSTEM_PROMPT = (
     "as active perception. The SAM3 sensor always scans the SAME region -- the tree "
     "region of interest -- so your job each step is to choose WHAT to ask it: a short "
     "text prompt of one or two adjectives plus a noun (e.g. \"green fruit\", "
-    "\"round fruit\", \"yellow citrus\"), and a detection threshold. You are shown the "
-    "raw frame, an overlay of the objects already found (colored by class), and the "
-    "FULL history of the prompts already tried and what each one yielded. Look at the "
-    "boxes: refine the wording to reveal previously-missed target objects and to avoid "
-    "the distractors the last prompt picked up. You never label or add objects "
-    "yourself; SAM3 grounds your text into boxes. Reply with ONLY a JSON object "
-    "{\"action\": <name>, \"args\": {...}} and nothing else."
+    "\"round fruit\", \"yellow citrus\"), and a detection threshold. Your prompt MUST "
+    "be different from every prompt already tried. You are shown the raw frame, an "
+    "overlay of the objects already found (colored by class), and, for each prompt "
+    "already tried, how it performed: n_detections (total objects it found), n_new "
+    "(previously-unseen objects it added), and n_redetected (objects it re-found that "
+    "were ALREADY known -- matched by the dedup step). Judge a prompt by n_redetected, "
+    "not just n_new: a wording that covers the target concept re-finds MOST of the "
+    "already-known target objects AND adds new ones; a wording that re-detects few of "
+    "the known objects is off-concept even if it added a couple. Look at the boxes, "
+    "then pick a NEW wording that covers the concept better. Keep proposing new "
+    "wordings that might reveal target objects the earlier prompts missed; choose "
+    "\"stop\" only when you believe no different wording would find more. The only "
+    "actions are \"refine\" and \"stop\" -- never anything else. You never label or "
+    "add objects yourself; SAM3 grounds your text into boxes. Reply with ONLY a JSON "
+    "object {\"action\": <name>, \"args\": {...}} and nothing else."
 )
 
 
@@ -85,41 +97,55 @@ def choose(phi, history, graph, cfg, client=None, image=None):
     try:
         content = _request(client, cfg, messages)
         logger.info("policy_vlm_v3 response: %s", content)
-    except Exception as exc:  # network / client error -> fall back
-        logger.warning("policy_vlm_v3: request failed (%s); fallback to heuristic.", exc)
-        return _fallback(phi, cfg, tree_roi)
+    except Exception as exc:  # network / client error -> stop
+        logger.warning("policy_vlm_v3: request failed (%s); stopping (no LookROIA fallback).", exc)
+        return _fallback(cfg)
 
-    action = _parse_and_validate(content, graph, cfg, image, tree_roi)
+    tried = _tried_prompt_set(history)
+    action = _parse_and_validate(content, graph, cfg, image, tree_roi, tried)
     if action is None:
-        logger.warning("policy_vlm_v3: invalid/illegal response; fallback to heuristic.")
-        return _fallback(phi, cfg, tree_roi)
+        logger.warning("policy_vlm_v3: invalid/repeated/illegal response; stopping.")
+        return _fallback(cfg)
     return action
 
 
-def _fallback(phi, cfg, tree_roi):
-    """The safety net: the non-visual heuristic, anchored to the tree ROI (the single
-    v2/v3 partition region). tree_roi None (offline, no image) yields a degenerate
-    anchor, which only occurs in contrived offline calls."""
-    partition = [tuple(tree_roi)] if tree_roi is not None else [(0.0, 0.0, 0.0, 0.0)]
-    return policy_heuristic.choose(phi, partition, cfg)
+def _fallback(cfg):
+    """LookROIA is banned in this arm. When the VLM returns no valid NEW prompt (a
+    parse error, a repeat, or an out-of-menu action), the arm STOPS rather than emit
+    any sensing action the VLM did not choose -- in particular it never falls back to
+    the v2 look/stop heuristic, which would produce a sub-ROI LookROIA. Termination is
+    then governed by the VLM, discovery saturation, or budget."""
+    return StopA(estimate_name="N_obs")
 
 
 # ----------------------- prompt body -----------------------
 
 def _prompts_tried(history):
-    """Distill the history into the ordered list of prompts already tried and what
-    each yielded, so the refinement trajectory is legible at a glance (in addition to
-    the full history, which is also included)."""
+    """Distill the history into the ordered list of prompts already tried and how each
+    performed -- n_detections (total found), n_new (previously-unseen added), and
+    n_redetected (already-known objects re-found, the prompt-quality signal). This is
+    the feedback that lets the VLM truly evaluate a wording, not just enumerate past
+    ones; the full history is also included in the body."""
     tried = []
     for rec in _history_records(history):
         x = rec.get("x", {})
         if "prompt" in x:
+            y = rec.get("y", {})
             tried.append({
                 "prompt": x["prompt"],
                 "conf": x.get("conf"),
-                "n_new": rec.get("y", {}).get("n_new"),
+                "n_detections": y.get("n_detections"),
+                "n_new": y.get("n_new"),
+                "n_redetected": y.get("n_redetected"),
             })
     return tried
+
+
+def _tried_prompt_set(history):
+    """The normalized set of prompts already tried (incl. the seed), so a refine that
+    merely repeats an earlier wording is rejected -- each step must try something new."""
+    return {" ".join(t["prompt"].split()).lower()
+            for t in _prompts_tried(history) if t.get("prompt")}
 
 
 def _build_body(phi, history, graph, cfg, image, tree_roi):
@@ -134,7 +160,7 @@ def _build_body(phi, history, graph, cfg, image, tree_roi):
         lo = getattr(cfg, "refine_conf_min", 0.30)
         hi = getattr(cfg, "refine_conf_max", 0.70)
         menu = {
-            "refine": {"prompt": "<1-2 adjectives + noun>",
+            "refine": {"prompt": "<NEW 1-2 adjectives + noun, not already tried>",
                        "threshold": "<%.2f-%.2f>" % (lo, hi)},
             **menu,
         }
@@ -204,8 +230,11 @@ def _validate_threshold(threshold, cfg):
     return float(min(hi, max(lo, threshold)))
 
 
-def _parse_and_validate(content, graph, cfg, image, tree_roi):
-    """Return a validated action dataclass, or None on any parse/validation failure."""
+def _parse_and_validate(content, graph, cfg, image, tree_roi, tried_prompts=frozenset()):
+    """Return a validated action dataclass, or None on any parse/validation failure.
+
+    tried_prompts: normalized prompts already tried this episode; a refine that
+    repeats one is rejected so every step tries a genuinely new wording."""
     try:
         data = json.loads(content)
         name = data["action"]
@@ -224,16 +253,19 @@ def _parse_and_validate(content, graph, cfg, image, tree_roi):
         prompt = _validate_prompt(args.get("prompt"), cfg)
         if prompt is None:
             return None
+        if " ".join(prompt.split()).lower() in tried_prompts:
+            return None                                  # must try a NEW wording each step
         conf = _validate_threshold(args.get("threshold"), cfg)
         region = tuple(float(v) for v in tree_roi)
-        return QueryA(region=region, prompt=prompt, conf=conf)
+        # Tiled over the tree ROI for recall parity with the generic cascade; still the
+        # whole region (not a sub-ROI zoom). The prompt sets only text/threshold/tiling.
+        tiling = bool(getattr(cfg, "refine_tiling", True))
+        return QueryA(region=region, prompt=prompt, conf=conf, tiling=tiling)
 
     if name == "stop":
-        # Never terminate before any candidate has been registered: a stop on an
-        # empty graph reports zero having sensed nothing. Fall back so the heuristic
-        # picks a sensing action instead.
-        if len(graph.nodes) == 0:
-            return None
+        # The bootstrap always senses before the policy loop, so an empty graph here
+        # means the seed genuinely found nothing (empty orchard) -- stopping with 0 is
+        # correct, and there is no LookROIA to fall back to.
         est = args.get("estimate_name", "N_cons")
         if est not in _ESTIMATORS:
             return None

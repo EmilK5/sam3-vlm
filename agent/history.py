@@ -12,9 +12,12 @@ Record shape:
       "t":  int,                       # 1-based record index (one per log line)
       "x":  {"action": str, ...},      # the sensing action + its params
       "y":  {                          # the observation the action produced
-        "n_new":     int,
-        "new_nodes": [{"id", "box", "conf", "class"}, ...],
-        "totals":    {"K": int, "N_obs": int},
+        "n_new":        int,           # previously-unseen tracks this action added
+        "n_redetected": int,           # detections that matched already-known tracks
+                                       # (dedup re-detections) -- the prompt-quality signal
+        "n_detections": int,           # total distinct detections the prompt produced
+        "new_nodes":    [{"id", "box", "conf", "class"}, ...],
+        "totals":       {"K": int, "N_obs": int},
       },
     }
 

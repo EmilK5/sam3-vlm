@@ -322,7 +322,8 @@ def run_active_arm(image_pil, cfg, oracle, query_set, vlm_client=None):
     )
     pol = runner.make_refine_policy(ctx, vlm_client=vlm_client)
     result = runner.run_episode(image_pil, ctx, pol, max_actions=cfg.budget_max_actions,
-                                bootstrap_global_pass=True, auto_stop=True)
+                                bootstrap_global_pass=True, bootstrap_tiled_pass=True,
+                                auto_stop=True)
     result["ctx"] = ctx
     return result
 
@@ -424,7 +425,9 @@ def run_experiment(split, idx, prompt, verifier, overlap_mode, gate_mode, iou_th
         x, y = rec["x"], rec["y"]
         p = x.get("prompt")
         label = x["action"] if p is None else f"{x['action']} prompt='{p}' @{x.get('conf'):.2f}"
-        traj.append(f"  t={rec['t']:>2}  {label:<48}  ->  new={y['n_new']} totals={y['totals']}")
+        traj.append(
+            f"  t={rec['t']:>2}  {label:<48}  ->  det={y.get('n_detections', 0)} "
+            f"new={y['n_new']} redet={y.get('n_redetected', 0)} totals={y['totals']}")
 
     footer = [
         "",

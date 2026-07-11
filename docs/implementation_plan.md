@@ -781,3 +781,60 @@ images, the full history, and the prompt→yield trajectory; the menu is refine/
 matches the old cascade, the active arm's log shows the prompt evolving
 (green fruit → …) with N_obs moving toward GT; the region never changes (always
 the tree ROI); no "fallback" spam on a healthy run.
+
+### Step 9.3 — Per-prompt dedup feedback + distinct-prompt rule
+**Files:** `agent/actions.py`, `agent/runner.py`, `agent/history.py`,
+`agent/policy_vlm_v3.py`, `citrus_orchestration_app.py`,
+`tests/test_prompt_feedback.py` (new); + `tests/test_policy_vlm_v3.py` update.
+**Prompt:**
+> The VLM can only judge a prompt if it sees how many ALREADY-KNOWN objects that
+> prompt re-found (dedup re-detections), not just how many new ones it added.
+> Thread `PassStats.duplicates_rejected` (and `post_nms`) through to the policy.
+> `actions.py`: add `ActionContext.last_pass_stats` (default None); `execute` clears
+> it each action; `_execute_query` stashes `{n_new, n_redetected(=duplicates_rejected),
+> n_detections(=post_nms)}`. `runner.py`: `_obs(ctx, n_new, new_nodes)` builds the
+> observation y including n_redetected/n_detections (zeros when no pass ran); used for
+> the bootstrap global_pass record and every loop record; canopy_roi/leaf_map carry
+> zeros. `history.py`: document the new y fields. `policy_vlm_v3.py`: `_prompts_tried`
+> now carries {prompt, conf, n_detections, n_new, n_redetected}; add `_tried_prompt_set`;
+> `_parse_and_validate` rejects a refine prompt already tried (normalized) so each step
+> tries a NEW wording; system prompt tells the VLM to judge a prompt by n_redetected
+> (good wording re-finds most known targets AND adds new) and that its prompt must
+> differ from all tried. `citrus_orchestration_app.py`: show det/new/redet per step in
+> the trajectory log. Pytest (CPU, `pipeline` stubbed in sys.modules / execute_fn
+> injected): `_execute_query` stashes the feedback; a Stop clears it; run_episode's y
+> carries n_redetected/n_detections; a repeated prompt falls back; prompts_tried shows
+> the dedup counts.
+**You verify:** on the GPU box, read one active-arm prompt — prompts_tried lists each
+prior wording with n_detections/n_new/n_redetected; the VLM never repeats a wording
+(each step is new); watch a run where an early prompt has low n_redetected and the
+VLM pivots to a wording that re-finds more of the known fruit.
+
+### Step 9.4 — Ban LookROIA in the active arm + tiling for recall
+**Files:** `config.py`, `agent/actions.py`, `agent/runner.py`,
+`agent/policy_vlm_v3.py`, `citrus_orchestration_app.py`,
+`tests/test_active_arm_tiling.py` (new); + `tests/test_policy_vlm_v3.py` migration.
+**Prompt:**
+> Observed: the active arm's fallback called policy_heuristic, which emits LookROIA
+> (a sub-ROI zoom that drops exemplars and finds nothing), and recall trailed the
+> generic cascade because the arm never tiled. Fix both. `policy_vlm_v3._fallback`
+> returns `StopA` (never the look heuristic) so the arm's action space is strictly
+> {refine, stop} -- LookROIA can never appear; drop the empty-graph stop guard (the
+> bootstrap always senses first, so an empty graph == empty orchard, stop with 0 is
+> correct). `config.py`: `refine_tiling=True`. `actions.py`: `QueryA.tiling` field
+> (default False, additive); `execute` forwards it. `policy_vlm_v3`: a refine builds
+> `QueryA(..., tiling=cfg.refine_tiling)` over the whole tree ROI (tiling is the recall
+> mechanism, NOT a sub-ROI zoom); system prompt tells the VLM to keep proposing new
+> wordings and that the only actions are refine/stop. `runner.py`: add
+> `bootstrap_tiled_pass` -- after the global seed, run one TILED pass over the tree ROI
+> with the seed prompt at refine_conf_default (a "tiled_seed_pass" record) so the arm's
+> recall floor equals the generic cascade before any refine. `citrus_orchestration_app`:
+> run_active_arm sets bootstrap_tiled_pass=True. Pytest (CPU, pipeline stubbed /
+> execute_fn injected): QueryA.tiling threads to execute_pass; bootstrap adds the tiled
+> seed record (untiled global then tiled seed); a refine is tiled (off when
+> refine_tiling=False); an invalid response returns StopA, never LookROIA.
+**You verify:** on the GPU box, the active-arm trajectory shows canopy_roi / leaf_map /
+global_pass / tiled_seed_pass then refines -- NO LookROIA anywhere; active-arm recall
+is >= the generic cascade (the tiled seed floor guarantees it) and rises further when
+the VLM finds a good wording; an invalid/repeated VLM reply ends the arm cleanly (a
+single "stopping" log line, not LookROIA spam).

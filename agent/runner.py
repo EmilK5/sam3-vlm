@@ -69,8 +69,27 @@ def _totals(ctx) -> dict:
             "N_obs": int(belief.count_estimates(ctx.graph, ctx.cfg)["N_obs"])}
 
 
+def _obs(ctx, n_new, new_nodes, totals=None) -> dict:
+    """Build an observation record y. Beyond n_new (previously-unseen tracks) and the
+    new-node summaries, it carries the last sensing pass's detection feedback:
+    n_detections (total distinct detections the prompt produced) and n_redetected
+    (detections that matched already-known tracks -- dedup re-detections). n_redetected
+    is the signal that lets the policy judge a prompt by how much of the known target
+    set it re-finds, not only by what it adds. Zeros when no sensing pass ran (the
+    stats are stashed on ctx by actions._execute_query)."""
+    stats = getattr(ctx, "last_pass_stats", None) or {}
+    return {
+        "n_new": n_new,
+        "n_redetected": int(stats.get("n_redetected", 0)),
+        "n_detections": int(stats.get("n_detections", 0)),
+        "new_nodes": new_nodes,
+        "totals": totals if totals is not None else _totals(ctx),
+    }
+
+
 def run_episode(image, ctx, policy, max_actions, execute_fn=None,
-                bootstrap_global_pass=False, auto_stop=False) -> dict:
+                bootstrap_global_pass=False, bootstrap_tiled_pass=False,
+                auto_stop=False) -> dict:
     """Run a heuristic (or any phi->action) policy to termination.
 
     image      : PIL image (stored on ctx.image_pil).
@@ -87,6 +106,11 @@ def run_episode(image, ctx, policy, max_actions, execute_fn=None,
         against max_actions (the canopy/leaf-map records document the pass, they
         are not separately billed). Default off so existing (heuristic-baseline)
         episodes are unchanged.
+    bootstrap_tiled_pass: when True (only meaningful with bootstrap_global_pass), run
+        ONE additional TILED pass over the tree ROI with the same seed prompt at
+        cfg.refine_conf_default right after the global bootstrap -- the generic
+        cascade's recall floor -- recorded as a "tiled_seed_pass" and billed as one
+        more sensing action. Default off.
     auto_stop: when True, end the episode once discovery saturates on a non-empty
         graph (DiscoveryCurve.saturated over cfg.window_m / cfg.delta_disc), even
         if the policy never returns StopA. Budget exhaustion is the other backstop
@@ -140,22 +164,36 @@ def run_episode(image, ctx, policy, max_actions, execute_fn=None,
         boot = QueryA(region=region, prompt=prompt, conf=conf)
         n_new, new_nodes = _sense(boot)
         sensing_used += 1
-        totals = _totals(ctx)
+        global_y = _obs(ctx, n_new, new_nodes)   # reads the bootstrap pass's stats
+        totals = global_y["totals"]
+        empty_y = {"n_new": 0, "n_redetected": 0, "n_detections": 0,
+                   "new_nodes": [], "totals": totals}
 
         # (1) canopy_roi: the tree ROI box actually used (graph.tree_roi or, when
         #     unset -- offline/stub runs -- the region the pass ran over).
         tree_roi = getattr(ctx.graph, "tree_roi", None) or list(region)
-        _record({"action": "canopy_roi", "roi": list(tree_roi)},
-                {"n_new": 0, "new_nodes": [], "totals": totals})
+        _record({"action": "canopy_roi", "roi": list(tree_roi)}, dict(empty_y))
         # (2) leaf_map: the number of background-leaf boxes the pass generated.
         leaf_boxes = getattr(ctx.graph, "cached_leaf_boxes", None)
         n_leaves = int(len(leaf_boxes)) if leaf_boxes is not None else 0
-        _record({"action": "leaf_map", "n_leaves": n_leaves},
-                {"n_new": 0, "new_nodes": [], "totals": totals})
+        _record({"action": "leaf_map", "n_leaves": n_leaves}, dict(empty_y))
         # (3) global_pass: the standard observation record for the QueryA.
         x_global = action_params(boot)
         x_global["action"] = "global_pass"
-        _record(x_global, {"n_new": n_new, "new_nodes": new_nodes, "totals": totals})
+        _record(x_global, global_y)
+
+        # (4) optional tiled_seed_pass: a TILED pass over the same tree ROI with the
+        #     SAME seed prompt at refine_conf_default -- the generic cascade's recall
+        #     floor, so the active arm never starts below the fixed cascade's coverage
+        #     before the VLM's refines begin. Billed as one more sensing action.
+        if bootstrap_tiled_pass and sensing_used < max_actions:
+            tconf = getattr(ctx.cfg, "refine_conf_default", conf)
+            tiled = QueryA(region=region, prompt=prompt, conf=tconf, tiling=True)
+            n_new_t, new_nodes_t = _sense(tiled)
+            sensing_used += 1
+            x_tiled = action_params(tiled)
+            x_tiled["action"] = "tiled_seed_pass"
+            _record(x_tiled, _obs(ctx, n_new_t, new_nodes_t))
 
     while sensing_used < max_actions:
         # Auto-stop backstop: saturated discovery on a non-empty graph ends the
@@ -169,8 +207,7 @@ def run_episode(image, ctx, policy, max_actions, execute_fn=None,
         n_new, new_nodes = _sense(action)
         if isinstance(action, _SENSING):
             sensing_used += 1
-        _record(action_params(action),
-                {"n_new": n_new, "new_nodes": new_nodes, "totals": _totals(ctx)})
+        _record(action_params(action), _obs(ctx, n_new, new_nodes))
         if isinstance(action, StopA):
             break
 

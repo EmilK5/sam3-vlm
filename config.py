@@ -137,6 +137,11 @@ class Config:
     refine_conf_max: float = 0.70  # [refine_conf_min, refine_conf_max].
     refine_min_words: int = 1      # a VLM refine prompt must have at least this many and
     refine_max_words: int = 3      # at most this many words (1-2 adjectives + a noun).
+    refine_tiling: bool = True     # refine passes are TILED over the tree ROI (recall
+                                   # parity with the generic cascade's tiled pass). The
+                                   # region is still the whole tree ROI -- tiling is the
+                                   # recall mechanism, not a sub-ROI zoom. Set False to
+                                   # reproduce global-only refines (ablation).
 
     # --- costs (normalized relative to one global SAM3 call) ---
     c_sam: float = 1.0
