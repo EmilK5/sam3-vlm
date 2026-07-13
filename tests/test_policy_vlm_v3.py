@@ -97,12 +97,12 @@ def test_request_carries_two_images_history_and_menu():
 
 def test_legal_refine_maps_to_tiled_queryA_over_tree_roi():
     cfg, graph, phi = _fixture()
-    client = _CaptureClient('{"action": "refine", "args": {"prompt": "round green fruit", "threshold": 0.4}}')
+    client = _CaptureClient('{"action": "refine", "args": {"prompt": "round green fruit", "threshold": 0.6}}')
     action = policy_vlm_v3.choose(phi, _history(), graph, cfg, client=client, image=FRAME)
     assert isinstance(action, QueryA)
     assert action.region == tuple(float(v) for v in TREE_ROI)    # the whole tree ROI (never a sub-ROI)
     assert action.prompt == "round green fruit"
-    assert action.conf == 0.4
+    assert action.conf == 0.6                                    # in [floor=0.50, 0.85] -> kept as chosen
     assert action.tiling is True                                 # tiled for recall (cfg.refine_tiling)
 
 

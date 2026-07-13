@@ -131,18 +131,25 @@ def _font():
         return None
 
 
-def draw_sam3_view(image_pil, graph, prompt_str, arm_label="SAM3"):
+def draw_sam3_view(image_pil, graph, prompt_str, arm_label="SAM3", max_pass=None):
     """A SAM3 arm panel: canopy ROI box + every candidate's box, colored by verifier
     classification, with a translucent mask fill wherever the node carries one
     (overlap_mode='mask', non-tiled passes). The banner names the arm + the (final)
-    prompt + the per-class tally."""
+    prompt + the per-class tally.
+
+    max_pass: when set, draw only nodes discovered by that pass or earlier (found_in_pass
+    <= max_pass) -- the graph is monotone, so this reconstructs the belief state AS OF
+    that pass for the scrollable per-pass animation."""
+    def _visible(node):
+        return max_pass is None or node.found_in_pass <= max_pass
+
     canvas = image_pil.convert("RGBA").copy()
     font = _font()
 
     # Mask fills first, so box outlines/text drawn afterward stay crisp.
     mask_overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
     for node in graph.nodes.values():
-        if node.mask is None:
+        if node.mask is None or not _visible(node):
             continue
         rgb = _CLASS_COLORS.get(node.classification, (255, 255, 255))
         x1, y1 = int(round(node.box[0])), int(round(node.box[1]))
@@ -161,6 +168,8 @@ def draw_sam3_view(image_pil, graph, prompt_str, arm_label="SAM3"):
 
     tally = {}
     for node in graph.nodes.values():
+        if not _visible(node):
+            continue
         x1, y1, x2, y2 = node.box
         rgb = _CLASS_COLORS.get(node.classification, (255, 255, 255))
         tally[node.classification] = tally.get(node.classification, 0) + 1
@@ -182,6 +191,47 @@ def draw_gt_view(image_pil, gt_boxes, gt_count):
         x1, y1, x2, y2 = [float(v) for v in box]
         draw.rectangle([x1, y1, x2, y2], outline=_GT_COLOR, width=3)
     draw.text((8, 8), f"GROUND TRUTH | count={gt_count}", fill=(255, 255, 255), font=font)
+    return canvas
+
+
+_PASS_LABEL = {"global_pass": "global seed", "tiled_seed_pass": "tiled seed"}
+
+
+def render_pass_frames(image_pil, graph, history):
+    """One frame per sensing pass for the scrollable animation: the belief state AS OF
+    that pass (nodes with found_in_pass <= k, the graph being monotone), captioned with
+    the pass's action + prompt + that pass's det/new/redet and running N_obs. Returns a
+    list of (PIL image, caption) for a gr.Gallery."""
+    sensing = [r for r in history if r["x"]["action"] in ("global_pass", "tiled_seed_pass", "QueryA")]
+    frames = []
+    for k, rec in enumerate(sensing, start=1):
+        x, y = rec["x"], rec["y"]
+        prompt = x.get("prompt", "")
+        label = _PASS_LABEL.get(x["action"], "refine")
+        img = draw_sam3_view(image_pil, graph, prompt, arm_label=f"pass {k}: {label}", max_pass=k)
+        cap = (f"pass {k} · {label} · '{prompt}' @{x.get('conf', 0):.2f} · "
+               f"det={y.get('n_detections', 0)} new={y.get('n_new', 0)} "
+               f"redet={y.get('n_redetected', 0)} · N_obs={y['totals']['N_obs']}")
+        frames.append((img, cap))
+    return frames
+
+
+def render_leaf_map(image_pil, graph):
+    """Separate panel: the cached green-leaf inhibitor boxes SAM3 generated (stored
+    ROI-relative on the graph; translated back to global here)."""
+    canvas = image_pil.convert("RGB").copy()
+    draw = ImageDraw.Draw(canvas)
+    font = _font()
+    boxes = getattr(graph, "cached_leaf_boxes", None)
+    roi = getattr(graph, "cached_leaf_roi", None)
+    n = 0
+    if boxes is not None and len(boxes) > 0 and roi is not None:
+        ox, oy = float(roi[0]), float(roi[1])
+        for b in boxes:
+            draw.rectangle([float(b[0]) + ox, float(b[1]) + oy, float(b[2]) + ox, float(b[3]) + oy],
+                           outline=_CLASS_COLORS["leaf"], width=2)
+            n += 1
+    draw.text((8, 8), f"LEAF MAP (green-leaf inhibitors) | n={n}", fill=(255, 255, 255), font=font)
     return canvas
 
 
@@ -348,13 +398,13 @@ def _tally(graph):
 def run_experiment(split, idx, prompt, verifier, overlap_mode, gate_mode, iou_threshold,
                    iom_threshold, dedup_metric, dedup_threshold, seed_conf, budget,
                    enable_thinking, use_mock, query_file, mock_true_class, oracle_kind):
-    """Run both arms on one dataset image. Returns (gt_view, generic_view,
-    active_view, status, verbose)."""
+    """Run both arms on one dataset image. Returns (gt_view, generic_view, active_view,
+    active_frames, leaf_view, status, verbose)."""
     idx = int(idx)
     samples = get_samples(split)
     if not samples:
         ph = Image.new("RGB", (512, 400), "#c0392b")
-        return (ph, ph, ph, "Dataset unavailable.",
+        return (ph, ph, ph, [], ph, "Dataset unavailable.",
                 f"ERROR: no samples for split '{split}' from root '{DATASET_ROOT}'. "
                 "Check CITRUS_DATASET_ROOT / the images+labels layout.")
 
@@ -365,7 +415,7 @@ def run_experiment(split, idx, prompt, verifier, overlap_mode, gate_mode, iou_th
 
     if PROCESSOR is None:
         ph = Image.new("RGB", (512, 400), "#2c3e50")
-        return (gt_view, ph, ph, "SAM3 model not loaded on this machine.",
+        return (gt_view, ph, ph, [], ph, "SAM3 model not loaded on this machine.",
                 f"[FATAL] SAM3 weights did not load:\n{_LOAD_ERROR}\n\n"
                 "Run this app on the GPU box with the SAM3 repo present.")
 
@@ -376,7 +426,7 @@ def run_experiment(split, idx, prompt, verifier, overlap_mode, gate_mode, iou_th
     try:
         oracle, query_set = _build_oracle(cfg, verifier, use_mock, mock_true_class, oracle_kind)
     except Exception as exc:
-        return gt_view, image_pil, image_pil, f"ERROR building verifier: {exc}", str(exc)
+        return gt_view, image_pil, image_pil, [], image_pil, f"ERROR building verifier: {exc}", str(exc)
 
     handler = _ListLogHandler()
     handler.setFormatter(logging.Formatter("%(levelname)-7s %(name)s: %(message)s"))
@@ -406,7 +456,7 @@ def run_experiment(split, idx, prompt, verifier, overlap_mode, gate_mode, iou_th
         root.setLevel(prev_level)
         detail = "\n".join(header + ["", "[PIPELINE EXCEPTION]", str(exc), "",
                                      "--- captured log ---"] + handler.records)
-        return gt_view, image_pil, image_pil, f"Pipeline error: {exc}", detail
+        return gt_view, image_pil, image_pil, [], image_pil, f"Pipeline error: {exc}", detail
     finally:
         root.removeHandler(handler)
         root.setLevel(prev_level)
@@ -418,6 +468,8 @@ def run_experiment(split, idx, prompt, verifier, overlap_mode, gate_mode, iou_th
 
     generic_view = draw_sam3_view(image_pil, g_graph, target, arm_label="GENERIC (fixed cascade)")
     active_view = draw_sam3_view(image_pil, a_graph, final_prompt, arm_label="ACTIVE (VLM refine)")
+    active_frames = render_pass_frames(image_pil, a_graph, a_history)   # scrollable per-pass animation
+    leaf_view = render_leaf_map(image_pil, a_graph)
 
     # Refinement trajectory (x_t -> y_t) the VLM produced -- the story of the run.
     traj = ["", "--- ACTIVE ARM: prompt refinement trajectory (x_t -> y_t) ---"]
@@ -447,18 +499,20 @@ def run_experiment(split, idx, prompt, verifier, overlap_mode, gate_mode, iou_th
         return f"{n - gt_count:+d}"
     status = (f"GT={gt_count}  |  GENERIC N_obs={g_counts['N_obs']} ({_delta(g_counts['N_obs'])})  "
               f"|  ACTIVE N_obs={a_counts['N_obs']} ({_delta(a_counts['N_obs'])})  |  final prompt='{final_prompt}'")
-    return gt_view, generic_view, active_view, status, verbose
+    return gt_view, generic_view, active_view, active_frames, leaf_view, status, verbose
 
 
 # ==========================================
 # 5. Navigation (load the image + GT only; running the experiment is on demand)
 # ==========================================
 def load_sample_view(split, idx):
+    """Load the image + GT overlay only (clears the arm panels, the per-pass gallery,
+    and the leaf map). Running the experiment is on demand."""
     samples = get_samples(split)
     n = len(samples)
     if n == 0:
         ph = Image.new("RGB", (512, 400), "#c0392b")
-        return (ph, None, None, f"### split '{split}' empty/unavailable",
+        return (ph, None, None, [], None, f"### split '{split}' empty/unavailable",
                 f"Dataset unavailable: check CITRUS_DATASET_ROOT='{DATASET_ROOT}' and its "
                 "images/<split> + labels/<split> layout.", 0)
     idx = max(0, min(int(idx), n - 1))
@@ -467,7 +521,7 @@ def load_sample_view(split, idx):
     gt_view = draw_gt_view(image_pil, sample["gt_boxes"], sample["count"])
     banner = (f"### [{split}] index {idx} / {n - 1} | "
               f"{os.path.basename(sample['image_path'])} | GT count: {sample['count']}")
-    return gt_view, None, None, banner, "Loaded. Press ▶ Run Experiment.", idx
+    return gt_view, None, None, [], None, banner, "Loaded. Press ▶ Run Experiment.", idx
 
 
 def nav_next(split, idx):
@@ -516,7 +570,13 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Citrus Prompt-Refinement Experimen
             with gr.Row():
                 gt_display = gr.Image(label="✅ Ground truth", type="pil", interactive=False)
                 generic_display = gr.Image(label="\U0001f4e6 Generic (fixed cascade)", type="pil", interactive=False)
-                active_display = gr.Image(label="\U0001f9e0 Active (VLM refine)", type="pil", interactive=False)
+                active_display = gr.Image(label="\U0001f9e0 Active (VLM refine, final)", type="pil", interactive=False)
+            with gr.Row():
+                active_gallery = gr.Gallery(
+                    label="\U0001f3ac Active arm — scroll pass by pass (belief after each pass)",
+                    columns=4, height=280, object_fit="contain")
+                leaf_display = gr.Image(
+                    label="\U0001f342 Leaf map (green-leaf inhibitors)", type="pil", interactive=False)
             status_box = gr.Textbox(label="\U0001f4ca Result", interactive=False)
             verbose_box = gr.Textbox(
                 label="\U0001f52c Verbose log (both arms · refinement trajectory · counts)",
@@ -586,12 +646,14 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Citrus Prompt-Refinement Experimen
                 jump_input = gr.Textbox(label="Jump to index", placeholder="e.g. 42", scale=2)
                 btn_jump = gr.Button("\U0001f3af Jump", scale=1)
 
-    nav_outputs = [gt_display, generic_display, active_display, banner_md, status_box, idx_state]
+    nav_outputs = [gt_display, generic_display, active_display, active_gallery, leaf_display,
+                   banner_md, status_box, idx_state]
     run_inputs = [split_dropdown, idx_state, prompt_input, verifier_radio, overlap_radio,
                   gate_mode_radio, iou_threshold_slider, iom_threshold_slider, dedup_metric_radio,
                   dedup_threshold_slider, seed_conf_slider, budget_number, thinking_checkbox,
                   mock_checkbox, query_file_dropdown, mock_class_dropdown, oracle_dropdown]
-    run_outputs = [gt_display, generic_display, active_display, status_box, verbose_box]
+    run_outputs = [gt_display, generic_display, active_display, active_gallery, leaf_display,
+                   status_box, verbose_box]
 
     app.load(fn=load_sample_view, inputs=[split_dropdown, idx_state], outputs=nav_outputs)
     split_dropdown.change(fn=on_split_change, inputs=[split_dropdown], outputs=nav_outputs)

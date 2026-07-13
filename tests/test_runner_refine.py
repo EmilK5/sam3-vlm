@@ -67,13 +67,13 @@ def test_make_refine_policy_wires_history_and_maps_refine_to_global_query():
     ctx = ActionContext(image_pil=FRAME, graph=graph, cfg=cfg, partition=[tuple(TREE_ROI)])
     ctx.history = _history()
 
-    client = _CaptureClient('{"action": "refine", "args": {"prompt": "round fruit", "threshold": 0.4}}')
+    client = _CaptureClient('{"action": "refine", "args": {"prompt": "round fruit", "threshold": 0.6}}')
     policy = runner.make_refine_policy(ctx, vlm_client=client)
     action = policy(phi, [tuple(TREE_ROI)], cfg)
 
     assert isinstance(action, QueryA)
     assert action.region == tuple(float(v) for v in TREE_ROI)      # global pass over the tree ROI
-    assert action.prompt == "round fruit" and action.conf == 0.4
+    assert action.prompt == "round fruit" and action.conf == 0.6   # in [floor 0.50, 0.85]
 
     body = _body_from_capture(client)
     assert body["history"] == ctx.history.as_list()               # ctx history reached the prompt

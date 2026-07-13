@@ -130,11 +130,17 @@ class Config:
                                    # global pass (arm-2 pass 1 + arm-3 bootstrap): only
                                    # detections >= this survive, so seeded exemplars are
                                    # confident by construction.
-    refine_conf_default: float = 0.40  # threshold for a refine pass when the VLM omits
-                                   # or gives an out-of-range one (the "lowered" recall
-                                   # threshold used after the confident seed).
-    refine_conf_min: float = 0.30  # a VLM-chosen refine threshold is clamped to
-    refine_conf_max: float = 0.70  # [refine_conf_min, refine_conf_max].
+    refine_conf_default: float = 0.50  # base refine threshold: the floor for the FIRST
+                                   # refine (and the tiled_seed_pass). Raised from 0.40 --
+                                   # with tiling, 0.40 admitted too much clutter on later
+                                   # passes.
+    refine_conf_step: float = 0.05  # the refine threshold FLOOR rises by this per new
+                                   # prompt already tried: floor_k = refine_conf_default +
+                                   # (# prior refines) * step, capped at refine_conf_max.
+                                   # So later prompts are progressively stricter (each new
+                                   # prompt scans a more-covered scene -> more clutter risk).
+    refine_conf_min: float = 0.45  # a VLM-chosen refine threshold is clamped to
+    refine_conf_max: float = 0.85  # [max(refine_conf_min, rising floor), refine_conf_max].
     refine_min_words: int = 1      # a VLM refine prompt must have at least this many and
     refine_max_words: int = 3      # at most this many words (1-2 adjectives + a noun).
     refine_tiling: bool = True     # refine passes are TILED over the tree ROI (recall

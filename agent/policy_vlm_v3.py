@@ -67,7 +67,9 @@ SYSTEM_PROMPT = (
     "not just n_new: a wording that covers the target concept re-finds MOST of the "
     "already-known target objects AND adds new ones; a wording that re-detects few of "
     "the known objects is off-concept even if it added a couple. Look at the boxes, "
-    "then pick a NEW wording that covers the concept better. Keep proposing new "
+    "then pick a NEW wording that covers the concept better. Use a HIGHER detection "
+    "threshold on later prompts (the system enforces a rising minimum) so a "
+    "well-covered scene does not re-admit clutter. Keep proposing new "
     "wordings that might reveal target objects the earlier prompts missed; choose "
     "\"stop\" only when you believe no different wording would find more. The only "
     "actions are \"refine\" and \"stop\" -- never anything else. You never label or "
@@ -102,7 +104,8 @@ def choose(phi, history, graph, cfg, client=None, image=None):
         return _fallback(cfg)
 
     tried = _tried_prompt_set(history)
-    action = _parse_and_validate(content, graph, cfg, image, tree_roi, tried)
+    n_prior_refines = _n_prior_refines(history)
+    action = _parse_and_validate(content, graph, cfg, image, tree_roi, tried, n_prior_refines)
     if action is None:
         logger.warning("policy_vlm_v3: invalid/repeated/illegal response; stopping.")
         return _fallback(cfg)
@@ -146,6 +149,14 @@ def _tried_prompt_set(history):
     merely repeats an earlier wording is rejected -- each step must try something new."""
     return {" ".join(t["prompt"].split()).lower()
             for t in _prompts_tried(history) if t.get("prompt")}
+
+
+def _n_prior_refines(history):
+    """How many refine passes (VLM QueryA actions) have already run this episode. Used
+    to raise the threshold floor per new prompt (the bootstrap global_pass/
+    tiled_seed_pass records are relabeled, so only refines carry action == 'QueryA')."""
+    return sum(1 for rec in _history_records(history)
+               if rec.get("x", {}).get("action") == "QueryA")
 
 
 def _build_body(phi, history, graph, cfg, image, tree_roi):
@@ -218,23 +229,32 @@ def _validate_prompt(prompt, cfg):
     return " ".join(words)
 
 
-def _validate_threshold(threshold, cfg):
-    """Clamp the VLM threshold to [refine_conf_min, refine_conf_max]; fall back to
-    refine_conf_default when it is missing or non-numeric. Always returns a float."""
-    lo = getattr(cfg, "refine_conf_min", 0.30)
-    hi = getattr(cfg, "refine_conf_max", 0.70)
-    default = getattr(cfg, "refine_conf_default", 0.40)
+def _validate_threshold(threshold, cfg, n_prior_refines=0):
+    """Resolve the effective refine threshold.
+
+    The floor RISES with each new prompt: floor = refine_conf_default +
+    n_prior_refines * refine_conf_step, bounded to [refine_conf_min, refine_conf_max].
+    The VLM may choose a stricter (higher) value but never a looser one -- so later
+    prompts, which scan an already-well-covered scene, do not re-admit clutter at a low
+    threshold. Missing/non-numeric -> the floor. Always returns a float."""
+    lo = getattr(cfg, "refine_conf_min", 0.45)
+    hi = getattr(cfg, "refine_conf_max", 0.85)
+    default = getattr(cfg, "refine_conf_default", 0.50)
+    step = getattr(cfg, "refine_conf_step", 0.05)
+    floor = max(lo, min(hi, default + n_prior_refines * step))
     threshold = _coerce_json_string(threshold)
     if isinstance(threshold, bool) or not isinstance(threshold, (int, float)):
-        return float(default)
-    return float(min(hi, max(lo, threshold)))
+        return float(floor)
+    return float(min(hi, max(floor, float(threshold))))
 
 
-def _parse_and_validate(content, graph, cfg, image, tree_roi, tried_prompts=frozenset()):
+def _parse_and_validate(content, graph, cfg, image, tree_roi, tried_prompts=frozenset(),
+                        n_prior_refines=0):
     """Return a validated action dataclass, or None on any parse/validation failure.
 
     tried_prompts: normalized prompts already tried this episode; a refine that
-    repeats one is rejected so every step tries a genuinely new wording."""
+    repeats one is rejected so every step tries a genuinely new wording.
+    n_prior_refines: number of refines already run -- raises the threshold floor."""
     try:
         data = json.loads(content)
         name = data["action"]
@@ -255,7 +275,7 @@ def _parse_and_validate(content, graph, cfg, image, tree_roi, tried_prompts=froz
             return None
         if " ".join(prompt.split()).lower() in tried_prompts:
             return None                                  # must try a NEW wording each step
-        conf = _validate_threshold(args.get("threshold"), cfg)
+        conf = _validate_threshold(args.get("threshold"), cfg, n_prior_refines)
         region = tuple(float(v) for v in tree_roi)
         # Tiled over the tree ROI for recall parity with the generic cascade; still the
         # whole region (not a sub-ROI zoom). The prompt sets only text/threshold/tiling.

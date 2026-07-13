@@ -838,3 +838,39 @@ global_pass / tiled_seed_pass then refines -- NO LookROIA anywhere; active-arm r
 is >= the generic cascade (the tiled seed floor guarantees it) and rises further when
 the VLM finds a good wording; an invalid/repeated VLM reply ends the arm cleanly (a
 single "stopping" log line, not LookROIA spam).
+
+### Step 9.5 — Refine threshold rises with each new prompt
+**Files:** `config.py`, `agent/policy_vlm_v3.py`, `tests/test_refine_threshold.py`
+(new); + `tests/test_policy_vlm_v3.py` / `tests/test_runner_refine.py` migration.
+**Prompt:**
+> With tiling added, the old 0.40 refine threshold admits too much clutter on later
+> passes (more, smaller boxes). Raise the range and make the threshold FLOOR rise per
+> new prompt. `config.py`: refine_conf_default 0.40->0.50, refine_conf_min 0.30->0.45,
+> refine_conf_max 0.70->0.85, add refine_conf_step=0.05. `policy_vlm_v3`: add
+> `_n_prior_refines(history)` (count of QueryA records); `_validate_threshold(threshold,
+> cfg, n_prior_refines)` computes floor = clamp(refine_conf_default + n_prior_refines*
+> step, [min,max]) and returns clamp(chosen, [floor, max]) (missing/non-numeric ->
+> floor). So each new prompt is at least one step stricter; the VLM may go higher but
+> never lower. System prompt tells the VLM to use higher thresholds later. Pytest: a
+> below-floor / missing value is raised to the floor; the floor rises by step per prior
+> refine; a stricter choice is kept; the ceiling is refine_conf_max.
+**You verify:** on the GPU box, the active trajectory shows refine thresholds climbing
+(≈0.50, 0.55, 0.60 …) and fewer clutter boxes on later passes than before; the tiled
+seed floor and the generic tiled pass both now run at 0.50.
+
+### Step 9.6 — Per-pass animation + separate leaf map (app)
+**Files:** `citrus_orchestration_app.py`.
+**Prompt:**
+> Add a scrollable per-pass animation and a separate leaf-map panel to the citrus app.
+> `draw_sam3_view` gains `max_pass=None` -> draw only nodes with found_in_pass <=
+> max_pass (the graph is monotone, so this reconstructs the belief AS OF each pass).
+> `render_pass_frames(image, graph, history)` -> list of (image, caption), one per
+> sensing pass (global_pass/tiled_seed_pass/QueryA in order; found_in_pass == the pass
+> index), captioned with action/prompt/threshold and that pass's det/new/redet + N_obs.
+> `render_leaf_map(image, graph)` -> the cached_leaf_boxes (ROI-relative -> global) on a
+> separate frame. Wire a gr.Gallery (active arm, scroll pass by pass) + a gr.Image (leaf
+> map) into run_experiment's outputs and clear them on navigation. App-only; GPU
+> hand-verified (the app loads SAM3 at import, so no offline test).
+**You verify:** run the app on the GPU box; the gallery lets you click pass 1..N and
+watch boxes accumulate as the prompt/threshold change; the leaf map shows the green-leaf
+inhibitors on its own panel; navigating to a new image clears both.
