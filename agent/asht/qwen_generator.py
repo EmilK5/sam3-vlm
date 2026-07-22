@@ -98,6 +98,60 @@ class QwenCandidateActionGenerator:
         self.fallback_bank = fallback_bank
         self.config = config or QwenActionGeneratorConfig()
 
+    def resolved_mapping(self) -> Mapping[str, Any]:
+        """Return every non-secret setting that can change generated actions."""
+
+        return {
+            "generator_type": f"{type(self).__module__}.{type(self).__qualname__}",
+            "client_type": f"{type(self.client).__module__}.{type(self.client).__qualname__}",
+            "config": {
+                "model_id": self.config.model_id,
+                "max_actions": self.config.max_actions,
+                "min_actions": self.config.min_actions,
+                "max_prompt_chars": self.config.max_prompt_chars,
+                "max_retries": self.config.max_retries,
+                "default_threshold": self.config.default_threshold,
+                "default_roi_padding_fraction": self.config.default_roi_padding_fraction,
+                "allow_qwen_regions": self.config.allow_qwen_regions,
+                "allow_tiling": self.config.allow_tiling,
+                "sampling_parameters": dict(self.config.sampling_parameters),
+                "image_artifact_ids": list(self.config.image_artifact_ids),
+                "system_prompt": self.config.system_prompt,
+            },
+            "sensor_profile": {
+                "observation_labels": list(self.profile.observation_labels),
+                "present": list(self.profile.present),
+                "absent": list(self.profile.absent),
+                "source": self.profile.source,
+            },
+            "fallback_bank": {
+                "allow_semantic_reuse": self.fallback_bank.allow_semantic_reuse,
+                "positive_class": self.fallback_bank.positive_class,
+                "negative_class": self.fallback_bank.negative_class,
+                "positive_exemplar_threshold": self.fallback_bank.positive_exemplar_threshold,
+                "negative_exemplar_threshold": self.fallback_bank.negative_exemplar_threshold,
+                "templates": [
+                    {
+                        "name": item.name,
+                        "family": item.family.value,
+                        "prompt": item.prompt,
+                        "semantic_key": item.semantic_key,
+                        "beta_by_class": dict(item.beta_by_class),
+                        "threshold": item.threshold,
+                        "tiling_mode": item.tiling_mode.value,
+                        "tile_scale": item.tile_scale,
+                        "roi_padding_fraction": item.roi_padding_fraction,
+                        "expected_cost": item.expected_cost,
+                        "use_positive_exemplars": item.use_positive_exemplars,
+                        "use_negative_exemplars": item.use_negative_exemplars,
+                        "rationale": item.rationale,
+                        "expected_visual_distinction": item.expected_visual_distinction,
+                    }
+                    for item in self.fallback_bank.templates
+                ],
+            },
+        }
+
     def generate(
         self,
         *,

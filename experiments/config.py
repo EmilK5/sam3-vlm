@@ -11,6 +11,7 @@ from typing import Any, Mapping
 
 from agent.asht.runner_static import StaticAshtConfig
 from agent.asht.tiling import AdaptiveTilingConfig
+from eval.reporting import EvaluationConfig
 from provenance.run_store import ReportingLevel
 from provenance.schema import TilingMode
 
@@ -77,6 +78,7 @@ class UnifiedExperimentConfig:
     run_name: str | None = None
     resolved_overrides: Mapping[str, Any] = field(default_factory=dict)
     legacy_options: Mapping[str, Any] = field(default_factory=dict)
+    evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "output_root", Path(self.output_root))
@@ -120,6 +122,10 @@ class UnifiedExperimentConfig:
             "output_root": str(self.output_root),
             "reporting_level": self.reporting_level.value,
             "random_seed": self.random_seed,
+            "overwrite": self.overwrite,
+            "fsync": self.fsync,
+            "checkpoint_every_events": self.checkpoint_every_events,
+            "raise_on_error": self.raise_on_error,
             "class_names": list(self.class_names),
             "target_class": self.target_class,
             "discovery_passes": [_dataclass_json(spec) for spec in self.discovery_passes],
@@ -131,6 +137,7 @@ class UnifiedExperimentConfig:
             "model_id": self.model_id,
             "run_name": self.run_name,
             "legacy_options": dict(self.legacy_options),
+            "evaluation": _dataclass_json(self.evaluation),
         }
         if self.asht_config is not None:
             payload["asht"] = _describe_asht(self.asht_config)
@@ -149,19 +156,14 @@ def _describe_asht(config: StaticAshtConfig) -> Mapping[str, Any]:
         "use_cost_adjusted_eig": config.use_cost_adjusted_eig,
         "suppression_confidence": config.suppression_confidence,
         "suppression_kwargs": dict(config.suppression_kwargs),
+        "observation_encoder": _dataclass_json(config.observation_encoder),
         "bootstrap_query": (
-            None
-            if config.bootstrap_query is None
-            else {
-                "prompt": config.bootstrap_query.prompt,
-                "threshold": config.bootstrap_query.threshold,
-                "region": list(config.bootstrap_query.region),
-                "return_masks": config.bootstrap_query.return_masks,
-            }
+            None if config.bootstrap_query is None else _dataclass_json(config.bootstrap_query)
         ),
         "bootstrap_dedup_metric": config.bootstrap_dedup_metric,
         "bootstrap_dedup_threshold": config.bootstrap_dedup_threshold,
         "bootstrap_tiling_mode": config.bootstrap_tiling_mode.value,
+        "adaptive_tiling": _dataclass_json(config.adaptive_tiling),
         "action_bank": {
             "allow_semantic_reuse": config.action_bank.allow_semantic_reuse,
             "positive_class": config.action_bank.positive_class,

@@ -19,6 +19,7 @@ import numpy as np
 from agent.asht.runner_qwen import QwenAshtRunner
 from agent.asht.runner_static import StaticAshtRunResult, StaticAshtRunner
 from eval.dataset_adapters import CanonicalSample, DatasetRegistry
+from eval.reporting import append_summary_csv, evaluate_and_record
 from experiments.config import ExperimentMode, UnifiedExperimentConfig
 from experiments.discovery import DiscoveryExecutionResult, DiscoveryExperimentExecutor
 from graph import OrchardGraph
@@ -74,6 +75,7 @@ class UnifiedRuntime:
     repository: RepositoryStateRecord | None = None
     environment: EnvironmentRecord | None = None
     models: tuple[ModelIdentityRecord, ...] = ()
+    runtime_configuration: Mapping[str, Any] = field(default_factory=dict)
     run_id_factory: Callable[[], str] = create_run_id
 
     def resolved_repository(self) -> RepositoryStateRecord:
@@ -93,6 +95,34 @@ class UnifiedRuntime:
                 provider="local",
             ),
         )
+
+    def resolved_configuration(self) -> Mapping[str, Any]:
+        """Describe runtime choices that can affect outputs without storing secrets."""
+
+        payload: dict[str, Any] = {
+            "backend_type": f"{type(self.backend).__module__}.{type(self.backend).__qualname__}",
+            "processor_type": f"{type(self.processor).__module__}.{type(self.processor).__qualname__}",
+            "legacy_executor": (
+                None
+                if self.legacy_executor is None
+                else f"{getattr(self.legacy_executor, '__module__', type(self.legacy_executor).__module__)}."
+                f"{getattr(self.legacy_executor, '__qualname__', type(self.legacy_executor).__qualname__)}"
+            ),
+        }
+        if self.qwen_action_generator is not None:
+            describe = getattr(self.qwen_action_generator, "resolved_mapping", None)
+            payload["qwen_action_generator"] = (
+                describe()
+                if callable(describe)
+                else {
+                    "generator_type": (
+                        f"{type(self.qwen_action_generator).__module__}."
+                        f"{type(self.qwen_action_generator).__qualname__}"
+                    )
+                }
+            )
+        payload.update(_sanitize_runtime_configuration(self.runtime_configuration))
+        return payload
 
 
 @dataclass(frozen=True)
@@ -120,6 +150,19 @@ class UnifiedExperimentRunner:
     def run(self, dataset_name: str, split: str, index: int) -> UnifiedExperimentResult:
         sample = self.datasets.get(dataset_name, split, index)
         return self.run_sample(sample)
+
+    def resolved_config_for_sample(self, sample: CanonicalSample) -> Mapping[str, Any]:
+        """Return the exact immutable configuration hashed into a sample run."""
+
+        resolved = dict(self.config.resolved_mapping())
+        resolved["runtime"] = dict(self.runtime.resolved_configuration())
+        resolved["dataset"] = {
+            "name": sample.dataset_name,
+            "version": sample.dataset_version,
+            "split": sample.split,
+            "sample_key": sample.sample_key,
+        }
+        return resolved
 
     def run_sample(self, sample: CanonicalSample) -> UnifiedExperimentResult:
         _set_seeds(self.config.random_seed)
@@ -160,6 +203,22 @@ class UnifiedExperimentRunner:
                 "sample_key": sample.sample_key,
                 "final_graph_artifact_id": graph_artifact.artifact_id,
             }
+            evaluation_outputs = evaluate_and_record(
+                store=store,
+                sample=sample,
+                graph=graph,
+                predictions=predictions,
+                image=image,
+                config=self.config.evaluation,
+            )
+            if evaluation_outputs.overlay_artifact_id is not None:
+                predictions["final_overlay_artifact_id"] = (
+                    evaluation_outputs.overlay_artifact_id
+                )
+            if evaluation_outputs.timeline_artifact_id is not None:
+                predictions["pass_timeline_artifact_id"] = (
+                    evaluation_outputs.timeline_artifact_id
+                )
             final = store.finalize_success(
                 final_predictions=predictions,
                 metadata={
@@ -168,6 +227,21 @@ class UnifiedExperimentRunner:
                     "sample_key": sample.sample_key,
                 },
             )
+            try:
+                append_summary_csv(
+                    self.config.output_root / self.config.evaluation.summary_csv_name,
+                    final,
+                    store.paths.root,
+                )
+            except Exception as exc:
+                # The canonical run is already complete. A shared CSV index must
+                # never invalidate or rewrite a successful experiment.
+                try:
+                    (store.paths.root / "summary_csv_error.txt").write_text(
+                        f"{type(exc).__name__}: {exc}\n", encoding="utf-8"
+                    )
+                except OSError:
+                    pass
             return UnifiedExperimentResult(
                 run=final,
                 run_directory=store.paths.root,
@@ -357,13 +431,7 @@ class UnifiedExperimentRunner:
                 ],
             },
         )
-        resolved = dict(self.config.resolved_mapping())
-        resolved["dataset"] = {
-            "name": sample.dataset_name,
-            "version": sample.dataset_version,
-            "split": sample.split,
-            "sample_key": sample.sample_key,
-        }
+        resolved = dict(self.resolved_config_for_sample(sample))
         initial = RunRecord(
             run_id=run_id,
             status=RunStatus.CREATED,
@@ -393,6 +461,29 @@ class UnifiedExperimentRunner:
             zip(mask_artifacts, sample.ground_truth_mask_paths)
         )
         return initial, declared
+
+
+_SECRET_TOKENS = ("api_key", "apikey", "token", "secret", "password", "credential")
+
+def _sanitize_runtime_configuration(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Remove secret-looking keys while preserving the complete safe configuration."""
+
+    def clean(item: Any) -> Any:
+        if isinstance(item, Mapping):
+            return {
+                str(key): clean(child)
+                for key, child in item.items()
+                if not any(token in str(key).lower() for token in _SECRET_TOKENS)
+            }
+        if isinstance(item, (tuple, list)):
+            return [clean(child) for child in item]
+        if isinstance(item, Path):
+            return str(item)
+        if isinstance(item, (str, bool, int, float)) or item is None:
+            return item
+        return repr(item)
+
+    return clean(value)
 
 
 def _final_predictions(execution, graph: OrchardGraph, target_class: str) -> Mapping[str, Any]:

@@ -15,6 +15,7 @@ from provenance.contracts import *  # noqa: F401,F403
 from provenance.events import EventLogReader, EventLogWriter, infer_event_kind
 from provenance.ids import EntityKind, IdFactory, create_run_id, validate_entity_id
 from provenance.io import JsonLineCorruptionError, StorageError
+from provenance.migrations import migrate_payload, migrated_record_from_dict
 from provenance.run_store import ReportingLevel, RunPaths, RunStore
 from provenance.schema import *  # noqa: F401,F403
 
@@ -35,6 +36,8 @@ __all__ = [
     "consolidate_run",
     "create_run_id",
     "infer_event_kind",
+    "migrate_payload",
+    "migrated_record_from_dict",
     "record_from_dict",
     "registered_record_types",
     "to_jsonable",
