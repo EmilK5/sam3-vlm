@@ -29,6 +29,7 @@ from provenance.contracts import (
     StoppingDecisionRecord,
     SurrogateKernelRecord,
     TileRecord,
+    TilingDecisionRecord,
 )
 from provenance.ids import EntityKind, IdFactory
 from provenance.io import (
@@ -48,6 +49,7 @@ _EVENT_KIND_BY_TYPE: tuple[tuple[type[CanonicalRecord], EventKind], ...] = (
     (QwenCallRecord, EventKind.QWEN_CALL),
     (Sam3CallRecord, EventKind.SAM3_CALL),
     (RawDetectionRecord, EventKind.DETECTION),
+    (TilingDecisionRecord, EventKind.TILE),
     (TileRecord, EventKind.TILE),
     (DedupComparisonRecord, EventKind.DEDUP),
     (RegistrationDecisionRecord, EventKind.REGISTRATION),

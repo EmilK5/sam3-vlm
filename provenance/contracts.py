@@ -289,6 +289,54 @@ class Sam3CallRecord(CanonicalRecord):
 
 
 @dataclass(frozen=True)
+class TilingDecisionRecord(CanonicalRecord):
+    RECORD_TYPE: ClassVar[str] = "tiling_decision"
+
+    tiling_decision_id: str
+    pass_id: str
+    mode: TilingMode
+    triggered: bool
+    trigger_source: str
+    tiling_rule: str
+    reason: str
+    source_detection_ids: tuple[str, ...]
+    source_roi: BoxXYXY
+    density_metrics: JsonMap
+    reliability_metrics: JsonMap
+    tile_size: int | None
+    overlap_pixels: int | None
+    stride_pixels: int | None
+    base_tile_count: int
+    selected_tile_count: int
+    thresholds: JsonMap
+    selected_roi: BoxXYXY | None = None
+    metadata: JsonMap = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        validate_entity_id(
+            self.tiling_decision_id, expected_kind=EntityKind.TILING_DECISION
+        )
+        validate_entity_id(self.pass_id, expected_kind=EntityKind.PASS)
+        require_non_empty(self.trigger_source, "trigger_source")
+        require_non_empty(self.tiling_rule, "tiling_rule")
+        require_non_empty(self.reason, "reason")
+        require_box(self.source_roi, "source_roi")
+        if self.selected_roi is not None:
+            require_box(self.selected_roi, "selected_roi")
+        for name, value in (
+            ("tile_size", self.tile_size),
+            ("overlap_pixels", self.overlap_pixels),
+            ("stride_pixels", self.stride_pixels),
+        ):
+            if value is not None:
+                require_non_negative(value, name)
+        require_non_negative(self.base_tile_count, "base_tile_count")
+        require_non_negative(self.selected_tile_count, "selected_tile_count")
+        if self.selected_tile_count > self.base_tile_count:
+            raise ContractError("selected_tile_count cannot exceed base_tile_count")
+
+
+@dataclass(frozen=True)
 class TileRecord(CanonicalRecord):
     RECORD_TYPE: ClassVar[str] = "tile"
 
@@ -763,6 +811,7 @@ class PassRecord(CanonicalRecord):
     graph_after: tuple[GraphNodeSnapshotRecord, ...]
     cost_after: CostSnapshotRecord
     continuation_reason: str | None
+    tiling_decision: TilingDecisionRecord | None = None
     warnings: tuple[str, ...] = ()
     metadata: JsonMap = field(default_factory=dict)
 
@@ -883,4 +932,5 @@ __all__ = [
     "StoppingDecisionRecord",
     "SurrogateKernelRecord",
     "TileRecord",
+    "TilingDecisionRecord",
 ]

@@ -375,6 +375,46 @@ class RunStore:
         self._closed = True
         return snapshot
 
+    def materialize_declared_artifact(
+        self,
+        artifact: ArtifactRef,
+        source_path: Path,
+        *,
+        verify: bool = True,
+    ) -> Path:
+        """Copy a predeclared artifact into the self-contained run directory.
+
+        Initial input images must already be referenced by ``DatasetSampleRecord``
+        before :meth:`create` writes the immutable manifest.  This method copies
+        that exact artifact without allocating a second ID or emitting a
+        duplicate event.
+        """
+
+        self._ensure_open()
+        declared_ids = {item.artifact_id for item in self.base_run.artifacts}
+        declared_ids.add(self.base_run.dataset_sample.image_artifact.artifact_id)
+        if artifact.artifact_id not in declared_ids:
+            raise StorageError(
+                f"Artifact {artifact.artifact_id} was not declared in the run manifest"
+            )
+        source = Path(source_path)
+        if not source.is_file():
+            raise StorageError(f"Declared artifact source is not a file: {source}")
+        relative = safe_relative_path(artifact.relative_path)
+        destination = self.paths.root / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.exists():
+            raise StorageError(f"Declared artifact destination already exists: {destination}")
+        shutil.copy2(source, destination)
+        if verify:
+            if artifact.size_bytes is not None and destination.stat().st_size != artifact.size_bytes:
+                destination.unlink(missing_ok=True)
+                raise StorageError("Declared artifact size does not match the manifest")
+            if artifact.sha256 is not None and sha256_file(destination) != artifact.sha256:
+                destination.unlink(missing_ok=True)
+                raise StorageError("Declared artifact hash does not match the manifest")
+        return destination
+
     def add_artifact_file(
         self,
         source_path: Path,

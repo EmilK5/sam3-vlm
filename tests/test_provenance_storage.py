@@ -378,3 +378,23 @@ def test_reporting_level_can_omit_full_only_events(tmp_path: Path):
     )
     assert result is None
     assert EventLogReader(store.paths.events).read_all() == ()
+
+
+def test_materialize_declared_input_artifact(tmp_path):
+    source = tmp_path / "source.png"
+    source.write_bytes(b"declared input")
+    _, run = make_initial_run("declared")
+    from dataclasses import replace
+    from provenance.io import sha256_file
+
+    declared = replace(
+        run.dataset_sample.image_artifact,
+        relative_path="artifacts/input/source.png",
+        sha256=sha256_file(source),
+        size_bytes=source.stat().st_size,
+    )
+    sample = replace(run.dataset_sample, image_artifact=declared, image_sha256=declared.sha256)
+    run = replace(run, dataset_sample=sample, artifacts=(declared,))
+    store = RunStore.create(tmp_path / "declared", run, fsync=False)
+    destination = store.materialize_declared_artifact(declared, source)
+    assert destination.read_bytes() == b"declared input"

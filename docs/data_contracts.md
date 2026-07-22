@@ -114,3 +114,10 @@ Phase 2 should add builders and writers around these records:
 
 The contract package must remain free of model and pipeline imports so it can be
 used by the sandbox, evaluators, replay tools, and offline analysis scripts.
+
+
+## Phase 8 additions
+
+- `TilingDecisionRecord`: density inputs, trigger mode, selected ROI, grid rule, tile budget, and thresholds.
+- `TileRecord`: per-tile coordinates, transforms, SAM3 calls, and detections.
+- `PassRecord.tiling_decision`: optional pass-level tiling decision reference.

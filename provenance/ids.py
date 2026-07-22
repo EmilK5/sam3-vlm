@@ -23,6 +23,7 @@ class EntityKind(str, Enum):
     QWEN_CALL = "qwen"
     SAM3_CALL = "sam3"
     TILE = "tile"
+    TILING_DECISION = "tiling"
     RAW_DETECTION = "det"
     CANDIDATE = "candidate"
     GRAPH_NODE = "node"

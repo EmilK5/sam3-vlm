@@ -714,3 +714,75 @@ def execute_pass(processor, image_pil, graph, conf, clahe, tiling, pass_number, 
         n_sam_calls=n_sam_calls,
         n_verify_calls=call_counter["n_oracle_calls"],
     )
+# ==========================================
+# 6. Explicit staged execution path (Phase 3)
+# ==========================================
+
+def execute_staged_pass(
+    processor,
+    image_np,
+    graph,
+    *,
+    query,
+    pass_number,
+    stage_context=None,
+    nms_mode="dualgate",
+    gate_mode="dual",
+    nms_iou_threshold=0.40,
+    nms_iom_threshold=0.90,
+    use_concentric=False,
+    cross_pass_dedup_metric="iou",
+    cross_pass_dedup_threshold=0.40,
+    signature=None,
+):
+    """Execute the new explicit discovery path without semantic verification.
+
+    The legacy :func:`execute_pass` above remains unchanged.  This entry point is
+    intended for the ASHT runner and performs the stages independently:
+
+    SAM3 request -> normalized detections -> intra-pass suppression ->
+    cross-pass graph registration.
+
+    ``query`` is a ``pipeline_stages.Sam3QuerySpec``.  Registration deliberately
+    leaves newly-created graph nodes unresolved; posterior verification belongs
+    to the mathematical controller rather than this sensing function.
+    """
+
+    from pipeline_stages import (
+        execute_sam3_request,
+        register_detection_batch,
+        suppress_detection_batch,
+    )
+
+    raw_batch = execute_sam3_request(
+        inference,
+        processor,
+        image_np,
+        query,
+        context=stage_context,
+    )
+    suppression = suppress_detection_batch(
+        raw_batch,
+        inference,
+        confidence=query.threshold,
+        mode=nms_mode,
+        gate_mode=gate_mode,
+        iou_threshold=nms_iou_threshold,
+        iom_threshold=nms_iom_threshold,
+        use_concentric=use_concentric,
+        context=stage_context,
+    )
+    registration = register_detection_batch(
+        suppression.kept,
+        graph,
+        pass_number=pass_number,
+        dedup_metric=cross_pass_dedup_metric,
+        dedup_threshold=cross_pass_dedup_threshold,
+        signature=signature,
+        context=stage_context,
+    )
+    return {
+        "raw_batch": raw_batch,
+        "suppression": suppression,
+        "registration": registration,
+    }
