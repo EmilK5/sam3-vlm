@@ -106,8 +106,16 @@ def validate_run_directory(
         except Exception as exc:
             add("error", "invalid_event_log", f"events.jsonl cannot be decoded: {type(exc).__name__}: {exc}", path="events.jsonl")
     if verify_event_parity and events:
-        if tuple(events) != tuple(run.events):
-            add("error", "event_parity", "run.json events differ from events.jsonl", path="events.jsonl")
+        # Compact runs intentionally keep the append-only stream in
+        # events.jsonl instead of duplicating it inside run.json.  Older runs
+        # that embedded events are still checked for exact parity.
+        if run.events:
+            if tuple(events) != tuple(run.events):
+                add("error", "event_parity", "run.json events differ from events.jsonl", path="events.jsonl")
+        else:
+            recorded_hash = run.metadata.get("event_log_sha256")
+            if recorded_hash and sha256_file(root / "events.jsonl") != recorded_hash:
+                add("error", "event_log_hash", "events.jsonl hash differs from the finalized run", path="events.jsonl")
         if run.metadata.get("event_count") != len(events):
             add("error", "event_count", f"metadata event_count={run.metadata.get('event_count')} but log contains {len(events)} events")
         expected_last = events[-1].sequence_number if events else 0

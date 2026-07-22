@@ -143,7 +143,7 @@ class QwenAshtRunner(StaticAshtRunner):
             kernel=None,
             belief_update=None,
             stopping_decision=stopping,
-            graph_after=self._snapshots(pass_id),
+            graph_after=self._snapshots_for_ids(pass_id, (node.id,)),
             cost_after=cost,
             continuation_reason="no_valid_action",
             metadata={"generation_failed": True},

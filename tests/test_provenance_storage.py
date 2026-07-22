@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -231,7 +232,7 @@ def test_run_store_creates_self_contained_layout_and_checkpoint(tmp_path: Path):
     partial = RunRecord.from_json(store.paths.partial_run.read_text())
     assert partial.status is RunStatus.RUNNING
     assert partial.run_id == initial.run_id
-    assert partial.metadata["reporting_level"] == "full"
+    assert partial.metadata["reporting_level"] == "standard"
 
 
 def test_checkpoint_and_finalization_consolidate_pass_graph_evaluation_and_artifact(
@@ -260,7 +261,9 @@ def test_checkpoint_and_finalization_consolidate_pass_graph_evaluation_and_artif
     )
 
     checkpoint = store.checkpoint(final_predictions={"soft_count": 0.8})
-    assert checkpoint.passes == (pass_record,)
+    assert checkpoint.passes == (
+        dataclasses.replace(pass_record, graph_before=(), graph_after=()),
+    )
     assert checkpoint.final_graph == (node,)
     assert checkpoint.evaluations == (evaluation,)
     assert artifact in checkpoint.artifacts
@@ -272,8 +275,11 @@ def test_checkpoint_and_finalization_consolidate_pass_graph_evaluation_and_artif
     assert loaded.status is RunStatus.SUCCEEDED
     assert loaded.metadata["event_count"] == 3
     assert loaded.metadata["last_event_sequence"] == 3
-    assert len(loaded.events) == 3
-    assert tuple(event.sequence_number for event in loaded.events) == (1, 2, 3)
+    assert loaded.events == ()
+    assert tuple(
+        event.sequence_number
+        for event in EventLogReader(store.paths.events).read_all()
+    ) == (1, 2, 3)
     assert json.loads(store.paths.summary.read_text())["status"] == "succeeded"
 
 
@@ -354,7 +360,9 @@ def test_failure_finalization_preserves_exception_and_partial_results(tmp_path: 
         )
 
     assert failed.status is RunStatus.FAILED
-    assert failed.passes == (pass_record,)
+    assert failed.passes == (
+        dataclasses.replace(pass_record, graph_before=(), graph_after=()),
+    )
     assert failed.final_predictions == {"partial_count": 1}
     assert len(failed.errors) == 1
     assert failed.errors[0].exception_type == "RuntimeError"

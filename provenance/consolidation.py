@@ -28,6 +28,7 @@ def consolidate_run(
     completed_at: str | None = None,
     id_counters: Mapping[str, int] | None = None,
     final_predictions: Mapping[str, Any] | None = None,
+    final_graph: tuple[GraphNodeSnapshotRecord, ...] | None = None,
     warnings: tuple[str, ...] | None = None,
     metadata: Mapping[str, Any] | None = None,
     include_events: bool = False,
@@ -63,9 +64,13 @@ def consolidate_run(
         payload = event.payload
 
         if isinstance(payload, PassRecord):
-            pass_by_id[payload.pass_id] = payload
             for node in payload.graph_after:
                 graph_by_id[node.graph_node_id] = node
+            # Keep graph deltas in the crash-recovery event stream, but avoid
+            # duplicating them inside every pass in the canonical run.json.
+            pass_by_id[payload.pass_id] = dataclasses.replace(
+                payload, graph_before=(), graph_after=()
+            )
         elif isinstance(payload, GraphNodeSnapshotRecord):
             graph_by_id[payload.graph_node_id] = payload
         elif isinstance(payload, RegistrationDecisionRecord):
@@ -103,7 +108,12 @@ def consolidate_run(
         completed_at=resolved_completed_at,
         id_counters=dict(id_counters or base_run.id_counters),
         passes=tuple(sorted(pass_by_id.values(), key=lambda item: (item.pass_index, item.pass_id))),
-        final_graph=tuple(sorted(graph_by_id.values(), key=lambda item: item.graph_node_id)),
+        final_graph=tuple(
+            sorted(
+                graph_by_id.values() if final_graph is None else final_graph,
+                key=lambda item: item.graph_node_id,
+            )
+        ),
         final_predictions=dict(
             base_run.final_predictions if final_predictions is None else final_predictions
         ),

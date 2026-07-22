@@ -60,8 +60,10 @@ class _PassSink:
         return self.store.new_id(kind)
 
     def append(self, payload, **kwargs):
+        # Pass-local records are consolidated into one PassRecord.  Writing
+        # every nested item separately duplicates the same data in events.jsonl.
         self.records.append(payload)
-        return self.store.append(payload, **kwargs)
+        return None
 
     def records_of(self, record_type):
         return tuple(item for item in self.records if isinstance(item, record_type))
@@ -125,7 +127,7 @@ class DiscoveryExperimentExecutor:
         scope = _PassSink(self.store)
         pass_id = scope.new_id(EntityKind.PASS)
         started_at = utc_now_iso()
-        graph_before = self._snapshots(pass_id)
+        graph_before = ()
         height, width = int(self.image_np.shape[0]), int(self.image_np.shape[1])
         region = specification.region or (0.0, 0.0, float(width), float(height))
         action = SensingActionRecord(
@@ -224,7 +226,10 @@ class DiscoveryExperimentExecutor:
             context=context,
             class_names=self.class_names,
         )
-        graph_after = self._snapshots(pass_id)
+        graph_after = self._snapshots_for_ids(
+            pass_id,
+            (*registration.created_node_ids, *registration.updated_node_ids),
+        )
         cost = CostSnapshotRecord(
             pass_id=pass_id,
             sam3_calls=self.sam3_calls,
@@ -279,18 +284,21 @@ class DiscoveryExperimentExecutor:
                 "extra_cross_tile_comparison_count": len(extra_comparisons),
             },
         )
-        for snapshot in graph_after:
-            scope.append(snapshot, pass_id=pass_id)
-        scope.append(record, pass_id=pass_id)
+        self.store.append(record, pass_id=pass_id)
         self.passes.append(record)
         self.records.extend(scope.records)
 
-    def _snapshots(self, pass_id: str):
-        return self.graph.snapshot_records(
-            pass_id=pass_id,
-            class_names=self.class_names,
-            positive_class=self.class_names[0],
-            negative_class=self.class_names[1] if len(self.class_names) > 1 else None,
+    def _snapshots_for_ids(self, pass_id: str, node_ids):
+        wanted = set(node_ids)
+        return tuple(
+            snapshot
+            for snapshot in self.graph.snapshot_records(
+                pass_id=pass_id,
+                class_names=self.class_names,
+                positive_class=self.class_names[0],
+                negative_class=self.class_names[1] if len(self.class_names) > 1 else None,
+            )
+            if snapshot.graph_node_id in wanted
         )
 
 

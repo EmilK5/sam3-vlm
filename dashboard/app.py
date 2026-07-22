@@ -129,7 +129,7 @@ def build_app(service: DashboardService):
             with gr.Row():
                 replay_image = gr.Image(type="pil", label="Saved overlay / selected pass")
                 replay_summary = gr.JSON(label="Run summary")
-            pass_slider = gr.Slider(0, 0, value=0, step=1, label="Pass")
+            pass_slider = gr.Slider(0, 1, value=0, step=1, label="Pass")
             pass_button = gr.Button("Show selected pass")
             pass_detail = gr.JSON(label="Pass detail")
             replay_passes = gr.Dataframe(interactive=False)

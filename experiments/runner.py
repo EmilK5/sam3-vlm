@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import io
 import json
 import os
 import platform
@@ -189,12 +190,34 @@ class UnifiedExperimentRunner:
                 store=store,
             )
             predictions = _final_predictions(execution, graph, self.config.target_class)
+            mask_artifact_paths: dict[str, str] = {}
+            for node in graph.nodes.values():
+                if node.mask is None:
+                    continue
+                buffer = io.BytesIO()
+                np.savez_compressed(buffer, mask=np.asarray(node.mask, dtype=bool))
+                artifact = store.write_artifact_bytes(
+                    buffer.getvalue(),
+                    kind=ArtifactKind.MASK,
+                    relative_path=f"masks/nodes/{node.id}.npz",
+                    media_type="application/x-npz",
+                    metadata={"graph_node_id": node.id, "role": "node_mask"},
+                )
+                mask_artifact_paths[node.id] = artifact.relative_path
+
+            compact_graph = graph.to_dict(
+                include_masks=False,
+                mask_artifact_paths=mask_artifact_paths,
+            )
             graph_artifact = store.write_artifact_bytes(
-                json.dumps(graph.to_dict(), indent=2, sort_keys=True).encode("utf-8"),
+                json.dumps(compact_graph, indent=2, sort_keys=True).encode("utf-8"),
                 kind=ArtifactKind.GRAPH,
                 relative_path="graph/final_graph.json",
                 media_type="application/json",
-                metadata={"graph_schema_version": graph.to_dict().get("graph_schema_version")},
+                metadata={
+                    "graph_schema_version": compact_graph.get("graph_schema_version"),
+                    "masks_stored_separately": True,
+                },
             )
             predictions = {
                 **predictions,
@@ -219,8 +242,10 @@ class UnifiedExperimentRunner:
                 predictions["pass_timeline_artifact_id"] = (
                     evaluation_outputs.timeline_artifact_id
                 )
+            final_graph = self._final_graph_snapshots(graph, execution, store)
             final = store.finalize_success(
                 final_predictions=predictions,
+                final_graph=final_graph,
                 metadata={
                     "pipeline_mode": self.config.mode.value,
                     "dataset_adapter": sample.dataset_name,
@@ -252,6 +277,7 @@ class UnifiedExperimentRunner:
             failed = store.finalize_failure(
                 exc,
                 component="unified_experiment_runner",
+                final_graph=self._final_graph_snapshots(graph, None, store),
                 metadata={
                     "pipeline_mode": self.config.mode.value,
                     "dataset_adapter": sample.dataset_name,
@@ -270,6 +296,24 @@ class UnifiedExperimentRunner:
                     metadata={"failed": True, "exception_type": type(exc).__name__},
                 ),
             )
+
+    def _final_graph_snapshots(self, graph, execution, store):
+        passes = tuple(getattr(execution, "passes", ()) or ())
+        pass_id = (
+            passes[-1].pass_id
+            if passes
+            else store.new_id(EntityKind.PASS)
+        )
+        return graph.snapshot_records(
+            pass_id=pass_id,
+            class_names=self.config.class_names,
+            positive_class=self.config.target_class,
+            negative_class=(
+                self.config.class_names[1]
+                if len(self.config.class_names) > 1
+                else None
+            ),
+        )
 
     def _execute(
         self,

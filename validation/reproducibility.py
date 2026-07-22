@@ -33,6 +33,8 @@ _IGNORED_KEYS = {
     "source_path",
     "run_directory",
     "checkpoint_reason",
+    "event_log_sha256",
+    "event_log_size_bytes",
 }
 _IGNORED_TOP_LEVEL = {
     "repository",

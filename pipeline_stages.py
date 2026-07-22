@@ -429,7 +429,7 @@ def suppress_detection_batch(
                 selected_survivor_id=survivor_id,
             )
             comparisons.append(record)
-            context.emit(record, minimum_level=ReportingLevel.FULL)
+            context.emit(record)
 
     return SuppressionResult(
         kept=kept,
@@ -451,27 +451,32 @@ def register_detection_batch(
     class_names: tuple[str, ...] = ("fruit", "leaf", "background"),
     context: StageContext | None = None,
 ) -> RegistrationResult:
-    """Associate detections with graph nodes, then perform explicit mutations.
+    """Associate detections with graph nodes and log only final assignments.
 
-    This stage does registration only.  Semantic verification is intentionally a
-    separate downstream stage.
+    Earlier versions emitted one record for every detection/node comparison and
+    embedded full node snapshots in each registration.  That made a single pass
+    grow quadratically with the number of objects.  The compact contract records
+    only the comparison that actually caused a merge, plus one final registration
+    outcome for every detection.
     """
 
+    del class_names  # retained in the public signature for compatibility
     if dedup_metric not in {"iou", "iom", "mask_iou"}:
         raise StageError(f"Unsupported cross-pass metric: {dedup_metric!r}")
+
     created: list[str] = []
     updated: list[str] = []
     rejected: list[str] = []
-    all_comparisons: list[DedupComparisonRecord] = []
+    decisive_comparisons: list[DedupComparisonRecord] = []
     decisions: list[RegistrationDecisionRecord] = []
 
     for index in range(len(batch)):
         box = batch.boxes_global[index]
         mask = batch.masks[index] if batch.masks else None
         detection_id = batch.detection_ids[index] if batch.detection_ids else None
-        candidate_nodes: list[str] = []
         matched_node = None
-        selected_dedup_id = None
+        matched_metrics: dict[str, float] | None = None
+        matched_rank: int | None = None
 
         for rank, node in enumerate(graph.nodes.values()):
             if getattr(node, "classification", "unresolved") not in match_classes:
@@ -479,45 +484,47 @@ def register_detection_batch(
             node_box = getattr(node, "bbox", getattr(node, "box", None))
             if node_box is None:
                 continue
-            candidate_nodes.append(node.id)
             node_mask = getattr(node, "mask", None)
             metrics = _pair_metrics(box, mask, node_box, node_mask)
-            chosen_value = metrics[
-                "mask_iou" if dedup_metric == "mask_iou" and mask is not None and node_mask is not None else dedup_metric
-            ]
-            is_match = chosen_value > dedup_threshold
-
-            if context and context.sink is not None and detection_id is not None:
-                dedup_id = context.new_id(EntityKind.DEDUP_DECISION)
-                record = DedupComparisonRecord(
-                    dedup_decision_id=dedup_id,  # type: ignore[arg-type]
-                    pass_id=context.pass_id,
-                    new_detection_id=detection_id,
-                    existing_detection_id=None,
-                    existing_node_id=node.id,
-                    stage="cross_pass_registration",
-                    metrics=metrics,
-                    thresholds={dedup_metric: float(dedup_threshold)},
-                    decision=(DedupDecision.MERGE if is_match else DedupDecision.KEEP_DISTINCT),
-                    reason=("cross-pass match" if is_match else "below dedup threshold"),
-                    selected_survivor_id=node.id if is_match else None,
-                    comparison_rank=rank,
-                )
-                all_comparisons.append(record)
-                context.emit(record, minimum_level=ReportingLevel.FULL)
-                if is_match:
-                    selected_dedup_id = dedup_id
-
-            if is_match:
+            metric_name = (
+                "mask_iou"
+                if dedup_metric == "mask_iou"
+                and mask is not None
+                and node_mask is not None
+                else dedup_metric
+            )
+            if metrics[metric_name] > dedup_threshold:
                 matched_node = node
+                matched_metrics = metrics
+                matched_rank = rank
                 break
 
+        selected_dedup_id = None
+        if (
+            matched_node is not None
+            and context is not None
+            and context.sink is not None
+            and detection_id is not None
+        ):
+            selected_dedup_id = context.new_id(EntityKind.DEDUP_DECISION)
+            comparison = DedupComparisonRecord(
+                dedup_decision_id=selected_dedup_id,  # type: ignore[arg-type]
+                pass_id=context.pass_id,
+                new_detection_id=detection_id,
+                existing_detection_id=None,
+                existing_node_id=matched_node.id,
+                stage="cross_pass_registration",
+                metrics=dict(matched_metrics or {}),
+                thresholds={dedup_metric: float(dedup_threshold)},
+                decision=DedupDecision.MERGE,
+                reason="selected cross-pass match",
+                selected_survivor_id=matched_node.id,
+                comparison_rank=matched_rank,
+            )
+            decisive_comparisons.append(comparison)
+            context.emit(comparison)
+
         if matched_node is not None:
-            before = _node_snapshot(
-                matched_node,
-                pass_id=context.pass_id if context else "pass_legacy_000001",
-                class_names=class_names,
-            ) if context and context.sink is not None else None
             registration_id = (
                 context.new_id(EntityKind.REGISTRATION)
                 if context and context.sink is not None and detection_id is not None
@@ -531,11 +538,6 @@ def register_detection_batch(
                 dedup_decision_id=selected_dedup_id,
                 registration_id=registration_id,
             )
-            after = _node_snapshot(
-                matched_node,
-                pass_id=context.pass_id if context else "pass_legacy_000001",
-                class_names=class_names,
-            ) if context and context.sink is not None else None
             updated.append(matched_node.id)
             if detection_id is not None:
                 rejected.append(detection_id)
@@ -546,11 +548,11 @@ def register_detection_batch(
                     raw_detection_id=detection_id,
                     outcome=RegistrationOutcome.UPDATED_NODE,
                     graph_node_id=matched_node.id,
-                    candidate_node_ids=tuple(candidate_nodes),
+                    candidate_node_ids=(matched_node.id,),
                     selected_dedup_decision_id=selected_dedup_id,
-                    reason="reinforced existing graph node",
-                    node_before=before,
-                    node_after=after,
+                    reason="assigned to existing graph object",
+                    node_before=None,
+                    node_after=None,
                 )
                 decisions.append(decision)
                 context.emit(decision)
@@ -582,18 +584,17 @@ def register_detection_batch(
             node.mask = mask
         created.append(node_id)
         if registration_id is not None and detection_id is not None:
-            after = _node_snapshot(node, pass_id=context.pass_id, class_names=class_names)
             decision = RegistrationDecisionRecord(
                 registration_id=registration_id,
                 pass_id=context.pass_id,
                 raw_detection_id=detection_id,
                 outcome=RegistrationOutcome.CREATED_NODE,
                 graph_node_id=node_id,
-                candidate_node_ids=tuple(candidate_nodes),
+                candidate_node_ids=(),
                 selected_dedup_decision_id=None,
-                reason="no existing node crossed the dedup threshold",
+                reason="created a new graph object",
                 node_before=None,
-                node_after=after,
+                node_after=None,
             )
             decisions.append(decision)
             context.emit(decision)
@@ -602,10 +603,9 @@ def register_detection_batch(
         created_node_ids=tuple(created),
         updated_node_ids=tuple(updated),
         rejected_detection_ids=tuple(rejected),
-        comparisons=tuple(all_comparisons),
+        comparisons=tuple(decisive_comparisons),
         decisions=tuple(decisions),
     )
-
 
 
 def _node_snapshot(node: Any, *, pass_id: str, class_names: tuple[str, ...]) -> GraphNodeSnapshotRecord:

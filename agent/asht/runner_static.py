@@ -152,8 +152,10 @@ class _PassCollector:
         return self.root.new_id(kind)
 
     def append(self, payload, **kwargs):
+        # Keep detailed records inside the pass.  Only the completed PassRecord
+        # is forwarded to the run event stream, avoiding duplicate JSON.
         self.records.append(payload)
-        return self.root.append(payload, **kwargs)
+        return None
 
     def records_of(self, record_type):
         return tuple(value for value in self.records if isinstance(value, record_type))
@@ -319,7 +321,10 @@ class StaticAshtRunner:
             kernel=None,
             belief_update=None,
             stopping_decision=None,
-            graph_after=self._snapshots(pass_id),
+            graph_after=self._snapshots_for_ids(
+                pass_id,
+                (*registration.created_node_ids, *registration.updated_node_ids),
+            ),
             cost_after=cost,
             continuation_reason="bootstrap_complete",
             tiling_decision=tiling_decision,
@@ -530,7 +535,7 @@ class StaticAshtRunner:
             kernel=update.kernel_record,
             belief_update=update.belief_update_record,
             stopping_decision=update.stopping_record,
-            graph_after=self._snapshots(pass_id),
+            graph_after=self._snapshots_for_ids(pass_id, (node.id,)),
             cost_after=cost,
             continuation_reason=(
                 "node_stopped" if update.stop_decision.should_stop else "node_unresolved"
@@ -586,7 +591,7 @@ class StaticAshtRunner:
             kernel=None,
             belief_update=None,
             stopping_decision=stopping,
-            graph_after=self._snapshots(pass_id),
+            graph_after=self._snapshots_for_ids(pass_id, (node.id,)),
             cost_after=cost,
             continuation_reason=reason.value,
         )
@@ -632,13 +637,10 @@ class StaticAshtRunner:
         self._pass_index += 1
         pass_sink = _PassCollector(self.root)
         pass_id = pass_sink.new_id(EntityKind.PASS)
-        return pass_sink, pass_id, utc_now_iso(), self._snapshots(pass_id)
+        return pass_sink, pass_id, utc_now_iso(), ()
 
     def _finish_pass(self, pass_sink: _PassCollector, record: PassRecord) -> None:
-        for snapshot in record.graph_after:
-            pass_sink.append(snapshot, pass_id=record.pass_id)
-        pass_sink.append(record.cost_after, pass_id=record.pass_id)
-        pass_sink.append(record, pass_id=record.pass_id)
+        self.root.append(record, pass_id=record.pass_id)
         self.passes.append(record)
 
     def _snapshots(self, pass_id: str):
@@ -649,6 +651,14 @@ class StaticAshtRunner:
             negative_class=self.config.action_bank.negative_class,
             positive_threshold=self.config.action_bank.positive_exemplar_threshold,
             negative_threshold=self.config.action_bank.negative_exemplar_threshold,
+        )
+
+    def _snapshots_for_ids(self, pass_id: str, node_ids):
+        wanted = set(node_ids)
+        return tuple(
+            snapshot
+            for snapshot in self._snapshots(pass_id)
+            if snapshot.graph_node_id in wanted
         )
 
     def _cost_record(self, pass_id: str) -> CostSnapshotRecord:

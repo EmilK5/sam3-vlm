@@ -390,7 +390,7 @@ def test_validator_detects_event_log_divergence(tmp_path: Path):
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     report = validate_run_directory(result.run_directory)
     assert not report.valid
-    assert any(issue.code == "event_parity" for issue in report.issues)
+    assert any(issue.code == "event_log_hash" for issue in report.issues)
 
 
 def test_run_tree_validation_and_graph_replay(tmp_path: Path):

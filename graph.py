@@ -176,7 +176,12 @@ class OrchardNode:
             and posterior.get(class_name, 0.0) >= float(threshold)
         )
 
-    def to_dict(self) -> dict:
+    def to_dict(
+        self,
+        *,
+        include_mask: bool = True,
+        mask_artifact_path: str | None = None,
+    ) -> dict:
         d: dict[str, Any] = {
             "id": self.id,
             "box": list(self.box),
@@ -199,8 +204,11 @@ class OrchardNode:
                 "exemplar_uses": [dict(item) for item in self.exemplar_uses],
                 "used_semantic_keys": sorted(self.used_semantic_keys),
             },
-            "mask": _encode_mask(self.mask),
         }
+        if include_mask:
+            d["mask"] = _encode_mask(self.mask)
+        elif mask_artifact_path is not None:
+            d["mask_artifact_path"] = mask_artifact_path
         if self.vip_chain is not None:
             d["vip_chain"] = self.vip_chain
         if self.vip_posterior is not None:
@@ -372,11 +380,20 @@ class OrchardGraph:
             for node in sorted(self.nodes.values(), key=lambda value: value.id)
         )
 
-    def to_dict(self) -> dict:
+    def to_dict(
+        self,
+        *,
+        include_masks: bool = True,
+        mask_artifact_paths: Mapping[str, str] | None = None,
+    ) -> dict:
+        paths = dict(mask_artifact_paths or {})
         return {
             "graph_schema_version": GRAPH_SCHEMA_VERSION,
             "nodes": [
-                node.to_dict()
+                node.to_dict(
+                    include_mask=include_masks,
+                    mask_artifact_path=paths.get(node.id),
+                )
                 for node in sorted(self.nodes.values(), key=lambda value: value.id)
             ],
             "metadata": {
@@ -453,6 +470,23 @@ def _node_snapshot_record(
         legacy_scores={str(key): float(value) for key, value in node.scores.items()},
         metadata={
             "legacy_classification": node.classification,
+            "lifecycle": {
+                "created_in_pass": node.found_in_pass,
+                "created_from_detection_id": (
+                    node.source_detection_ids[0] if node.source_detection_ids else None
+                ),
+                "updates": [
+                    {
+                        "pass": pass_number,
+                        "detection_id": (
+                            node.source_detection_ids[index]
+                            if index < len(node.source_detection_ids)
+                            else None
+                        ),
+                    }
+                    for index, pass_number in enumerate(node.found_in_passes[1:], start=1)
+                ],
+            },
             "dedup_decision_ids": list(node.dedup_decision_ids),
             "registration_ids": list(node.registration_ids),
             "verification_action_ids": list(node.verification_action_ids),

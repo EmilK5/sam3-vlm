@@ -600,26 +600,22 @@ def suppress_cross_tile_duplicates(
                 continue
             iou = _iou(batch.boxes_global[i], batch.boxes_global[j])
             should_suppress = iou > iou_threshold
-            comparisons.append(
-                DedupComparisonRecord(
-                    dedup_decision_id=id_source.new_id(EntityKind.DEDUP_DECISION),
-                    pass_id=pass_id,
-                    new_detection_id=batch.detection_ids[j],
-                    existing_detection_id=batch.detection_ids[i],
-                    existing_node_id=None,
-                    stage="cross_tile_nms",
-                    metrics={"iou": float(iou)},
-                    thresholds={"iou": float(iou_threshold)},
-                    decision=(
-                        DedupDecision.SUPPRESS_NEW
-                        if should_suppress
-                        else DedupDecision.KEEP_DISTINCT
-                    ),
-                    selected_survivor_id=batch.detection_ids[i] if should_suppress else None,
-                    reason="higher-score tile detection retained" if should_suppress else "below threshold",
-                )
-            )
             if should_suppress:
+                comparisons.append(
+                    DedupComparisonRecord(
+                        dedup_decision_id=id_source.new_id(EntityKind.DEDUP_DECISION),
+                        pass_id=pass_id,
+                        new_detection_id=batch.detection_ids[j],
+                        existing_detection_id=batch.detection_ids[i],
+                        existing_node_id=None,
+                        stage="cross_tile_nms",
+                        metrics={"iou": float(iou)},
+                        thresholds={"iou": float(iou_threshold)},
+                        decision=DedupDecision.SUPPRESS_NEW,
+                        selected_survivor_id=batch.detection_ids[i],
+                        reason="higher-score tile detection retained",
+                    )
+                )
                 suppressed.add(j)
     kept_sorted = sorted(kept)
     return batch.subset(kept_sorted), tuple(comparisons)

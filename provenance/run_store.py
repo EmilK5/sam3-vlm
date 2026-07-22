@@ -17,6 +17,8 @@ from provenance.contracts import (
     ArtifactRef,
     ErrorEventRecord,
     EventEnvelope,
+    GraphNodeSnapshotRecord,
+    PassRecord,
     RunRecord,
 )
 from provenance.events import EventLogReader, EventLogWriter
@@ -37,12 +39,14 @@ class ReportingLevel(str, Enum):
     MINIMAL = "minimal"
     STANDARD = "standard"
     FULL = "full"
+    DEBUG = "debug"
 
 
 _REPORTING_RANK = {
     ReportingLevel.MINIMAL: 0,
     ReportingLevel.STANDARD: 1,
     ReportingLevel.FULL: 2,
+    ReportingLevel.DEBUG: 3,
 }
 
 
@@ -113,7 +117,7 @@ class RunStore:
         output_root: Path,
         initial_run: RunRecord,
         *,
-        reporting_level: ReportingLevel = ReportingLevel.FULL,
+        reporting_level: ReportingLevel = ReportingLevel.STANDARD,
         overwrite: bool = False,
         fsync: bool = True,
         checkpoint_every_events: int = 0,
@@ -175,11 +179,11 @@ class RunStore:
             checkpoint_run = RunRecord.from_dict(strict_json_load(paths.latest_checkpoint))
         base_run = checkpoint_run or manifest
 
-        reporting_text = str(base_run.metadata.get("reporting_level", ReportingLevel.FULL.value))
+        reporting_text = str(base_run.metadata.get("reporting_level", ReportingLevel.STANDARD.value))
         try:
             reporting_level = ReportingLevel(reporting_text)
         except ValueError:
-            reporting_level = ReportingLevel.FULL
+            reporting_level = ReportingLevel.STANDARD
 
         id_factory = IdFactory.restore(base_run.run_id, base_run.id_counters)
         writer = EventLogWriter.restore(
@@ -236,6 +240,7 @@ class RunStore:
         status: RunStatus = RunStatus.RUNNING,
         completed_at: str | None = None,
         final_predictions: Mapping[str, Any] | None = None,
+        final_graph: tuple[GraphNodeSnapshotRecord, ...] | None = None,
         warnings: tuple[str, ...] | None = None,
         metadata: Mapping[str, Any] | None = None,
         include_events: bool = False,
@@ -250,6 +255,7 @@ class RunStore:
             completed_at=completed_at,
             id_counters=self.id_factory.snapshot(),
             final_predictions=final_predictions,
+            final_graph=final_graph,
             warnings=warnings,
             metadata=merged_metadata,
             include_events=include_events,
@@ -280,6 +286,7 @@ class RunStore:
         self,
         *,
         final_predictions: Mapping[str, Any],
+        final_graph: tuple[GraphNodeSnapshotRecord, ...] | None = None,
         completed_at: str | None = None,
         warnings: tuple[str, ...] | None = None,
         metadata: Mapping[str, Any] | None = None,
@@ -289,9 +296,10 @@ class RunStore:
             status=RunStatus.SUCCEEDED,
             completed_at=completed_at or utc_now_iso(),
             final_predictions=final_predictions,
+            final_graph=final_graph,
             warnings=warnings,
-            metadata=metadata,
-            include_events=True,
+            metadata=self._event_log_metadata(metadata),
+            include_events=False,
         )
         atomic_write_json(self.paths.latest_checkpoint, snapshot, fsync=self.fsync)
         atomic_write_json(self.paths.partial_run, snapshot, fsync=self.fsync)
@@ -309,6 +317,7 @@ class RunStore:
         recoverable: bool = False,
         fallback_action: str | None = None,
         final_predictions: Mapping[str, Any] | None = None,
+        final_graph: tuple[GraphNodeSnapshotRecord, ...] | None = None,
         completed_at: str | None = None,
         metadata: Mapping[str, Any] | None = None,
     ) -> RunRecord:
@@ -334,8 +343,9 @@ class RunStore:
             status=RunStatus.FAILED,
             completed_at=completed_at or utc_now_iso(),
             final_predictions=final_predictions,
-            metadata=metadata,
-            include_events=True,
+            final_graph=final_graph,
+            metadata=self._event_log_metadata(metadata),
+            include_events=False,
         )
         atomic_write_json(self.paths.latest_checkpoint, snapshot, fsync=self.fsync)
         atomic_write_json(self.paths.partial_run, snapshot, fsync=self.fsync)
@@ -366,7 +376,8 @@ class RunStore:
             status=RunStatus.INTERRUPTED,
             completed_at=utc_now_iso(),
             final_predictions=final_predictions,
-            include_events=True,
+            metadata=self._event_log_metadata(None),
+            include_events=False,
         )
         atomic_write_json(self.paths.latest_checkpoint, snapshot, fsync=self.fsync)
         atomic_write_json(self.paths.partial_run, snapshot, fsync=self.fsync)
@@ -498,6 +509,15 @@ class RunStore:
             minimum_level=minimum_level,
         )
         return artifact
+
+    def _event_log_metadata(
+        self, metadata: Mapping[str, Any] | None
+    ) -> dict[str, Any]:
+        merged = dict(metadata or {})
+        if self.paths.events.is_file():
+            merged["event_log_sha256"] = sha256_file(self.paths.events)
+            merged["event_log_size_bytes"] = self.paths.events.stat().st_size
+        return merged
 
     def _write_static_files(self) -> None:
         manifest_metadata = dict(self.base_run.metadata)
