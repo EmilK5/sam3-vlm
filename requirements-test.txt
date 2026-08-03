@@ -1,3 +1,6 @@
 numpy
 Pillow
 pytest
+opencv-python-headless
+matplotlib
+scipy
